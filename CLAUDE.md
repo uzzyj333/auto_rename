@@ -49,30 +49,29 @@ When `--web` is passed, the main process starts both `FileSystemMonitor` (in a t
 
 ### Upload Integrations
 
-`upload/` contains uploaders for multiple cloud services: Emos, 123Pan (`p123`), 天翼云 (`cloud189`), and 139云 (`yun139`). Upload targets are configured via `processing.upload_targets` in config.
+`upload/upload_emos.py` implements `RobustEmosVideoUploader`, the only upload target. It talks to the official Emos API: `POST /api/upload/getUploadToken` → (multipart presign / PUT / complete, or google_drive resumable) → `POST /api/upload/video/save`. `core/emos_client.py` wraps every other official endpoint used for recognition (`/api/video/getVideoId`, `/api/video/tree`, `/api/upload/video/base`, ...).
 
-**139云盘 App 模式**: `yun139` uploader supports both PC mode (default) and App mode (`app_mode = true` in config). App mode uses a different API endpoint and authentication flow compatible with mobile client tokens.
+### Online Recognition Upload
 
-### Media Tracker Integration
-
-`MediaTrackerClient` (`core/media_tracker_client.py`) listens to a WebSocket server for new media events. When a media entry is received:
-1. Parses metadata from the provided filename
-2. Optionally generates a new path via `VideoRenamer` (if `suggested_path` is not provided)
-3. Uploads STRM file to 139云盘 via `yun139_uploader`
-4. Skips TMDB queries if `suggested_path` is present (direct STRM generation)
-
-Runs in a background thread with async workers (default 3 concurrent) to avoid blocking the WebSocket event loop. Configured via `[media_tracker]` section with `enabled`, `host`, `port`, `token`, and `max_concurrent` options.
+`core/online_upload.py` hosts the `OnlineUploadService` singleton driving the 「在线识别上传」 Web page:
+1. Browse/scan a configured video root (`online_upload.video_root`) with path confinement.
+2. `core/probe.py` runs ffprobe to validate the file and build the `file_metadata` sent to Emos (skipped gracefully when ffprobe is missing).
+3. Recognition: `VideoRenamer` + TMDB → `GET /api/video/getVideoId`; falls back to `GET /api/video/tree` candidates the user picks manually.
+4. Uploads run in a 3-worker thread pool; in-memory task progress is polled by the UI (`/api/online-upload/tasks`).
 
 ### Configuration
 
-Config is an INI file at `src/video_organizer/data/config.ini`, loaded by `core/config_loader.py`. Key sections:
-- `[monitoring]` — `watch_path`, `processed_path`, polling settings, `path_mappings` (maps downloader container paths to host paths)
+Config is an INI file (default `src/video_organizer/config.ini`; Docker uses `/app/data/config.ini`), loaded by `core/config_loader.py`. Key sections:
+- `[monitoring]` — `watch_dir`, `output_dir`, polling settings, `path_mappings` (maps downloader container paths to host paths)
 - `[naming]` — Jinja2-style format strings for `tv_show_format`, `movie_format`, `anime_format`, `simple_format`
-- `[api]` — `tmdb_api_key`, `ai_service_url` (LLM for translation)
-- `[processing]` — `supported_extensions`, `upload_targets`, copy/delete behavior
-- `[emos]`, `[p123]`, `[cloud189]`, `[yun139]` — Per-service upload credentials. `yun139` supports `app_mode` flag.
-- `[media_tracker]` — WebSocket integration: `enabled`, `host`, `port`, `token`, `max_concurrent`
+- `[tmdb]` — `api_key`, `language`, `region`
+- `[processing]` — `upload_targets` (fixed to `emos`), `max_upload_workers`, delete-after-upload behavior
+- `[emos]` — `auth_token`, `base_url` (default `https://emos.best`), `file_storage`, `file_storages`, `chunk_size_mb`, `timeout`
+- `[online_upload]` — `video_root`, `probe_enabled`, `ffprobe_path`, `path_type`
+- `[logging]` — level / console / file logging; the log file always lives in the container's own log dir (`VIDEO_ORGANIZER_LOG_DIR`, default `/app/data/logs`)
 - `[manual_rules]` — List of manual rules in DSL format (each rule on a new line)
+
+Config edits made in the Web UI are hot-applied through `VideoFileHandler.apply_config()` and `OnlineUploadService.configure()` — no container restart required.
 
 ### Content Type Detection
 

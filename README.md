@@ -3,7 +3,7 @@
 ![版本](https://img.shields.io/badge/version-1.0.0-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.12%2B-green.svg)
 ![平台](https://img.shields.io/badge/平台-Windows%20%7C%20Linux%20%7C%20macOS-blue.svg)
-![构建](https://img.shields.io/github/actions/workflow/status/liyk-master/auto_rename/build.yml?label=构建)
+![构建](https://img.shields.io/github/actions/workflow/status/uzzyj333/auto_rename/build.yml?label=构建)
 
 自动识别、重命名、刮削、上传视频文件。支持 TMDB 元数据、多字幕组分类、云盘多端上传、Web 管理后台。
 
@@ -18,7 +18,7 @@
 | **字幕组分类** | 内置 300+ 字幕组映射，自动区分动漫 / 日韩剧 / 电影 |
 | **手动规则 DSL** | 自定义屏蔽词、替换、定位截取、内嵌 TMDB ID |
 | **Web 管理后台** | FastAPI + SPA，实时仪表盘、配置管理、手动处理、日志查看 |
-| **云盘上传** | 支持 Emos、123云盘、天翼云盘、中国移动云盘 |
+| **Emos 上传** | 官方 API 上传 + 在线识别上传（浏览服务器视频、识别条目、手动选择目标）|
 | **下载器监控** | 自动监控 aria2 / qBittorrent 下载完成事件 |
 | **文件监控** | 目录轮询 + 文件稳定性检测，自动整理归档 |
 | **LLM 兜底** | 多 Provider 负载均衡（OpenAI / DeepSeek / 智谱等）|
@@ -32,11 +32,11 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/liyk-master/auto_rename.git
+git clone https://github.com/uzzyj333/auto_rename.git
 cd auto_rename
 
-# 创建数据目录
-mkdir -p data logs strm
+# 创建数据目录（容器内以 uid 1000 运行，需要确保目录可写）
+mkdir -p data && chown -R 1000:1000 data
 
 # 编辑 docker-compose.yml 修改挂载路径后启动
 docker compose up -d
@@ -49,15 +49,18 @@ docker compose logs | grep "管理员密码"
 
 完整 Docker 部署文档：[DOCKER.md](DOCKER.md) | [快速开始](DOCKER_QUICKSTART.md)
 
+> 说明：`./data` 是唯一的持久化目录（`config.ini`、日志、SQLite 数据库都在里面），日志不再映射宿主机路径；
+> 在 Web「配置管理」里修改的配置会立即生效，无需重启容器。
+
 ### 下载可执行文件
 
-从 [GitHub Releases](https://github.com/liyk-master/auto_rename/releases) 下载对应平台的单文件可执行程序，解压即可运行。
+从 [GitHub Releases](https://github.com/uzzyj333/auto_rename/releases) 下载对应平台的单文件可执行程序，解压即可运行。
 
 ### 从源码运行
 
 ```bash
 # 克隆仓库
-git clone https://github.com/liyk-master/auto_rename.git
+git clone https://github.com/uzzyj333/auto_rename.git
 cd auto_rename
 
 # 安装依赖
@@ -102,8 +105,6 @@ python -m src.video_organizer.main --monitor-dir "D:\Downloads" --web --web-port
 # 手动处理单个文件
 python -m src.video_organizer.main --process "D:\video.mkv"
 
-# 整理 123 云盘文件
-python -m src.video_organizer.main --organize-p123 --organize-dry-run
 ```
 
 ---
@@ -120,7 +121,8 @@ python -m src.video_organizer.main --organize-p123 --organize-dry-run
 | **日志查看** | 选择日志文件、tail 模式、实时日志流（WebSocket）|
 | **手动处理** | 输入/浏览文件路径，预览重命名、验证刮削、批量处理 |
 | **下载器管理** | 下载器状态查看，配置管理（添加/编辑/删除）|
-| **用户管理** | 用户 CRUD、密码修改 |
+| **手动处理** | 输入/浏览文件路径，预览重命名、验证刮削、批量处理 |
+| **在线识别上传** | 浏览/扫描视频根目录、识别 Emos 条目、手动选择目标并上传，实时进度 |
 
 ### API 文档
 
@@ -146,14 +148,12 @@ python -m src.video_organizer.main --organize-p123 --organize-dry-run
 | `[guessit]` | GuessIt 增强解析开关 |
 | `[llm_fallback]` | LLM 兜底解析开关和并发控制 |
 | `[llm_provider_N]` | LLM 提供商（名称/地址/密钥/模型/权重/超时），支持多个 |
-| `[processing]` | 上传目标、上传后删除源文件、最大上传并发数 |
-| `[emos]` | Emos 云盘认证令牌、API 地址、分片大小 |
-| `[cloud189]` | 天翼云盘账号/密码/Cookie、文件夹 ID、STRM 代理 |
-| `[yun139]` | 中国移动云盘授权、云盘类型、文件夹 ID、STRM 代理 |
+| `[processing]` | 上传目标（固定 `emos`）、上传后删除源文件、最大上传并发数 |
+| `[emos]` | Emos 认证令牌、API 地址（默认 `https://emos.best`）、存储类型、分片大小 |
+| `[online_upload]` | 在线识别上传：视频根目录、ffprobe 开关与路径、path_type |
 | `[downloader.aria2]` | aria2 RPC 地址、密钥、监控模式（轮询/WebSocket/Webhook）|
 | `[downloader.qbittorrent]` | qBittorrent 地址、用户名、密码 |
 | `[telegram]` | Telegram 推送 Bot Token、Chat ID |
-| `[emya_db]` | Emby 数据库 MySQL 连接配置 |
 | `[manual_rules]` | 手动规则列表（DSL 语法）|
 | `[logging]` | 日志级别、文件、控制台开关 |
 
@@ -166,7 +166,7 @@ python -m src.video_organizer.main --organize-p123 --organize-dry-run
 | `{episode}` | 集号（两位数）| 电视剧/动漫 |
 | `{season_episode}` | `S01E01` 格式 | 电视剧 |
 | `{year}` / `{year_suffix}` | 年份 / `(2024)` 格式 | 所有 |
-| `{tmdb_id}` / `{tmdbid_suffix}` | TMDB ID / `{tmdb-123}` | 所有 |
+| `{tmdb_id}` / `{tmdbid_suffix}` | TMDB ID / `{tmdbid=123}`（在线识别会读取该标记） | 所有 |
 | `{title}` | 综合标题 | 简单模式 |
 | `{quality_tags}` / `{quality_tags_suffix}` | 画质标签 / `-1080p` | 所有 |
 | `{release_group}` / `{release_group_suffix}` | 发布组 / `-[ANi]` | 所有 |
@@ -212,13 +212,13 @@ position: start=3,end=-4,offset=-2
 when: 包含"1080p" => block: 4K
 ```
 
-### 云盘上传
+### 云盘上传（Emos 官方 API）
 
-上传完成后自动推送到多端云盘，可选方案：
-- **Emos** — 分片上传，断点续传
-- **123云盘** — 标准上传 + 云端文件整理
-- **天翼云盘** — 账号/SSO 登录，个人云/家庭云，STRM 文件生成
-- **中国移动云盘** — 四种云盘类型，自定义分片，STRM 文件生成
+上传完成后自动推送到 Emos，全部使用官方 API：
+- **在线识别上传** — 在 Web 页面浏览服务器视频 → 自动识别 Emos 条目（TMDB ID / 标题搜索）→ 选择目标一次性入队上传
+- **自动上传** — 文件监控/下载器完成后自动识别 `getVideoId` 并分片上传
+- **断点续传** — google_drive 存储走 resumable 协议，其他存储走 multipart 分片 + 校验
+- **ffprobe 校验** — 上传前校验视频并提取分辨率/编码/时长等元数据
 
 ### 下载器集成
 
@@ -290,14 +290,16 @@ src/video_organizer/
 │   ├── file_mover.py            # 文件移动器
 │   ├── subtitle_handler.py      # 字幕处理
 │   ├── downloader_monitor.py    # 下载器监控（aria2/qBittorrent）
-│   └── emya_service.py          # Emby 数据库入库
+│   ├── emos_client.py           # Emos 官方 API 客户端
+│   ├── probe.py                 # ffprobe 视频校验
+│   └── online_upload.py         # 在线识别上传服务
 ├── web/
 │   ├── app.py                   # FastAPI 应用
 │   ├── auth.py                  # 认证系统
 │   ├── routers/                 # API 路由
 │   └── static/                  # SPA 前端
 ├── database/                    # SQLite ORM
-├── upload/                      # 云盘上传器
+├── upload/                      # Emos 上传器
 └── utils/                       # 工具模块
 ```
 

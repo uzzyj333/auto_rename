@@ -248,6 +248,7 @@ function switchPage(pageName) {
     if (sidebar) sidebar.classList.remove('show');
     if (pageName === 'downloaders') loadDownloaderConfigs();
     if (pageName === 'users') loadUsers();
+    if (pageName === 'online') initOnlinePage(); else stopOnlinePolling();
 }
 
 function switchTaskTab(tabName) {
@@ -565,9 +566,9 @@ function getSectionLabel(section) {
     const labels = {
         'monitoring': '监控配置', 'tmdb': 'TMDB 配置', 'naming': '命名规则',
         'processing': '处理配置', 'logging': '日志配置',
-        'p123': '123云盘', 'cloud189': '天翼云盘', 'yun139': '139云盘',
-        'emos': 'Emby 云盘', 'telegram': 'Telegram', 'guessit': 'GuessIt 解析',
-        'emya_db': 'Emby 数据库', 'downloaders': '下载器列表',
+        'emos': 'Emos 云盘', 'online_upload': '在线识别上传',
+        'telegram': 'Telegram', 'guessit': 'GuessIt 解析',
+        'downloaders': '下载器列表',
     };
     return labels[section] || section;
 }
@@ -1606,7 +1607,7 @@ function updateUploadProgressList() {
         const statusBadge = p.status === 'uploading' ? '<span class="badge badge-warning">上传中</span>'
             : p.status === 'completed' ? '<span class="badge badge-success">已完成</span>'
             : p.status === 'failed' ? '<span class="badge badge-danger">失败</span>' : '';
-        const uploaderNames = { 'cloud189': '天翼云盘', 'yun139': '139云盘', 'p123': '123云盘', 'emos': 'Emos' };
+        const uploaderNames = { 'emos': 'Emos' };
         const pct = Math.min(100, Math.max(0, p.progress || 0));
         return `<tr>
             <td style="font-family:monospace;font-size:0.8125rem">${escapeHtml(p.filename || '未知文件')}</td>
@@ -1753,3 +1754,466 @@ async function deleteUser(userId) {
     } catch (e) { showToast('删除失败: ' + e.message, 'error'); }
 }
 window.deleteUser = deleteUser;
+// ===== 在线识别上传 =====
+
+const onlineState = {
+    initialized: false,
+    config: null,
+    path: '',
+    videos: [],
+    selected: new Set(),
+    recognized: [],
+    tasks: [],
+    timer: null,
+};
+
+function escapeOnline(value) {
+    return escapeHtml(String(value == null ? '' : value));
+}
+
+async function initOnlinePage() {
+    if (!onlineState.initialized) {
+        onlineState.initialized = true;
+        bindOnlineEvents();
+    }
+    startOnlinePolling();
+    await loadOnlineConfig();
+    await loadOnlineTasks();
+}
+
+function bindOnlineEvents() {
+    const bind = (id, handler) => {
+        const node = document.getElementById(id);
+        if (node) node.addEventListener('click', handler);
+    };
+    bind('onlineRefreshBtn', async () => { await loadOnlineConfig(); await loadOnlineTasks(); });
+    bind('onlineBrowseBtn', () => browseOnline(onlineState.path));
+    bind('onlineScanBtn', () => scanOnline());
+    bind('onlineRecognizeBtn', () => recognizeSelected());
+    bind('onlineRefreshTasksBtn', () => loadOnlineTasks());
+    bind('onlineClearTasksBtn', async () => {
+        try { await clearOnlineTasksApi(); await loadOnlineTasks(); }
+        catch (e) { alert('清空失败: ' + e.message); }
+    });
+
+    const selectAll = document.getElementById('onlineSelectAll');
+    if (selectAll) selectAll.addEventListener('change', () => {
+        onlineState.selected = new Set(selectAll.checked ? onlineState.videos.map(v => v.path) : []);
+        renderOnlineVideos();
+    });
+
+    const pathInput = document.getElementById('onlinePathInput');
+    if (pathInput) pathInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            onlineState.path = pathInput.value.trim();
+            browseOnline(onlineState.path);
+        }
+    });
+
+    bind('onlineSearchBtn', () => searchOnlineTargets());
+    const searchInput = document.getElementById('onlineSearchInput');
+    if (searchInput) searchInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') searchOnlineTargets();
+    });
+}
+
+function stopOnlinePolling() {
+    if (onlineState.timer) { clearInterval(onlineState.timer); onlineState.timer = null; }
+}
+
+function startOnlinePolling() {
+    stopOnlinePolling();
+    onlineState.timer = setInterval(() => {
+        if (document.querySelector('#page-online.active')) loadOnlineTasks();
+    }, 3000);
+}
+
+async function loadOnlineConfig() {
+    try {
+        const data = await loadOnlineConfigApi();
+        onlineState.config = data;
+        const hint = document.getElementById('onlineRootHint');
+        if (hint) {
+            const roots = (data.roots || []).join(' 、 ') || '未配置视频根目录';
+            const tokenText = data.token_configured
+                ? '已配置 Emos Token'
+                : '<span style="color:#e5534b">未配置 Emos auth_token，无法识别/上传</span>';
+            hint.innerHTML = 'Emos: <code>' + escapeOnline(data.base_url || '') + '</code> · ' + tokenText +
+                ' · 可浏览根目录: ' + escapeOnline(roots);
+        }
+        const input = document.getElementById('onlinePathInput');
+        if (input && !input.value) {
+            input.value = data.video_root || (data.roots || [])[0] || '';
+        }
+        onlineState.path = input ? input.value.trim() : '';
+    } catch (e) {
+        console.error('加载在线上传配置失败:', e);
+    }
+}
+
+async function browseOnline(path) {
+    try {
+        const data = await browseOnlineApi(path || '');
+        const panel = document.getElementById('onlineDirPanel');
+        const list = document.getElementById('onlineDirList');
+        if (!panel || !list) return;
+        const entries = data.entries || [];
+        let html = '';
+        if (data.parent) {
+            html += '<tr><td colspan="4"><a href="#" data-online-dir="' + escapeOnline(data.parent) + '">⬆ 上级目录</a></td></tr>';
+        }
+        for (const entry of entries) {
+            const isDir = entry.kind === 'directory' || entry.kind === 'root';
+            const action = isDir
+                ? '<a href="#" data-online-dir="' + escapeOnline(entry.path) + '">打开</a>'
+                : '<a href="#" data-online-probe="' + escapeOnline(entry.path) + '">探测</a>';
+            html += '<tr><td>' + (isDir ? '📁 ' : '🎬 ') + escapeOnline(entry.name) + '</td>' +
+                '<td>' + (isDir ? '目录' : '视频') + '</td>' +
+                '<td>' + escapeOnline(entry.size_text || '') + '</td>' +
+                '<td>' + action + '</td></tr>';
+        }
+        if (!html) html = '<tr><td colspan="4"><div class="empty-state"><p>空目录</p></div></td></tr>';
+        list.innerHTML = html;
+        panel.style.display = '';
+        list.querySelectorAll('[data-online-dir]').forEach(node => node.addEventListener('click', (e) => {
+            e.preventDefault();
+            const target = node.getAttribute('data-online-dir');
+            const input = document.getElementById('onlinePathInput');
+            if (input) input.value = target;
+            onlineState.path = target;
+            browseOnline(target);
+        }));
+        list.querySelectorAll('[data-online-probe]').forEach(node => node.addEventListener('click', (e) => {
+            e.preventDefault();
+            probeOnline(node.getAttribute('data-online-probe'));
+        }));
+    } catch (e) {
+        alert('浏览失败: ' + e.message);
+    }
+}
+
+async function scanOnline() {
+    const input = document.getElementById('onlinePathInput');
+    const recursive = document.getElementById('onlineRecursiveCheck');
+    const path = input ? input.value.trim() : '';
+    try {
+        const data = await scanOnlineApi(path, recursive ? recursive.checked : true);
+        onlineState.path = data.path || path;
+        onlineState.videos = data.files || [];
+        onlineState.selected = new Set();
+        renderOnlineVideos();
+        const panel = document.getElementById('onlineVideoPanel');
+        if (panel) panel.style.display = '';
+        if (!onlineState.videos.length) alert('该目录下没有扫描到视频文件');
+    } catch (e) {
+        alert('扫描失败: ' + e.message);
+    }
+}
+
+function renderOnlineVideos() {
+    const list = document.getElementById('onlineVideoList');
+    const count = document.getElementById('onlineVideoCount');
+    if (!list) return;
+    const videos = onlineState.videos;
+    if (!videos.length) {
+        list.innerHTML = '<tr><td colspan="4"><div class="empty-state"><p>暂无视频</p></div></td></tr>';
+    } else {
+        list.innerHTML = videos.map(v =>
+            '<tr>' +
+                '<td><input type="checkbox" data-online-video="' + escapeOnline(v.path) + '"' +
+                    (onlineState.selected.has(v.path) ? ' checked' : '') + '></td>' +
+                '<td>' + escapeOnline(v.name) +
+                    '<div style="font-size:12px;color:var(--text-muted)">' + escapeOnline(v.path) + '</div></td>' +
+                '<td>' + escapeOnline(v.size_text || '') + '</td>' +
+                '<td><a href="#" data-online-probe="' + escapeOnline(v.path) + '">探测</a></td>' +
+            '</tr>').join('');
+        list.querySelectorAll('[data-online-video]').forEach(node => node.addEventListener('change', () => {
+            const p = node.getAttribute('data-online-video');
+            if (node.checked) onlineState.selected.add(p); else onlineState.selected.delete(p);
+            const counter = document.getElementById('onlineVideoCount');
+            if (counter) counter.textContent = '已选择 ' + onlineState.selected.size + ' / ' + onlineState.videos.length;
+        }));
+        list.querySelectorAll('[data-online-probe]').forEach(node => node.addEventListener('click', (e) => {
+            e.preventDefault();
+            probeOnline(node.getAttribute('data-online-probe'));
+        }));
+    }
+    if (count) count.textContent = '已选择 ' + onlineState.selected.size + ' / ' + videos.length;
+    const selectAll = document.getElementById('onlineSelectAll');
+    if (selectAll) selectAll.checked = videos.length > 0 && onlineState.selected.size === videos.length;
+}
+
+async function probeOnline(path) {
+    const card = document.getElementById('onlineProbeCard');
+    const box = document.getElementById('onlineProbeContent');
+    if (!card || !box) return;
+    try {
+        const data = await probeOnlineApi(path);
+        const s = data.summary || {};
+        const skipped = data.skipped ? '（已按配置跳过 ffprobe 校验）' : '';
+        const available = data.available === false && !data.skipped ? '（未安装 ffprobe，可通过配置 ffprobe_path 指定路径）' : '';
+        box.innerHTML = '<div class="config-section">' +
+            '<div style="font-size:13px">文件: <code>' + escapeOnline(path) + '</code></div>' +
+            '<div style="font-size:13px;margin-top:6px">状态: ' +
+                (data.valid ? '✅ 有效视频' : '⚠️ ' + escapeOnline(data.error || '无法解析')) +
+                escapeOnline(skipped) + escapeOnline(available) + '</div>' +
+            '<div style="font-size:13px;margin-top:6px">分辨率: ' +
+                escapeOnline((s.width || 0) + 'x' + (s.height || 0)) +
+                ' · 编码: ' + escapeOnline((s.video_codec || '-') + '/' + (s.audio_codec || '-')) +
+                ' · 时长: ' + escapeOnline(Math.round(s.duration || 0)) + 's' +
+                ' · 帧率: ' + escapeOnline(s.frame_rate || '-') +
+                ' · 动态范围: ' + escapeOnline(s.dynamic_range || '-') + '</div>' +
+            '</div>';
+        card.style.display = '';
+    } catch (e) {
+        alert('探测失败: ' + e.message);
+    }
+}
+
+async function recognizeSelected() {
+    const paths = Array.from(onlineState.selected);
+    if (!paths.length) { alert('请先勾选要识别的视频'); return; }
+    const btn = document.getElementById('onlineRecognizeBtn');
+    if (btn) { btn.disabled = true; btn.textContent = '识别中...'; }
+    const results = [];
+    for (const p of paths) {
+        try {
+            results.push(await recognizeOnlineApi(p));
+        } catch (e) {
+            results.push({
+                file_path: p,
+                file_name: p.replace(/^.*[\\/]/, ''),
+                metadata: {}, candidates: [], match: null, error: e.message,
+            });
+        }
+    }
+    onlineState.recognized = results.map(buildRecognizedItem);
+    renderOnlineRecognize();
+    if (btn) { btn.disabled = false; btn.textContent = '识别选中文件'; }
+}
+
+function buildRecognizedItem(data) {
+    const target = data.match ? Object.assign({}, data.match) : null;
+    const options = [];
+    const seen = new Set();
+    const push = (t) => {
+        if (!t || !t.item_id) return;
+        const key = t.item_type + ':' + t.item_id;
+        if (seen.has(key)) return;
+        seen.add(key);
+        options.push({
+            item_type: t.item_type,
+            item_id: String(t.item_id),
+            label: t.label || key,
+            kind: t.kind || '',
+        });
+    };
+    push(target);
+    for (const video of (data.candidates || [])) {
+        push({ item_type: 'vl', item_id: video.item_id, label: '[作品] ' + (video.title || ''), kind: 'video' });
+        for (const season of (video.seasons || [])) {
+            push({ item_type: 'vs', item_id: season.item_id, label: '　└ S' + (season.season_number || '?') + ' ' + (season.season_title || ''), kind: 'season' });
+            for (const ep of (season.episodes || [])) {
+                push({ item_type: 've', item_id: ep.item_id, label: '　　└ S' + (season.season_number || '?') + 'E' + (ep.episode_number || '?') + ' ' + (ep.episode_title || ''), kind: 'episode' });
+            }
+        }
+    }
+    return {
+        file_path: data.file_path,
+        file_name: data.file_name || String(data.file_path || '').replace(/^.*[\\/]/, ''),
+        file_size: data.file_size || 0,
+        metadata: data.metadata || {},
+        match: data.match || null,
+        candidates: data.candidates || [],
+        options: options,
+        target: target,
+        storage: '',
+        error: data.error || '',
+    };
+}
+
+function renderOnlineRecognize() {
+    const card = document.getElementById('onlineRecognizeCard');
+    const box = document.getElementById('onlineRecognizeResult');
+    if (!card || !box) return;
+    const items = onlineState.recognized;
+    if (!items.length) { card.style.display = 'none'; box.innerHTML = ''; return; }
+    card.style.display = '';
+
+    const storages = (onlineState.config && onlineState.config.storages) || ['internal'];
+    const defaultStorage = (onlineState.config && onlineState.config.default_storage) || 'internal';
+
+    let html = '<div class="config-section">';
+    items.forEach((item, index) => {
+        const meta = item.metadata || {};
+        const optionHtml = item.options.length
+            ? item.options.map((t, i) =>
+                '<option value="' + i + '"' +
+                (item.target && item.target.item_type === t.item_type && String(item.target.item_id) === String(t.item_id) ? ' selected' : '') +
+                '>' + escapeOnline(t.label) + '（' + escapeOnline(t.item_type + '/' + t.item_id) + '）</option>').join('')
+            : '<option value="-1">未找到匹配，请使用上方搜索</option>';
+        const storageHtml = storages.map(s =>
+            '<option value="' + escapeOnline(s) + '"' + (s === (item.storage || defaultStorage) ? ' selected' : '') + '>' + escapeOnline(s) + '</option>').join('');
+        const seasonText = (meta.season != null ? ' · S' + meta.season : '') + (meta.episode != null ? 'E' + meta.episode : '');
+        html += '<div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px">' +
+            '<div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap">' +
+                '<div style="min-width:260px">' +
+                    '<div style="font-weight:600">' + escapeOnline(item.file_name) + '</div>' +
+                    '<div style="font-size:12px;color:var(--text-muted)">' + escapeOnline(item.file_path) + '</div>' +
+                    '<div style="font-size:12px;color:var(--text-muted);margin-top:4px">识别: ' +
+                        escapeOnline(meta.title || '-') + ' · TMDB: ' + escapeOnline(meta.tmdb_id || '-') +
+                        ' · 类型: ' + escapeOnline(meta.media_type || '-') + escapeOnline(seasonText) + '</div>' +
+                    (item.error ? '<div style="font-size:12px;color:#e5534b;margin-top:4px">' + escapeOnline(item.error) + '</div>' : '') +
+                '</div>' +
+                '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+                    '<select class="form-input" data-online-target="' + index + '" style="min-width:260px">' + optionHtml + '</select>' +
+                    '<select class="form-input" data-online-storage="' + index + '" style="min-width:130px">' + storageHtml + '</select>' +
+                    '<button class="btn btn-primary btn-sm" data-online-add="' + index + '">加入上传队列</button>' +
+                '</div>' +
+            '</div>' +
+        '</div>';
+    });
+    html += '</div>';
+    box.innerHTML = html;
+
+    box.querySelectorAll('[data-online-target]').forEach(node => node.addEventListener('change', () => {
+        const item = onlineState.recognized[parseInt(node.getAttribute('data-online-target'), 10)];
+        if (!item) return;
+        const idx = parseInt(node.value, 10);
+        item.target = idx >= 0 ? item.options[idx] : null;
+    }));
+    box.querySelectorAll('[data-online-storage]').forEach(node => node.addEventListener('change', () => {
+        const item = onlineState.recognized[parseInt(node.getAttribute('data-online-storage'), 10)];
+        if (item) item.storage = node.value;
+    }));
+    box.querySelectorAll('[data-online-add]').forEach(node => node.addEventListener('click', () => {
+        addOnlineTask(parseInt(node.getAttribute('data-online-add'), 10));
+    }));
+}
+
+async function searchOnlineTargets() {
+    const input = document.getElementById('onlineSearchInput');
+    const box = document.getElementById('onlineSearchResults');
+    const keyword = input ? input.value.trim() : '';
+    if (!keyword) { alert('请输入搜索关键词'); return; }
+    if (!box) return;
+    try {
+        const data = await searchOnlineTargetsApi(keyword);
+        const results = data.results || [];
+        if (!results.length) {
+            box.innerHTML = '<div class="empty-state"><p>未搜索到 Emos 条目</p></div>';
+            return;
+        }
+        let html = '<div class="table-container" style="max-height:260px;overflow:auto"><table>' +
+            '<thead><tr><th>标题</th><th style="width:100px">类型</th><th style="width:140px">item_id</th><th style="width:120px">操作</th></tr></thead><tbody>';
+        results.forEach((item, i) => {
+            html += '<tr><td>' + escapeOnline(item.title || '') + '</td>' +
+                '<td>' + escapeOnline(item.video_type || '') + '</td>' +
+                '<td>' + escapeOnline(item.item_type + '/' + item.item_id) + '</td>' +
+                '<td><button class="btn btn-secondary btn-sm" data-online-apply="' + i + '">设为目标</button></td></tr>';
+        });
+        html += '</tbody></table></div>';
+        box.innerHTML = html;
+        window._onlineSearchResults = results;
+        box.querySelectorAll('[data-online-apply]').forEach(node => node.addEventListener('click', () => {
+            applyOnlineSearchResult(parseInt(node.getAttribute('data-online-apply'), 10));
+        }));
+    } catch (e) {
+        alert('搜索失败: ' + e.message);
+    }
+}
+
+function applyOnlineSearchResult(index) {
+    const results = window._onlineSearchResults || [];
+    const result = results[index];
+    if (!result) return;
+    const pending = onlineState.recognized.filter(item => !item.target);
+    const targets = pending.length ? pending : onlineState.recognized;
+    if (!targets.length) { alert('请先识别视频文件'); return; }
+    const applyTo = pending.length ? pending[0] : targets[0];
+    const option = {
+        item_type: result.item_type || 'vl',
+        item_id: String(result.item_id),
+        label: result.title || '',
+        kind: 'video',
+    };
+    if (!applyTo.options.some(t => t.item_type === option.item_type && String(t.item_id) === String(option.item_id))) {
+        applyTo.options.unshift(option);
+    }
+    applyTo.target = option;
+    renderOnlineRecognize();
+}
+
+async function addOnlineTask(index) {
+    const item = onlineState.recognized[index];
+    if (!item) return;
+    if (!item.target) { alert('请先为该文件选择一个上传目标'); return; }
+    const meta = item.metadata || {};
+    try {
+        const result = await createOnlineTasksApi([{
+            file_path: item.file_path,
+            item_type: item.target.item_type,
+            item_id: String(item.target.item_id),
+            storage: item.storage || null,
+            title: meta.title || '',
+            season_number: meta.season == null ? null : meta.season,
+            episode_number: meta.episode == null ? null : meta.episode,
+        }]);
+        if (result.errors && result.errors.length) {
+            alert('创建任务失败: ' + result.errors.join('；'));
+        }
+        await loadOnlineTasks();
+    } catch (e) {
+        alert('创建任务失败: ' + e.message);
+    }
+}
+
+async function loadOnlineTasks() {
+    try {
+        const data = await loadOnlineTasksApi();
+        onlineState.tasks = data.tasks || [];
+        renderOnlineTasks();
+    } catch (e) {
+        console.error('加载在线任务失败:', e);
+    }
+}
+
+function renderOnlineTasks() {
+    const list = document.getElementById('onlineTaskList');
+    if (!list) return;
+    const tasks = onlineState.tasks;
+    if (!tasks.length) {
+        list.innerHTML = '<tr><td colspan="6"><div class="empty-state"><p>暂无任务</p></div></td></tr>';
+        return;
+    }
+    const statusMap = { queued: '排队中', uploading: '上传中', completed: '已完成', failed: '失败' };
+    list.innerHTML = tasks.map(t => {
+        const progress = Math.min(100, Math.max(0, Number(t.progress) || 0));
+        const statusText = statusMap[t.status] || t.status;
+        const color = t.status === 'completed' ? '#3fb950' : (t.status === 'failed' ? '#e5534b' : 'inherit');
+        const actions = (t.status === 'queued' || t.status === 'uploading')
+            ? '<span style="font-size:12px;color:var(--text-muted)">进行中…</span>'
+            : '<button class="btn btn-secondary btn-sm" data-online-retry="' + escapeOnline(t.id) + '">重试</button> ' +
+              '<button class="btn btn-secondary btn-sm" data-online-delete="' + escapeOnline(t.id) + '">删除</button>';
+        return '<tr>' +
+            '<td>' + escapeOnline(t.file_name) + '<div style="font-size:12px;color:var(--text-muted)">' + escapeOnline(t.file_path) + '</div></td>' +
+            '<td>' + escapeOnline(t.item_type + '/' + t.item_id) + '</td>' +
+            '<td>' + escapeOnline(t.storage || '') + '</td>' +
+            '<td><div class="progress-bar-container"><div class="progress-bar-fill" style="width:' + progress + '%"></div></div>' +
+                '<div style="font-size:12px;color:var(--text-muted);margin-top:4px">' + escapeOnline(t.stage || '') + ' ' + progress.toFixed(1) + '%' +
+                (t.speed ? ' · ' + escapeOnline(t.speed) : '') + '</div></td>' +
+            '<td style="color:' + color + '">' + escapeOnline(statusText) +
+                (t.error ? '<div style="font-size:12px">' + escapeOnline(t.error) + '</div>' : '') + '</td>' +
+            '<td>' + actions + '</td>' +
+        '</tr>';
+    }).join('');
+
+    list.querySelectorAll('[data-online-retry]').forEach(node => node.addEventListener('click', async () => {
+        try { await retryOnlineTaskApi(node.getAttribute('data-online-retry')); await loadOnlineTasks(); }
+        catch (e) { alert('重试失败: ' + e.message); }
+    }));
+    list.querySelectorAll('[data-online-delete]').forEach(node => node.addEventListener('click', async () => {
+        try { await deleteOnlineTaskApi(node.getAttribute('data-online-delete')); await loadOnlineTasks(); }
+        catch (e) { alert('删除失败: ' + e.message); }
+    }));
+}

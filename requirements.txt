@@ -21,12 +21,10 @@ uvicorn[standard]>=0.23.0
 # WebSocket依赖 - uvicorn[standard]已包含，此处显式声明确保可用
 websockets>=14.0
 
-# 数据库依赖 - 用于 emya 入库功能
+# 数据库依赖 - Web 后台配置/任务持久化（默认 SQLite）
 SQLAlchemy>=2.0.0
-PyMySQL>=1.1.0
-
-# 可选依赖 - 注释掉需要Python 3.12的包
-p123client  # 需要Python 3.12，暂时注释
+# 可选：使用 MySQL 作为后台数据库时启用
+# PyMySQL>=1.1.0
 
 # 开发依赖
 pytest>=7.0.0
@@ -38,5 +36,3 @@ nuitka>=1.0.0
 setuptools>=60.0.0
 wheel>=0.40.0
 
-cryptography
-websocket

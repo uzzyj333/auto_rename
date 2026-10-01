@@ -6,11 +6,11 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/liyk-master/auto_rename.git
+git clone https://github.com/uzzyj333/auto_rename.git
 cd auto_rename
 
 # 创建数据目录
-mkdir -p data logs strm
+mkdir -p data
 
 # 编辑 docker-compose.yml，修改挂载路径：
 # - /path/to/downloads:/downloads  （你的下载目录）
@@ -25,18 +25,6 @@ docker compose logs -f
 # 访问 Web 管理界面
 # http://localhost:8080
 # 首次启动会在日志中显示随机管理员密码
-```
-
-### 2. 仅启动 Web 管理界面（不监控文件）
-
-```bash
-docker compose --profile web-only up -d video-organizer-web-only
-```
-
-### 3. 开发模式（代码热重载）
-
-```bash
-docker compose --profile dev up -d video-organizer-dev
 ```
 
 ## 使用 Docker 命令
@@ -54,13 +42,11 @@ docker run -d \
   --name video-organizer \
   --restart unless-stopped \
   -p 8080:8080 \
-  -v $(pwd)/data/config.ini:/app/config.ini \
-  -v $(pwd)/data:/app/data \
-  -v $(pwd)/logs:/app/logs \
-  -v $(pwd)/strm:/app/strm \
+  -v ./data:/app/data \
+  -e VIDEO_ORGANIZER_LOG_DIR=/app/data/logs \
+  -e TZ=Asia/Shanghai \
   -v /path/to/downloads:/downloads \
   -v /path/to/media:/media \
-  -e TZ=Asia/Shanghai \
   video-organizer:latest
 ```
 
@@ -89,12 +75,10 @@ docker rm video-organizer
 
 | 容器路径 | 宿主机路径 | 说明 |
 |---------|-----------|------|
-| `/app/config.ini` | `./data/config.ini` | 配置文件（首次启动自动生成）|
-| `/app/data` | `./data` | 数据目录（秒传信息、数据库等）|
-| `/app/logs` | `./logs` | 日志目录 |
-| `/app/strm` | `./strm` | STRM 文件输出目录 |
+| `/app/data` | `./data` | 唯一持久化目录：config.ini、日志、SQLite 数据库 |
+| `/app/data/logs` | `./data/logs` | 日志目录（容器内固定路径，无需单独挂载）|
 | `/downloads` | 你的下载目录 | 监控的下载目录 |
-| `/media` | 你的媒体库目录 | 整理后的输出目录 |
+| `/media` | 你的媒体库目录 | 整理后的输出目录 / 在线识别上传的视频根目录 |
 
 ### 环境变量
 
@@ -102,11 +86,21 @@ docker rm video-organizer
 |-----|--------|------|
 | `TZ` | `Asia/Shanghai` | 时区 |
 | `PYTHONUNBUFFERED` | `1` | Python 输出不缓冲 |
+| `VIDEO_ORGANIZER_LOG_DIR` | `/app/data/logs` | 日志目录（容器内固定路径，不再映射宿主机日志路径）|
+| `VIDEO_ORGANIZER_DB_PATH` | `/app/data/video_organizer.db` | SQLite 数据库路径（默认与 config.ini 同一个持久化目录）|
 | `LOG_LEVEL` | `INFO` | 日志级别（DEBUG/INFO/WARNING/ERROR）|
 
 ### 端口
 
 - `8080` - Web 管理界面
+
+> 容器内以非 root 用户（uid 1000）运行，首次部署请先创建并授权数据目录：
+>
+> ```bash
+> mkdir -p data && chown -R 1000:1000 data
+> ```
+>
+> 若目录不可写，程序会自动回退到可写位置并在日志中给出警告，不会直接崩溃。
 
 ## 首次配置
 
@@ -125,9 +119,10 @@ docker compose logs | grep "管理员密码"
 - `[monitoring]` - 监控目录设置为 `/downloads`
 - `[monitoring]` - 输出目录设置为 `/media`
 - `[tmdb]` - 填入你的 TMDB API Key
-- `[yun139]` / `[cloud189]` / `[emos]` - 配置云盘上传（可选）
+- `[emos]` - 配置 Emos auth_token 与 base_url (必须)
+- `[online_upload]` - 配置在线识别上传的视频根目录 video_root
 
-或直接编辑 `./data/config.ini` 文件，然后重启容器：
+或直接编辑 `./data/config.ini` 文件后重启容器（在 Web 界面修改则立即生效，无需重启）：
 
 ```bash
 docker compose restart
@@ -172,7 +167,7 @@ path_mappings = {
 容器使用 `appuser` (UID 1000) 运行，确保挂载目录有读写权限：
 
 ```bash
-sudo chown -R 1000:1000 data logs strm
+sudo chown -R 1000:1000 data
 ```
 
 或修改 Dockerfile 中的 UID：
@@ -183,8 +178,8 @@ RUN useradd -m -u YOUR_UID appuser
 
 ### 2. 配置文件不生效
 
-- 确保配置文件路径正确挂载
-- 修改配置后需要重启容器：`docker compose restart`
+- 确认挂在 `./data` 的 `config.ini` 已保存
+- Web「配置管理」里修改的配置会立即热生效，无需重启容器；直接改文件才需要 `docker compose restart`
 
 ### 3. 无法访问 Web 界面
 

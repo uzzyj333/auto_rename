@@ -22,15 +22,15 @@
   - `video_file_handler.py` — 文件处理主循环
   - `filesystem_monitor.py` — 目录/下载器监控
   - `tmdb_client.py` — TMDB API 客户端
-  - `manual_rule_engine.py` — 手动规则 DSL 引擎
   - `guessit_parser.py` — GuessIt 集成 + 中文文件名预处理
+  - `emos_client.py` / `probe.py` / `online_upload.py` — Emos 官方 API 客户端、ffprobe 校验、在线识别上传服务
 - **Web 后端** (`web/`):
   - `app.py` — FastAPI 应用创建，`create_app()`
   - `auth.py` — HMAC-SHA256 令牌认证（非标准 JWT），服务重启所有 token 失效
-  - `routers/` — `config.py`, `tasks.py`, `logs.py`, `manual.py`, `auth.py`, `downloaders.py`, `strm.py`
+  - `routers/` — `config.py`, `tasks.py`, `logs.py`, `manual.py`, `auth.py`, `downloaders.py`, `online_upload.py`
   - `services/state.py` — `StateManager` 单例
-- **上传模块** (`upload/`): `yun139.py`/`upload_yun139.py`, `cloud189_upload.py`, `p123do.py`
-- **数据库** (`database/`): SQLAlchemy，用于 emya 入库和 DB 配置
+- **上传模块** (`upload/`): `upload_emos.py` — Emos 官方 API 上传（分片/直传 + save）
+- **数据库** (`database/`): SQLAlchemy，用于任务/配置持久化（默认 SQLite）
 - **配置文件:** `config.ini`（实际）、`config_template.ini`（模板），首次运行自动生成
 - **打包:** `build.sh` — PyInstaller 构建，spec 内嵌生成
 
@@ -44,9 +44,9 @@
 
 ## Docker
 
-- 正式镜像: `Dockerfile`（ENTRYPOINT + CMD `--web-only`）
-- 轻量镜像: `Dockerfile.run`（默认 `python run_organizer.py`，无 healthcheck）
-- `docker-compose.yml` 有 `video-organizer` 和 `video-organizer-dev` 两个 service
+- 正式镜像: `Dockerfile`（多阶段构建，内置 ffmpeg，默认 `python run_organizer.py --web`）
+- 单卷持久化: `./data:/app/data`（config.ini / 日志 / 数据库），不再映射 logs/strm 路径
+- `docker-compose.yml` 只有一个 `video-organizer` service
 
 ## 调试
 
@@ -73,3 +73,5 @@ python -c "import sys; sys.path.insert(0,'src'); from pathlib import Path; p=Pat
 - `GET /api/auth/first-run-credentials` — 首次运行随机密码
 - `/api/auth/`、`/static/`、`/api/health` 无需认证
 - WebSocket: `/api/tasks/ws/progress`, `/api/tasks/ws/dashboard`, `/api/logs/ws/{filename}`
+- 在线识别上传: `GET /api/online-upload/config|roots|search|tasks`、`POST /api/online-upload/browse|scan|probe|recognize|tasks|save-internal`、`POST /api/online-upload/tasks/{id}/retry`、`DELETE /api/online-upload/tasks/{id}|tasks/clear`
+- 配置在线修改后会自动热更新到视频处理器与在线识别上传服务，无需重启容器

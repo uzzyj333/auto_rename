@@ -21,6 +21,8 @@ FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     ca-certificates \
+    ffmpeg \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -34,8 +36,10 @@ COPY src/ ./src/
 COPY run_organizer.py .
 COPY config_template.ini ./config.ini
 
-# 创建必要的目录
-RUN mkdir -p /app/data /app/logs /app/strm && \
+# 创建必要目录，并预置一份带注释的配置模板到数据目录
+# 日志固定写入 /app/data/logs（env: VIDEO_ORGANIZER_LOG_DIR），不再映射宿主机日志路径
+RUN mkdir -p /app/data/logs && \
+    cp /app/config.ini /app/data/config.ini && \
     chmod -R 755 /app
 
 # 健康检查

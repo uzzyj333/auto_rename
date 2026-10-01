@@ -27,7 +27,7 @@ sudo usermod -aG docker $USER
 
 ```bash
 # 克隆仓库
-git clone https://github.com/liyk-master/auto_rename.git
+git clone https://github.com/uzzyj333/auto_rename.git
 cd auto_rename
 
 # 编辑配置文件
@@ -48,7 +48,7 @@ docker-compose down
 
 ```bash
 # 构建镜像
-docker build -f Dockerfile.run -t video-organizer .
+docker build -t video-organizer .
 
 # 运行容器
 docker run -d \
@@ -70,7 +70,7 @@ docker stop video-organizer
 
 ```bash
 # 在本地构建镜像并保存
-docker build -f Dockerfile.run -t video-organizer .
+docker build -t video-organizer .
 
 # 导出为tar文件
 docker save -o video-organizer.tar video-organizer
@@ -116,7 +116,7 @@ docker run -d \
 
 | 文件 | 说明 |
 |------|------|
-| `Dockerfile.run` | 直接运行模式的Dockerfile |
+| `Dockerfile` | 生产镜像（多阶段构建，含 ffmpeg）|
 | `docker-compose.yml` | Docker Compose配置 |
 | `config.ini` | 配置文件（需要自行创建或修改） |
 

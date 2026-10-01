@@ -13,10 +13,10 @@
 - 🎯 **GuessIt 增强识别** - 专业文件名解析库，提高识别准确率
 - ✏️ **自定义命名规则** - 灵活的 Jinja2 模板配置文件命名格式
 - 📁 **自动组织** - 根据类型和系列将文件移动到指定目录
-- ☁️ **多云盘支持** - EMOS、123 网盘、天翼云盘、中国移动云盘 (139 云盘)
+- ☁️ **Emos 官方 API** - 分片/断点续传上传，上传前 ffprobe 校验
 - 📥 **下载器监控** - 支持 qBittorrent 等下载器，自动清理已完成任务
 - 🌐 **Web 管理后台** - FastAPI + Uvicorn 提供的 Web 界面
-- 📺 **Emya 数据库集成** - 支持视频入库到 Emya 媒体库
+- 📤 **在线识别上传** - 浏览服务器视频、识别 Emos 条目、手动选择目标并上传
 - 📱 **Telegram 通知** - 上传进度推送
 
 ## 项目结构
@@ -32,10 +32,9 @@ auto_rename/
 │   │   ├── video_file_handler.py # 视频文件处理器
 │   │   ├── renamer.py            # 重命名逻辑
 │   │   ├── tmdb_client.py        # TMDB API 客户端
-│   │   ├── emya_service.py       # Emya 数据库服务
-│   │   ├── emya_api.py           # Emya API 封装
-│   │   ├── emya_models.py        # Emya 数据模型
-│   │   ├── db_manager.py         # 数据库管理器
+│   │   ├── emos_client.py        # Emos 官方 API 客户端
+│   │   ├── probe.py              # ffprobe 视频校验
+│   │   ├── online_upload.py      # 在线识别上传服务
 │   │   ├── downloader_monitor.py # 下载器监控器
 │   │   ├── file_mover.py         # 文件移动器
 │   │   ├── guessit_parser.py     # GuessIt 解析器
@@ -48,9 +47,7 @@ auto_rename/
 │   │   ├── path_manager.py       # 路径管理器
 │   │   └── llm_translator.py     # LLM 翻译工具
 │   ├── upload/                   # 上传相关模块
-│   │   ├── p123_organizer.py     # 123 网盘整理
-│   │   ├── cloud189_uploader.py  # 天翼云盘上传
-│   │   └── yun139_uploader.py    # 139 云盘上传
+│   │   └── upload_emos.py        # Emos 官方 API 上传（RobustEmosVideoUploader）
 │   ├── web/                      # Web 服务
 │   │   ├── app.py                # FastAPI 应用
 │   │   ├── routers/              # API 路由
@@ -65,7 +62,7 @@ auto_rename/
 ├── pyproject.toml                # 项目配置 (pytest)
 ├── setup.py                      # 安装脚本
 ├── docker-compose.yml            # Docker Compose 配置
-├── Dockerfile.run                # 运行模式 Dockerfile
+├── Dockerfile                    # 生产镜像（含 ffmpeg）
 └── run_organizer.py              # 运行脚本
 ```
 
@@ -179,8 +176,7 @@ video-organizer --log-level DEBUG
 # 使用轮询模式
 video-organizer --use-polling --polling-interval 5
 
-# 123 网盘整理模式
-video-organizer --organize-p123 --organize-dry-run
+# 在 Web 管理后台的「在线识别上传」页面浏览并上传视频
 
 # 仅启动 Web 管理后台
 video-organizer --web-only --web-host 0.0.0.0 --web-port 8080
@@ -278,7 +274,7 @@ prefer_guessit = False            # 是否优先使用 GuessIt 结果
 ### [processing] - 处理配置
 ```ini
 [processing]
-upload_targets = emos             # 上传目标：emos, p123, cloud189, yun139
+upload_targets = emos             # 上传目标固定为 Emos
 delete_after_upload = True
 max_upload_workers = 3            # 并发上传线程数
 ```
@@ -292,18 +288,24 @@ username = admin
 password = 123456
 ```
 
-### [emya_db] - Emya 数据库配置
+### [emos] - Emos 官方 API 配置
 ```ini
-[emya_db]
-enabled = False
-host = localhost
-port = 3306
-user = root
-password = ""
-database = emya
-default_user_id = 1
-default_tv_library = 电视剧
-default_movie_library = 电影
+[emos]
+auth_token = your_emos_token
+base_url = https://emos.best
+file_storage = internal
+file_storages = internal,global,google_drive
+chunk_size_mb = 50
+timeout = 60
+```
+
+### [online_upload] - 在线识别上传配置
+```ini
+[online_upload]
+video_root = /media            # 允许浏览/上传的视频根目录，多个用逗号分隔
+probe_enabled = True           # 上传前用 ffprobe 校验
+ffprobe_path =                 # ffprobe 路径，留空用 PATH
+path_type = local_emos_1       # saveInternal 使用的 path_type
 ```
 
 ## 开发约定
@@ -441,7 +443,7 @@ from src.video_organizer.utils.logging_utils import get_logger
 
 ### 构建镜像
 ```bash
-docker build -f Dockerfile.run -t video-organizer .
+docker build -t video-organizer .
 ```
 
 ### 运行容器

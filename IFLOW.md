@@ -44,7 +44,7 @@ src/
 - **jinja2**: 模板引擎
 - **tqdm**: 进度条显示
 - **httpx**: 现代化 HTTP 客户端
-- **p123client**: 123 网盘 API (可选，需要 Python 3.12)
+- **ffmpeg / ffprobe**: 上传前视频校验（Docker 镜像已内置）
 
 ### 开发依赖
 - **pytest**: 测试框架
@@ -119,8 +119,7 @@ video-organizer --log-level DEBUG
 # 使用轮询模式
 video-organizer --use-polling --polling-interval 5
 
-# 123网盘整理模式
-video-organizer --organize-p123 --organize-dry-run
+# 在 Web 管理后台的「在线识别上传」页面浏览并上传视频
 ```
 
 ### 测试
@@ -187,11 +186,7 @@ backup_count = 5
 [emos]
 # Emos 相关配置
 
-[p123]
-token = ""
-organize_source_id = 0
-organize_target_id = 0
-max_workers = 2
+
 
 [telegram]
 # Telegram 通知配置
@@ -319,14 +314,13 @@ TMDB API 客户端，负责：
 ## Docker 部署
 
 项目支持 Docker 容器化部署，相关文件：
-- `Dockerfile.run` - 直接运行模式的 Dockerfile
-- `Dockerfile` - 构建可执行文件的 Dockerfile
+- `Dockerfile` - 生产镜像（多阶段构建，内置 ffmpeg）
 - `docker-compose.yml` - Docker Compose 配置
 
 部署步骤：
 1. 构建 Docker 镜像
 2. 配置 `config.ini` 文件
-3. 挂载必要目录（视频目录、配置文件、日志目录）
+3. 挂载必要目录（下载目录、媒体目录、`./data` 数据目录）
 4. 运行容器
 
 ## 版本信息

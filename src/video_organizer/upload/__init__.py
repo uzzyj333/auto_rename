@@ -1,14 +1,9 @@
 """
 上传模块
-支持多种云盘上传服务
+
+只保留 Emos 官方 API 上传能力。
 """
 
-from .yun139 import Yun139, CloudType, FileInfo
-from .upload_yun139 import Yun139Uploader
+from .upload_emos import RobustEmosVideoUploader
 
-__all__ = [
-    "Yun139",
-    "CloudType",
-    "FileInfo",
-    "Yun139Uploader",
-]
+__all__ = ["RobustEmosVideoUploader"]

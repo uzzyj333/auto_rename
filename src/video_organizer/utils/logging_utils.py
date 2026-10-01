@@ -2,8 +2,9 @@ import logging
 import logging.handlers
 import os
 import sys
+import tempfile
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 
 # 日志格式
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -17,6 +18,38 @@ LOG_LEVELS = {
     "ERROR": logging.ERROR,
     "CRITICAL": logging.CRITICAL,
 }
+
+def get_log_dir() -> Path:
+    """返回统一的日志目录
+
+    优先使用环境变量 VIDEO_ORGANIZER_LOG_DIR；容器内使用 /app/logs；
+    本地开发时使用项目根目录下的 logs/。不再依赖主机路径映射。
+
+    如果首选目录不可写（例如容器里挂载目录权限不对），会依次回退到其他可写目录，
+    避免因为日志目录权限问题直接启动失败。
+    """
+    candidates: List[Path] = []
+    env_dir = os.environ.get("VIDEO_ORGANIZER_LOG_DIR", "").strip()
+    if env_dir:
+        candidates.append(Path(env_dir))
+    if os.name != "nt" and Path("/app").is_dir():
+        candidates.append(Path("/app/logs"))
+    candidates.append(Path(__file__).resolve().parents[3] / "logs")
+    candidates.append(Path(tempfile.gettempdir()) / "video-organizer-logs")
+
+    last_error: Optional[OSError] = None
+    for path in candidates:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".write-check"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+            return path
+        except OSError as exc:
+            last_error = exc
+            continue
+    print(f"警告: 日志目录均不可写，将仅输出到控制台: {last_error}")
+    return candidates[-1]
 
 
 def setup_logging(config: Optional[Dict[str, Any]] = None) -> None:
@@ -59,24 +92,9 @@ def setup_logging(config: Optional[Dict[str, Any]] = None) -> None:
 
     # 添加文件处理器
     if default_config["file_log"]:
-        log_file = default_config["log_file"]
-        
-        # 如果没有指定日志文件，使用默认路径
-        if not log_file:
-            # 尝试多个默认路径
-            default_paths = [
-                Path("logs/video-organizer.log"),
-                Path(__file__).parent.parent / "logs" / "video-organizer.log",
-            ]
-            for p in default_paths:
-                p.parent.mkdir(parents=True, exist_ok=True)
-                log_file = str(p)
-                break
-
-        # 确保日志目录存在
-        log_dir = os.path.dirname(log_file)
-        if log_dir and not os.path.exists(log_dir):
-            os.makedirs(log_dir)
+        # 统一使用固定日志目录内的文件名，避免主机/容器路径映射带来的问题
+        log_name = os.path.basename(str(default_config["log_file"] or "")) or "video-organizer.log"
+        log_file = str(get_log_dir() / log_name)
 
         try:
             max_bytes = int(default_config.get("log_max_bytes", 10 * 1024 * 1024))

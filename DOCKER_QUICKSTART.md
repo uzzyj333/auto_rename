@@ -6,11 +6,11 @@
 
 ```bash
 # 1. 克隆项目
-git clone https://github.com/liyk-master/auto_rename.git
+git clone https://github.com/uzzyj333/auto_rename.git
 cd auto_rename
 
-# 2. 创建数据目录
-mkdir -p data logs strm
+# 2. 创建数据目录（容器内以 uid 1000 运行，需要确保目录可写）
+mkdir -p data && chown -R 1000:1000 data
 
 # 3. 编辑 docker-compose.yml，修改挂载路径
 # /path/to/downloads -> 你的下载目录
@@ -36,34 +36,16 @@ docker compose logs | grep "管理员密码"
 - ✅ Multi-stage 构建，镜像体积优化
 - ✅ 非 root 用户运行，安全可靠
 - ✅ 自动健康检查
-- ✅ 支持热重载开发模式
+- ✅ 内置 ffmpeg / ffprobe，支持上传前视频校验
 - ✅ 完整的数据持久化
 
-## 三种运行模式
-
-### 1. 完整模式（Web + 文件监控）
+## 运行模式
 
 ```bash
 docker compose up -d
 ```
 
-自动监控下载目录，完成后刮削上传，并提供 Web 管理界面。
-
-### 2. 仅 Web 模式（不监控文件）
-
-```bash
-docker compose --profile web-only up -d video-organizer-web-only
-```
-
-只启动 Web 管理界面，通过 Web 手动处理文件或管理配置。
-
-### 3. 开发模式（代码热重载）
-
-```bash
-docker compose --profile dev up -d video-organizer-dev
-```
-
-代码修改后自动重启，适合开发调试。
+自动监控下载目录，完成后刮削并上传到 Emos，同时提供 Web 管理界面（含「在线识别上传」页面）。
 
 ## 配置说明
 
@@ -71,8 +53,8 @@ docker compose --profile dev up -d video-organizer-dev
 
 1. 查看日志获取随机管理员密码
 2. 访问 `http://localhost:8080` 登录
-3. 在"配置管理"页面填写 TMDB API Key 和云盘配置
-4. 或直接编辑 `./data/config.ini` 后重启容器
+3. 在`配置管理`页面填写 TMDB API Key 与 Emos auth_token（修改后立即生效，无需重启容器）
+4. 在`在线识别上传`页面选择视频根目录并上传；也可直接编辑 `./data/config.ini` 后重启容器
 
 ## 常用命令
 

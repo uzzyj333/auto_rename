@@ -75,9 +75,6 @@ class FileSystemMonitor:
             naming_rules=naming_rules,
             tmdb_config=tmdb_config,
             emos_config=emos_config,
-            p123_config=self.config.get("p123") if self.config else None,
-            cloud189_config=self.config.get("cloud189") if self.config else None,
-            yun139_config=self.config.get("yun139") if self.config else None,
             processing_config=processing_config,
             path_mappings=(
                 self.config.get("monitoring", {}).get("path_mappings")
@@ -86,7 +83,6 @@ class FileSystemMonitor:
             ),
             telegram_config=self.config.get("telegram") if self.config else None,
             config=self.config,
-            emya_db_config=self.config.get("emya_db") if self.config else None,
         )
         self.event_handler._parent_monitor = self  # 设置父监控器引用
 

@@ -27,41 +27,19 @@ DEFAULT_CONFIG = {
         "directory_metadata_format": "nfo",
         "directory_polling_interval": 5,
     },
-    "emos": {"auth_token": "", "base_url": "https://emos.lol"},
-    "p123": {
-        "token": "",
-        "parent_id": 0,
-        "max_workers": 2,
-        "organize_source_id": 0,  # 需要整理的源目录ID
-        "organize_target_id": 0,  # 整理到的目标目录ID
+    "emos": {
+        "auth_token": "",
+        "base_url": "https://emos.best",
+        "file_storage": "internal",  # internal / global / default / google_drive / zn_r2_upload
+        "file_storages": "internal,default,google_drive,zn_r2_upload",  # 在线上传页面可选的存储列表
+        "chunk_size_mb": 50,
+        "timeout": 60,
     },
-    "cloud189": {
-        "username": "",
-        "password": "",
-        "cookie": "",
-        "parent_folder_id": "-11",
-        "family_id": "",
-        "max_workers": 5,
-        "strm_server": "",  # STRM 服务器地址，如 http://192.0.2.0:5000
-        "strm_output_dir": "",  # STRM 文件输出目录
-        "delete_after": False,  # 上传完成后删除云端文件
-        "empty_recycle_bin": False,  # 上传完成后清空回收站
-        "generate_cas": False,  # 上传成功后生成 .cas 文件（用于秒传校验）
-        "cas_output_dir": "",  # .cas 文件输出目录，留空则输出到程序同级目录下的 cas/ 文件夹
-        "cas_upload_url": "",  # 外部 .cas 上传 API 地址
-        "cas_upload_api_key": "",  # 外部 .cas 上传 API 的 Bearer 认证密钥
-    },
-    "yun139": {
-        "authorization": "",  # Base64编码的认证信息
-        "cloud_type": "personal_new",  # 云盘类型: personal_new, personal, family, group
-        "cloud_id": "",  # 家庭云/群组云ID
-        "parent_id": "/",  # 根目录文件夹ID，空字符串表示根目录
-        "custom_part_size": 0,  # 自定义分片大小，0为自动
-        "max_workers": 3,  # 并行上传视频数量（每个视频内分片串行上传）
-        "strm_server": "",  # STRM 服务器地址，如 http://192.0.2.0:5010
-        "strm_output_dir": "",  # STRM 文件输出目录
-        "delete_after": False,  # 上传完成后删除云端文件
-        "app_mode": False,  # 使用 Android App 协议栈伪装上传（绕过 PC 通道限制）
+    "online_upload": {
+        "video_root": "",  # 允许浏览/上传的视频根目录，多个用逗号分隔（留空则使用监控目录）
+        "probe_enabled": True,  # 上传前用 ffprobe 校验并提取视频信息
+        "ffprobe_path": "",  # ffprobe 可执行文件路径，留空则使用 PATH
+        "path_type": "local_emos_1",  # saveInternal 使用的 path_type
     },
     "naming": {
         "tv_show_format": "{show_name}/Season {season:02d}/{show_name} {season_episode} {quality_tags}",
@@ -107,32 +85,6 @@ DEFAULT_CONFIG = {
         "rules": [],  # 手动规则列表
     },
     "downloaders": [],
-    "emya_db": {
-        "enabled": False,
-        "host": "localhost",
-        "port": 3306,
-        "user": "root",
-        "password": "",
-        "database": "emya",
-        "charset": "utf8mb4",
-        "pool_size": 5,
-        "max_overflow": 10,
-        "pool_recycle": 3600,
-        "default_user_id": 1,
-        "default_tv_library": "电视剧",
-        "default_movie_library": "电影",
-    },
-    "media_tracker": {
-        "enabled": False,
-        "host": "localhost",
-        "port": 8082,
-        "token": "",
-        "reconnect_delay": 5,
-        "app_mode": True,
-        # 上传配置
-        "upload_enabled": False,  # 是否启用上传到 media_tracker
-        "upload_cloud": "cloud-1",  # 云盘标识
-    },
     "auth": {
         "enabled": False,
         "username": "admin",
@@ -169,11 +121,15 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     # 检查配置文件是否存在
     if not os.path.exists(config_path):
         logger.warning(f"配置文件不存在: {config_path}")
-        # 创建默认配置目录
-        os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        # 保存默认配置
-        save_default_config(config_path)
-        logger.info(f"已创建默认配置文件: {config_path}")
+        try:
+            directory = os.path.dirname(config_path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            save_default_config(config_path)
+            logger.info(f"已创建默认配置文件: {config_path}")
+        except OSError as exc:
+            # 目录只读（例如容器挂载权限不对）时不要直接崩溃，先用内存默认配置跑起来
+            logger.warning(f"无法写入默认配置文件，改用内存中的默认配置: {exc}")
     
     config = configparser.ConfigParser()
     # 使用UTF-8编码读取配置文件，避免编码错误

@@ -23,7 +23,7 @@ from .routers import (
     manual_router,
     downloaders_router,
     auth_router,
-    strm_router,
+    online_upload_router,
 )
 from .auth import auth_middleware
 from ..database.config_operations import seed_from_ini
@@ -73,7 +73,15 @@ def create_app(
             seed_from_ini(config)
         except Exception as e:
             logger.warning(f"导入配置到数据库失败: {e}")
-    
+
+    # 初始化在线识别上传服务（配置在线修改后由配置路由热更新，无需重启）
+    try:
+        from ..core.online_upload import OnlineUploadService
+
+        OnlineUploadService.instance().configure(config or {})
+    except Exception as e:
+        logger.warning(f"初始化在线识别上传服务失败: {e}")
+
     app = FastAPI(
         title=title,
         version=version,
@@ -98,7 +106,7 @@ def create_app(
     app.include_router(logs_router, prefix="/api/logs", tags=["日志查看"])
     app.include_router(manual_router, prefix="/api/manual", tags=["手动处理"])
     app.include_router(downloaders_router, prefix="/api/downloaders", tags=["下载器监控"])
-    app.include_router(strm_router, tags=["STRM 代理"])
+    app.include_router(online_upload_router, prefix="/api/online-upload", tags=["在线识别上传"])
     
     # 认证中间件（对 API 请求进行登录检查）
     app.middleware("http")(auth_middleware)

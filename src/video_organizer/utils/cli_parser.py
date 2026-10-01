@@ -12,15 +12,6 @@ def get_cli_parser():
     parser = argparse.ArgumentParser(
         description="视频文件自动整理工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例用法:
-  python -m src.video_organizer.main --config config.json
-  python -m src.video_organizer.main --monitor-dir "D:\\Downloads"
-  python -m src.video_organizer.main --process "D:\\videos\\sample.mp4"  # 强制处理文件
-  python -m src.video_organizer.main --organize-p123  # 整理123网盘文件
-  python -m src.video_organizer.main --web  # 启动 Web 管理后台
-  python -m src.video_organizer.main --web --web-port 9000  # 指定端口启动 Web 后台
-        """,
     )
 
     # 配置文件参数
@@ -34,18 +25,6 @@ def get_cli_parser():
 
     # 强制处理文件参数
     parser.add_argument("--process", type=str, help="强制处理指定的文件")
-
-    # 123网盘整理参数
-    parser.add_argument(
-        "--organize-p123",
-        action="store_true",
-        help="整理123网盘中的文件（需要配置organize_source_id和organize_target_id）",
-    )
-
-    # 123网盘整理试运行参数
-    parser.add_argument(
-        "--organize-dry-run", action="store_true", help="试运行模式（只显示不执行）"
-    )
 
     # 版本信息参数
     parser.add_argument("-v", "--version", action="store_true", help="显示版本信息")

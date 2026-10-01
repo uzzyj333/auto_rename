@@ -204,9 +204,6 @@ def force_process_file(file_path: str, config: dict) -> bool:
         naming_rules = config.get("naming_rules")
         tmdb_config = config.get("tmdb")
         emos_config = config.get("emos", {})
-        p123_config = config.get("p123", {})
-        cloud189_config = config.get("cloud189", {})
-        yun139_config = config.get("yun139", {})
 
         # DEBUG: 打印 TMDB 配置
         print(f"DEBUG: TMDB config: {tmdb_config}")
@@ -235,14 +232,10 @@ def force_process_file(file_path: str, config: dict) -> bool:
             naming_rules=naming_rules,
             tmdb_config=tmdb_config,
             emos_config=emos_config,
-            p123_config=p123_config,
-            cloud189_config=cloud189_config,
-            yun139_config=yun139_config,
             processing_config=config.get("processing"),
             path_mappings=monitoring_config.get("path_mappings"),
             telegram_config=config.get("telegram"),
             config=config,
-            emya_db_config=config.get("emya_db"),  # 传递 emya 数据库配置
         )
 
         # 初始化并添加下载器（用于任务清理）
@@ -493,77 +486,6 @@ def main() -> None:
             display_config(config)
             sys.exit(0)
 
-        # 123网盘整理模式
-        if args.organize_p123:
-            from .upload.p123_organizer import P123Organizer
-
-            cli_output.print_header("123网盘整理模式")
-
-            p123_config = config.get("p123", {})
-            tmdb_config = config.get("tmdb", {})
-            token = p123_config.get("token", "")
-            organize_source_id = int(p123_config.get("organize_source_id", 0))
-            organize_target_id = int(p123_config.get("organize_target_id", 0))
-            max_workers = int(p123_config.get("max_workers", 2))
-            tmdb_api_key = tmdb_config.get("api_key", "")
-
-            if not token:
-                cli_output.print_error("123云盘 token 未配置")
-                sys.exit(1)
-
-            if organize_source_id == 0 or organize_target_id == 0:
-                cli_output.print_error(
-                    "请先配置 organize_source_id 和 organize_target_id"
-                )
-                cli_output.print_info("在 config.ini 的 [p123] 段落中添加:")
-                cli_output.print_info("  organize_source_id = 源目录ID")
-                cli_output.print_info("  organize_target_id = 目标目录ID")
-                sys.exit(1)
-
-            organizer = P123Organizer(
-                token=token,
-                organize_source_id=organize_source_id,
-                organize_target_id=organize_target_id,
-                max_workers=max_workers,
-                tmdb_api_key=tmdb_api_key,
-            )
-
-            if not organizer.is_available():
-                cli_output.print_error("123云盘整理功能不可用（p123client未安装）")
-                sys.exit(1)
-
-            dry_run = args.organize_dry_run
-            if dry_run:
-                cli_output.print_warning("试运行模式：只显示，不实际执行")
-
-            cli_output.print_info(f"源目录ID: {organize_source_id}")
-            cli_output.print_info(f"目标目录ID: {organize_target_id}")
-
-            # 使用流式处理（适用于大量文件）
-            cli_output.print_info("使用流式处理模式（适用于大量文件）")
-            result = organizer.organize_streaming(
-                source_id=organize_source_id,
-                target_id=organize_target_id,
-                dry_run=dry_run,
-                show_progress=True,
-            )
-
-            cli_output.print_separator()
-            cli_output.print_info("整理完成!")
-            cli_output.print_info(f"  成功: {result['success']}")
-            cli_output.print_info(f"  失败: {result['failed']}")
-            cli_output.print_info(f"  跳过: {result['skipped']}")
-            cli_output.print_info(f"  总计: {result['total']}")
-
-            if result["errors"]:
-                cli_output.print_warning("错误列表:")
-                for error in result["errors"][:10]:  # 只显示前10个
-                    cli_output.print_error(f"  - {error}")
-                if len(result["errors"]) > 10:
-                    cli_output.print_info(f"  ... 共 {len(result['errors'])} 个错误")
-
-            sys.exit(0)
-
         # 强制处理文件模式
         if args.process:
             cli_output.print_header("强制处理模式")
@@ -584,31 +506,6 @@ def main() -> None:
             state = get_state_manager()
             state.set_config(config, Path(config_path) if config_path else None)
             state.set_system_running(False)
-
-            # 在 web-only 模式下也初始化云盘客户端（供 strm 端点使用）
-            yun139_cfg = config.get("yun139", {})
-            raw_auth = yun139_cfg.get("authorization", "")
-            yun139_auth = str(raw_auth).split("#")[0].split(";")[0].strip()
-            if yun139_auth:
-                try:
-                    from .upload.upload_yun139 import Yun139Uploader
-                    uploader = Yun139Uploader(
-                        authorization=yun139_auth,
-                        cloud_type=yun139_cfg.get("cloud_type", "personal_new"),
-                        cloud_id=yun139_cfg.get("cloud_id", ""),
-                        parent_id=yun139_cfg.get("parent_id", "/"),
-                        custom_part_size=int(yun139_cfg.get("custom_part_size", 0)),
-                        app_mode=yun139_cfg.get("app_mode", False),
-                    )
-                    # 创建一个轻量 handler 容器，仅暴露 yun139_uploader
-                    class _MinimalHandler:
-                        pass
-                    handler = _MinimalHandler()
-                    handler.yun139_uploader = uploader
-                    state.set_video_handler(handler)
-                    cli_output.print_success("139云盘客户端已初始化")
-                except Exception as e:
-                    cli_output.print_warning(f"139云盘客户端初始化失败: {e}")
 
             # 启动 Web 服务（主线程运行）
             try:
@@ -653,21 +550,6 @@ def main() -> None:
                 downloader_monitors=downloader_monitors,
                 reload=args.web_reload,
             )
-
-        # 启动 Media Tracker 监听客户端
-        if config.get("media_tracker", {}).get("enabled", False):
-            try:
-                video_handler = getattr(monitor, "event_handler", None)
-                if video_handler and video_handler.renamer and video_handler.yun139_uploader:
-                    from .core.media_tracker_client import MediaTrackerClient
-                    mt_client = MediaTrackerClient(
-                        config=config.get("media_tracker", {}),
-                        renamer=video_handler.renamer,
-                        yun139_uploader=video_handler.yun139_uploader,
-                    )
-                    mt_client.start()
-            except Exception as e:
-                logger.warning(f"初始化 Media Tracker 客户端失败: {e}")
 
         try:
             # 启动监控

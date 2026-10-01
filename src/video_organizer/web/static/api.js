@@ -274,3 +274,47 @@ async function updateUserViaApi(id, data) {
 async function deleteUserViaApi(id) {
     return await apiRequest(`/auth/users/${id}`, { method: 'DELETE' });
 }
+// ===== 在线识别上传 API =====
+
+async function loadOnlineConfigApi() {
+    return await apiRequest('/online-upload/config');
+}
+async function loadOnlineRootsApi() {
+    return await apiRequest('/online-upload/roots');
+}
+async function browseOnlineApi(path) {
+    return await apiRequest('/online-upload/browse', { method: 'POST', body: JSON.stringify({ path: path || '' }) });
+}
+async function scanOnlineApi(path, recursive) {
+    return await apiRequest('/online-upload/scan', { method: 'POST', body: JSON.stringify({ path: path || '', recursive: recursive !== false }) });
+}
+async function probeOnlineApi(path) {
+    return await apiRequest('/online-upload/probe', { method: 'POST', body: JSON.stringify({ path }) });
+}
+async function recognizeOnlineApi(path) {
+    return await apiRequest('/online-upload/recognize', { method: 'POST', body: JSON.stringify({ path }) });
+}
+async function searchOnlineTargetsApi(q, videoType) {
+    const params = new URLSearchParams();
+    if (q) params.set('q', q);
+    if (videoType) params.set('video_type', videoType);
+    return await apiRequest(`/online-upload/search?${params.toString()}`);
+}
+async function loadOnlineTasksApi() {
+    return await apiRequest('/online-upload/tasks');
+}
+async function createOnlineTasksApi(items) {
+    return await apiRequest('/online-upload/tasks', { method: 'POST', body: JSON.stringify({ items }) });
+}
+async function retryOnlineTaskApi(taskId) {
+    return await apiRequest(`/online-upload/tasks/${encodeURIComponent(taskId)}/retry`, { method: 'POST' });
+}
+async function deleteOnlineTaskApi(taskId) {
+    return await apiRequest(`/online-upload/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' });
+}
+async function clearOnlineTasksApi() {
+    return await apiRequest('/online-upload/tasks/clear', { method: 'DELETE' });
+}
+async function saveInternalOnlineApi(data) {
+    return await apiRequest('/online-upload/save-internal', { method: 'POST', body: JSON.stringify(data) });
+}

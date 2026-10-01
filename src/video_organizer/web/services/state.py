@@ -33,7 +33,7 @@ class UploadProgress:
     """上传进度"""
     file_path: str
     filename: str
-    uploader: str  # cloud189, yun139, p123, emos
+    uploader: str  # emos
     progress: float  # 0-100
     uploaded_bytes: int
     total_bytes: int
@@ -139,27 +139,6 @@ class StateManager:
     def get_downloader_monitors(self) -> List[Any]:
         """获取下载器监控器列表"""
         return self._downloader_monitors.copy()
-    
-    def get_cloud_client(self, provider: str):
-        """
-        获取云盘客户端实例
-        
-        Args:
-            provider: 云盘类型 ("cloud189" 或 "yun139")
-            
-        Returns:
-            云盘客户端实例，如果不可用则返回 None
-        """
-        handler = self._video_handler
-        if not handler:
-            return None
-        if provider == "cloud189" and hasattr(handler, "cloud189_uploader"):
-            uploader = handler.cloud189_uploader
-            return uploader.client if uploader else None
-        if provider == "yun139" and hasattr(handler, "yun139_uploader"):
-            uploader = handler.yun139_uploader
-            return uploader.client if uploader else None
-        return None
     
     def set_system_running(self, running: bool) -> None:
         """设置系统运行状态"""
@@ -440,7 +419,7 @@ def report_upload_progress(
     Args:
         file_path: 文件路径
         filename: 文件名
-        uploader: 上传器名称 (cloud189, yun139, p123, emos)
+        uploader: 上传器名称（emos）
         progress: 进度百分比 (0-100)
         uploaded_bytes: 已上传字节数
         total_bytes: 总字节数

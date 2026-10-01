@@ -21,6 +21,22 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _apply_runtime_config(config: Dict[str, Any]) -> None:
+    """把最新配置同步到视频处理器与在线识别上传服务（无需重启容器）"""
+    try:
+        handler = get_state_manager().get_video_handler()
+        if handler is not None and hasattr(handler, "apply_config"):
+            handler.apply_config(config)
+    except Exception as e:
+        logger.warning(f"配置热更新同步到视频处理器失败: {e}")
+    try:
+        from ...core.online_upload import OnlineUploadService
+
+        OnlineUploadService.instance().configure(config)
+    except Exception as e:
+        logger.warning(f"配置热更新同步到在线识别上传服务失败: {e}")
+
+
 class ConfigUpdateRequest(BaseModel):
     section: str
     key: str
@@ -370,6 +386,8 @@ async def update_config_item(request: ConfigUpdateRequest):
         if config_path:
             from ...core.config_loader import update_config
             update_config(config, config_path)
+        state.set_config(config, config_path)
+        _apply_runtime_config(config)
         return ConfigResponse(
             success=True, message=f"配置项 '{request.section}.{request.key}' 已更新", config=config,
         )
@@ -394,8 +412,11 @@ async def update_config_section(request: ConfigSectionUpdateRequest):
             update_config(config, config_path)
             new_config = load_config(config_path)
             state.set_config(new_config, config_path)
+            effective_config = new_config
         else:
             state.set_config(config, config_path)
+            effective_config = config
+        _apply_runtime_config(effective_config)
         return ConfigResponse(success=True, message=f"配置节 '{request.section}' 已更新", config=config)
     except Exception as e:
         logger.error(f"更新配置节失败: {e}")
@@ -416,6 +437,7 @@ async def delete_config_section(section: str):
             update_config(config, config_path)
             new_config = load_config(config_path)
             state.set_config(new_config, config_path)
+            _apply_runtime_config(new_config)
         else:
             state.set_config(config, config_path)
         return ConfigResponse(success=True, message=f"配置节 '{section}' 已删除", config=config)
@@ -435,6 +457,7 @@ async def reload_config():
         from ...core.config_loader import load_config
         new_config = load_config(config_path)
         state.set_config(new_config, config_path)
+        _apply_runtime_config(new_config)
         return ConfigResponse(success=True, message="配置已重新加载", config=new_config)
     except HTTPException:
         raise
@@ -474,12 +497,24 @@ async def get_config_schema():
                 "backup_count": "日志文件备份数量",
             }
         },
-        "p123": {
-            "description": "123云盘配置",
+        "emos": {
+            "description": "Emos 官方 API 配置",
             "fields": {
-                "token": "123云盘 API Token",
-                "organize_source_id": "整理源目录ID",
-                "organize_target_id": "整理目标目录ID",
+                "auth_token": "Emos 认证令牌（Bearer Token）",
+                "base_url": "Emos 服务地址（如 https://emos.best）",
+                "file_storage": "默认文件存储类型",
+                "file_storages": "在线上传可选的存储列表",
+                "chunk_size_mb": "分片大小（MB）",
+                "timeout": "请求超时（秒）",
+            }
+        },
+        "online_upload": {
+            "description": "在线识别上传配置",
+            "fields": {
+                "video_root": "允许浏览/上传的视频根目录（多个用逗号分隔）",
+                "probe_enabled": "上传前是否用 ffprobe 校验视频",
+                "ffprobe_path": "ffprobe 可执行文件路径",
+                "path_type": "saveInternal 使用的 path_type",
             }
         },
         "naming": {

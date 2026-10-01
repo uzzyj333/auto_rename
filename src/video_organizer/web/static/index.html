@@ -121,6 +121,12 @@
                 </svg>
                 <span>手动处理</span>
             </a>
+            <a class="nav-item" data-page="online">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 21h16"/>
+                </svg>
+                <span>在线识别上传</span>
+            </a>
             <a class="nav-item" data-page="downloaders">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/>
@@ -318,26 +324,16 @@
                         <div class="cnav-group">
                             <div class="cnav-group-title">
                                 <span class="led led-cyan"></span>
-                                云盘配置
+                                Emos 云盘
                             </div>
-                            <a class="cnav-item" data-section="p123">
-                                <span class="cnav-led"></span>
-                                <span class="cnav-label">123云盘</span>
-                                <span class="cnav-badge">3</span>
-                            </a>
-                            <a class="cnav-item" data-section="cloud189">
-                                <span class="cnav-led"></span>
-                                <span class="cnav-label">天翼云盘</span>
-                                <span class="cnav-badge">—</span>
-                            </a>
-                            <a class="cnav-item" data-section="yun139">
-                                <span class="cnav-led"></span>
-                                <span class="cnav-label">139云盘</span>
-                                <span class="cnav-badge">—</span>
-                            </a>
                             <a class="cnav-item" data-section="emos">
                                 <span class="cnav-led"></span>
-                                <span class="cnav-label">Emby 云盘</span>
+                                <span class="cnav-label">Emos API</span>
+                                <span class="cnav-badge">—</span>
+                            </a>
+                            <a class="cnav-item" data-section="online_upload">
+                                <span class="cnav-led"></span>
+                                <span class="cnav-label">在线识别上传</span>
                                 <span class="cnav-badge">—</span>
                             </a>
                         </div>
@@ -354,11 +350,6 @@
                             <a class="cnav-item" data-section="guessit">
                                 <span class="cnav-led"></span>
                                 <span class="cnav-label">GuessIt 解析</span>
-                                <span class="cnav-badge">—</span>
-                            </a>
-                            <a class="cnav-item" data-section="emya_db">
-                                <span class="cnav-led"></span>
-                                <span class="cnav-label">Emby 数据库</span>
                                 <span class="cnav-badge">—</span>
                             </a>
                         </div>
@@ -477,6 +468,87 @@
                 <div class="card" id="validateResult" style="display:none">
                     <div class="card-header"><h3 class="card-title">刮削验证结果</h3></div>
                     <div id="validateContent"></div>
+                </div>
+            </div>
+
+            <!-- 在线识别上传 -->
+            <div id="page-online" class="page">
+                <div class="page-header">
+                    <h1 class="page-title">在线识别上传</h1>
+                    <p class="page-subtitle">浏览服务器视频 → 识别 Emos 条目 → 直接上传（修改配置后立即生效，无需重启容器）</p>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="card-title">1. 选择视频</h3>
+                        <button class="btn btn-secondary btn-sm" id="onlineRefreshBtn">刷新配置</button>
+                    </div>
+                    <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+                        <input type="text" class="form-input" id="onlinePathInput" placeholder="视频根目录或子目录路径..." style="flex:1;min-width:280px">
+                        <button class="btn btn-secondary" id="onlineBrowseBtn">浏览</button>
+                        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                            <input type="checkbox" id="onlineRecursiveCheck" checked> 递归
+                        </label>
+                        <button class="btn btn-secondary" id="onlineScanBtn">扫描视频</button>
+                    </div>
+                    <div id="onlineRootHint" style="margin-top:8px;font-size:13px;color:var(--text-muted)"></div>
+                    <div id="onlineDirPanel" style="display:none;margin-top:12px">
+                        <div class="table-container" style="max-height:280px;overflow:auto">
+                            <table>
+                                <thead><tr><th>名称</th><th style="width:100px">类型</th><th style="width:120px">大小</th><th style="width:80px">操作</th></tr></thead>
+                                <tbody id="onlineDirList"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div id="onlineVideoPanel" style="display:none;margin-top:12px">
+                        <div class="table-container" style="max-height:360px;overflow:auto">
+                            <table>
+                                <thead><tr>
+                                    <th style="width:40px"><input type="checkbox" id="onlineSelectAll"></th>
+                                    <th>视频文件</th><th style="width:120px">大小</th><th style="width:80px">操作</th>
+                                </tr></thead>
+                                <tbody id="onlineVideoList"></tbody>
+                            </table>
+                        </div>
+                        <div style="margin-top:8px;display:flex;gap:12px;align-items:center">
+                            <span id="onlineVideoCount" style="font-size:13px;color:var(--text-muted)"></span>
+                            <button class="btn btn-primary btn-sm" id="onlineRecognizeBtn" style="margin-left:auto">识别选中文件</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card" id="onlineProbeCard" style="display:none;margin-top:1.5rem">
+                    <div class="card-header"><h3 class="card-title">ffprobe 校验结果</h3></div>
+                    <div id="onlineProbeContent"></div>
+                </div>
+
+                <div class="card" id="onlineRecognizeCard" style="display:none;margin-top:1.5rem">
+                    <div class="card-header"><h3 class="card-title">2. 识别结果 / 选择上传目标</h3></div>
+                    <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px">
+                        <input type="text" class="form-input" id="onlineSearchInput" placeholder="搜索 Emos 条目（剧名 / 电影名），用于手动指定目标" style="flex:1">
+                        <button class="btn btn-secondary" id="onlineSearchBtn">搜索</button>
+                    </div>
+                    <div id="onlineSearchResults"></div>
+                    <div id="onlineRecognizeResult" style="margin-top:12px"></div>
+                </div>
+
+                <div class="card" style="margin-top:1.5rem">
+                    <div class="card-header">
+                        <h3 class="card-title">3. 上传队列</h3>
+                        <div style="display:flex;gap:8px">
+                            <button class="btn btn-secondary btn-sm" id="onlineClearTasksBtn">清空已完成</button>
+                            <button class="btn btn-secondary btn-sm" id="onlineRefreshTasksBtn">刷新</button>
+                        </div>
+                    </div>
+                    <div class="table-container">
+                        <table>
+                            <thead><tr>
+                                <th>文件</th><th style="width:150px">上传目标</th><th style="width:120px">存储</th>
+                                <th style="width:220px">进度</th><th style="width:140px">状态</th><th style="width:150px">操作</th>
+                            </tr></thead>
+                            <tbody id="onlineTaskList"><tr><td colspan="6"><div class="empty-state"><p>暂无任务</p></div></td></tr></tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
 

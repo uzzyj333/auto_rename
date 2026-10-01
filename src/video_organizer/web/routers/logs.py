@@ -41,48 +41,47 @@ class LogContentResponse(BaseModel):
     lines: List[LogEntry]
 
 
+def _log_dirs() -> List[Path]:
+    """日志目录列表
+
+    固定使用容器内部的日志目录，不再依赖主机路径映射，
+    从根本上避免「宿主机日志路径 ↔ 容器日志路径」不一致导致的问题。
+    """
+    dirs: List[Path] = []
+    try:
+        from ...utils.logging_utils import get_log_dir
+
+        canonical = get_log_dir()
+        if canonical not in dirs:
+            dirs.append(canonical)
+    except Exception:
+        pass
+    cwd = Path.cwd()
+    if cwd not in dirs:
+        dirs.append(cwd)
+    return dirs
+
+
 def _find_log_file(filename: str, config: dict) -> Optional[Path]:
     """
     查找日志文件
-    
+
     Args:
         filename: 日志文件名
-        config: 配置字典
-        
+        config: 配置字典（保留参数以兼容调用方）
+
     Returns:
         日志文件路径，如果未找到返回 None
     """
-    # 搜索路径列表（按优先级排序）
-    search_dirs = []
-    
-    # 1. 尝试从配置获取日志目录
-    logging_config = config.get("logging", {})
-    log_file = logging_config.get("file") or logging_config.get("log_file", "")
-    
-    if log_file:
-        log_path = Path(log_file)
-        if log_path.is_absolute():
-            search_dirs.append(log_path.parent)
-        else:
-            search_dirs.append(Path.cwd() / log_path.parent)
-    
-    # 2. 当前工作目录
-    search_dirs.append(Path.cwd())
-    
-    # 3. 项目目录下的 logs 文件夹
-    # video_organizer/web/routers/logs.py -> video_organizer/logs
-    search_dirs.append(Path(__file__).parent.parent / "logs")
-    # video_organizer/web/routers/logs.py -> src/video_organizer/logs
-    search_dirs.append(Path(__file__).parent.parent.parent / "video_organizer" / "logs")
-    # src/video_organizer/logs
-    search_dirs.append(Path(__file__).parent.parent.parent / "logs")
-    
-    for search_dir in search_dirs:
-        if search_dir.exists():
-            target = search_dir / filename
-            if target.exists():
-                return target
-    
+    safe_name = Path(str(filename)).name
+    if not safe_name:
+        return None
+    for search_dir in _log_dirs():
+        if not search_dir.exists():
+            continue
+        target = search_dir / safe_name
+        if target.exists():
+            return target
     return None
 
 
@@ -94,54 +93,28 @@ async def list_log_files():
     返回可用的日志文件。
     """
     try:
-        state = get_state_manager()
-        config = state.get_config()
-        
         log_files = set()
-        
-        # 搜索路径列表
-        search_dirs = []
-        
-        # 1. 从配置获取日志目录
-        logging_config = config.get("logging", {})
-        log_file = logging_config.get("file") or logging_config.get("log_file", "")
-        
-        if log_file:
-            log_path = Path(log_file)
-            if log_path.is_absolute():
-                search_dirs.append(log_path.parent)
-            else:
-                search_dirs.append(Path.cwd() / log_path.parent)
-        
-        # 2. 当前工作目录
-        search_dirs.append(Path.cwd())
-        
-        # 3. 项目目录下的 logs 文件夹
-        search_dirs.append(Path(__file__).parent.parent / "logs")
-        search_dirs.append(Path(__file__).parent.parent.parent / "video_organizer" / "logs")
-        search_dirs.append(Path(__file__).parent.parent.parent / "logs")
-        
-        for search_dir in search_dirs:
-            if search_dir.exists():
-                for f in search_dir.glob("*.log*"):
-                    log_files.add(f.name)
-        
+        for search_dir in _log_dirs():
+            if not search_dir.exists():
+                continue
+            for f in search_dir.glob("*.log*"):
+                log_files.add(f.name)
+
         # 确定当前日志文件名
         current_log = None
-        if log_file:
-            current_log = Path(log_file).name
-        elif log_files:
-            # 尝试找默认日志文件
-            for name in ["video-organizer.log", "video_organizer.log"]:
-                if name in log_files:
-                    current_log = name
-                    break
-        
+        for name in ["video-organizer.log", "video_organizer.log"]:
+            if name in log_files:
+                current_log = name
+                break
+        if current_log is None and log_files:
+            current_log = sorted(log_files, reverse=True)[0]
+
         return LogListResponse(
             success=True,
             files=sorted(log_files, reverse=True),
             current=current_log,
         )
+
     except Exception as e:
         logger.error(f"获取日志文件列表失败: {e}")
         raise HTTPException(status_code=500, detail=f"获取日志文件列表失败: {e}")

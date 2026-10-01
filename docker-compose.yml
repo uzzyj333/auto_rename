@@ -1,5 +1,18 @@
-version: '3.8'
-
+# Docker Compose 部署文件（仅 Emos 在线识别上传版）
+#
+# 快速开始：
+#   1.（可选）复制环境变量样例并按需修改：cp .env.example .env
+#   2. 首次部署先给数据目录授权（容器内以 uid 1000 运行）：
+#        mkdir -p data && sudo chown -R 1000:1000 data
+#   3. 构建并启动：docker compose up -d --build
+#   4. 查看日志：docker compose logs -f video-organizer
+#   5. 打开 http://<主机IP>:8080 访问 Web 界面
+#      （首次运行密码见日志：docker compose logs video-organizer | grep -i 密码）
+#
+# 设计说明：
+#   - 只挂载 ./data 一个持久化目录（config.ini / 日志 / 数据库都在里面），
+#     不再单独映射 logs / strm 等路径，避免主机与容器路径不一致导致的 bug。
+#   - 修改设置请直接在 Web 界面在线修改，保存后即时生效，无需重启容器。
 services:
   video-organizer:
     build:
@@ -9,74 +22,35 @@ services:
     container_name: video-organizer
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      # 左边是宿主机端口，可在 .env 里用 WEB_PORT 修改
+      - "${WEB_PORT:-8080}:8080"
     volumes:
-      # 配置文件（首次运行会自动生成模板）
-      - ./data/config.ini:/app/config.ini
-      # 数据目录（秒传信息、数据库等）
-      - ./data:/app/data
-      # 日志目录
-      - ./logs:/app/logs
-      # STRM 文件输出目录
-      - ./strm:/app/strm
-      # 监控目录 - 修改为你的下载目录
-      - /path/to/downloads:/downloads
-      # 输出目录 - 修改为你的媒体库目录
-      - /path/to/media:/media
+      # 唯一持久化目录：配置 / 日志 / 数据库
+      - "${DATA_PATH:-./data}:/app/data"
+      # 下载目录：改成你自己的下载目录
+      - "${DOWNLOADS_PATH:-./downloads}:/downloads"
+      # 媒体库目录：在「在线识别上传」里作为视频根目录
+      - "${MEDIA_PATH:-./media}:/media"
     environment:
-      - TZ=Asia/Shanghai
-      - PYTHONUNBUFFERED=1
+      TZ: "${TZ:-Asia/Shanghai}"
+      PYTHONUNBUFFERED: "1"
+      # 日志写入已挂载的 /app/data/logs，无需再映射宿主机日志路径
+      VIDEO_ORGANIZER_LOG_DIR: /app/data/logs
+      # 数据库文件放在数据卷内
+      VIDEO_ORGANIZER_DB_PATH: /app/data/video_organizer.db
+    command:
+      - python
+      - run_organizer.py
+      - --web
+      - --web-host
+      - 0.0.0.0
+      - --web-port
+      - "8080"
+      - --config
+      - /app/data/config.ini
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/api/health"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
-
-  # 仅 Web 模式（不启动文件监控）
-  video-organizer-web-only:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: video-organizer:latest
-    container_name: video-organizer-web
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./data/config.ini:/app/config.ini
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./strm:/app/strm
-    environment:
-      - TZ=Asia/Shanghai
-      - PYTHONUNBUFFERED=1
-    command: ["python", "run_organizer.py", "--web-only", "--web-host", "0.0.0.0", "--web-port", "8080"]
-    profiles:
-      - web-only
-
-  # 开发模式（代码热重载）
-  video-organizer-dev:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: video-organizer:latest
-    container_name: video-organizer-dev
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./src:/app/src:ro
-      - ./data/config.ini:/app/config.ini
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./strm:/app/strm
-      - /path/to/downloads:/downloads
-      - /path/to/media:/media
-    environment:
-      - TZ=Asia/Shanghai
-      - PYTHONUNBUFFERED=1
-      - LOG_LEVEL=DEBUG
-    command: ["python", "run_organizer.py", "--web", "--web-host", "0.0.0.0", "--web-port", "8080"]
-    profiles:
-      - dev
