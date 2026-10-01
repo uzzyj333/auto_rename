@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .emos_client import EmosApiError, EmosClient
 from .probe import probe_summary_for_upload, probe_video
@@ -78,6 +78,7 @@ class OnlineUploadTask:
     error: str = ""
     file_id: str = ""
     media_id: str = ""
+    original_deleted: bool = False
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
 
@@ -104,6 +105,7 @@ class OnlineUploadTask:
             "error": self.error,
             "file_id": self.file_id,
             "media_id": self.media_id,
+            "original_deleted": self.original_deleted,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -132,6 +134,8 @@ class OnlineUploadService:
         self._client: Optional[EmosClient] = None
         self._renamer = None
         self._probe_cache: Dict[str, Dict[str, Any]] = {}
+        # 可选：上传后清理原文件时的下载器回调（见 core/source_cleanup.py）
+        self._downloader_cleanup: Optional[Callable[[str], Optional[bool]]] = None
 
     # ------------------------------------------------------------------
     # 配置
@@ -189,6 +193,33 @@ class OnlineUploadService:
                     config=self._config,
                 )
             return self._renamer
+
+    def delete_after_upload_enabled(self) -> bool:
+        """是否开启「上传后删除原文件」（processing.delete_after_upload）"""
+        processing = self._config.get("processing") or {}
+        return bool(processing.get("delete_after_upload", False))
+
+    def _delete_source_if_configured(self, file_path: str) -> Tuple[bool, str]:
+        """上传成功后按配置处理原文件
+
+        Returns:
+            (是否已删除, 追加到任务阶段文案的后缀)
+        """
+        if not self.delete_after_upload_enabled():
+            return False, ""
+        try:
+            from .source_cleanup import cleanup_uploaded_source
+
+            outcome = cleanup_uploaded_source(file_path, downloader_cleanup=self._downloader_cleanup)
+        except Exception as exc:
+            logger.warning("上传后处理原文件失败: %s", exc)
+            return False, "（原文件删除失败）"
+        deleted = bool(outcome.get("deleted"))
+        reason = str(outcome.get("reason") or "")
+        logger.info("上传后处理原文件: %s -> %s", file_path, reason)
+        if deleted:
+            return True, "（已删除原文件）"
+        return False, (f"（原文件未删除：{reason}）" if reason else "（原文件未删除）")
 
     def config_snapshot(self) -> Dict[str, Any]:
         """返回前端需要的配置信息（不含 token 明文）"""
@@ -806,15 +837,18 @@ class OnlineUploadService:
                 metadata=metadata or None,
             )
             if result:
+                # 上传成功后按配置处理原文件（手动选片 / 自动上传 / Telegram 修正三条链路一致）
+                deleted, delete_note = self._delete_source_if_configured(snapshot["file_path"])
                 self._update_task(
                     task_id,
                     status="completed",
-                    stage="已完成",
+                    stage="已完成" + delete_note,
                     progress=100.0,
                     uploaded_bytes=snapshot["file_size"],
                     total_bytes=snapshot["file_size"],
                     file_id=str(result.get("file_id") or ""),
                     media_id=str(result.get("media_id") or ""),
+                    original_deleted=deleted,
                     error="",
                 )
             else:

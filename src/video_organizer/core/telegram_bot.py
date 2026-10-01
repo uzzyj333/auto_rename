@@ -644,11 +644,17 @@ class TelegramBotService:
             self.send_text(f"创建上传任务失败：{exc}", reply_to=reply_to, chat_id=chat_id)
             return
 
+        note = ""
+        try:
+            if service.delete_after_upload_enabled():
+                note = "\n（按配置，上传完成后会删除原文件）"
+        except Exception:
+            note = ""
         self.send_text(
             "✅ 已按修正目标重新上传\n"
             f"文件：{os.path.basename(file_path)}\n"
             f"目标：{match.get('label') or expr.describe()}\n"
-            f"任务：{task.get('id')}",
+            f"任务：{task.get('id')}{note}",
             reply_to=reply_to,
             chat_id=chat_id,
         )

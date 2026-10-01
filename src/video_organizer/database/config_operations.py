@@ -127,7 +127,7 @@ def seed_from_ini(config: Dict[str, Any]) -> bool:
                 items = {
                     "upload_targets": str(proc.get("upload_targets", "")),
                     "delete_after_upload": str(proc.get("delete_after_upload", "false")),
-                    "max_upload_workers": str(proc.get("max_upload_workers", "1")),
+                    "max_upload_workers": str(proc.get("max_upload_workers", "3")),
                 }
                 for k, v in items.items():
                     db.add(RuntimeConfig(key=k, value=v, description="", updated_at=now))

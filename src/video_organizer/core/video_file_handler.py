@@ -1,6 +1,5 @@
 import os
 import shutil
-import subprocess
 import threading
 import logging
 import time
@@ -14,6 +13,7 @@ from ..upload.upload_emos import RobustEmosVideoUploader
 
 from .emos_client import EmosClient
 from .probe import probe_summary_for_upload, probe_video
+from .source_cleanup import cleanup_uploaded_source, delete_file_with_retry
 from .renamer import VideoRenamer
 from .tmdb_client import TMDBClient
 from .subtitle_handler import SubtitleHandler
@@ -91,6 +91,12 @@ class VideoFileHandler:
         # 上传目标固定为 Emos 官方 API
         self.upload_targets = ["emos"]
 
+        # 上传队列工作线程管理（支持在线调整并发数，无需重启容器）
+        self._worker_lock = threading.Lock()
+        self._upload_workers: List[Any] = []  # [(thread, stop_event), ...]
+        self._worker_seq = 0
+        self._queue_running = False
+
         self._apply_processing_config()
         self._apply_emos_config()
         self._build_emos_client()
@@ -141,8 +147,6 @@ class VideoFileHandler:
         # 上传队列配置
         self._upload_queue = Queue()  # 上传队列
         self._use_queue = True  # 是否使用队列（可配置）
-        self._queue_running = False  # 队列运行标志
-        self._queue_thread = None  # 队列处理线程
 
         # 注册的下载器列表，用于清理任务
         self.downloaders = []
@@ -167,13 +171,17 @@ class VideoFileHandler:
         processing = self.processing_config or {}
         self.delete_after_upload = bool(processing.get("delete_after_upload", False))
         try:
-            self.max_upload_workers = max(1, int(processing.get("max_upload_workers", 1)))
+            self.max_upload_workers = max(1, int(processing.get("max_upload_workers", 3)))
         except (TypeError, ValueError):
-            self.max_upload_workers = 1
+            self.max_upload_workers = 3
         # 在线识别上传：ffprobe 校验配置（热更新时同步生效）
         online = self.config.get("online_upload") or {}
         self.probe_enabled = bool(online.get("probe_enabled", True))
         self.ffprobe_path = self._clean_value(online.get("ffprobe_path", ""))
+
+        # 在线修改「同时上传数量」后立即调整工作线程（调大补线程 / 调小回收线程）
+        if self._queue_running:
+            self._sync_upload_workers()
 
     def _apply_emos_config(self) -> None:
         """应用 Emos 配置"""
@@ -463,44 +471,77 @@ class VideoFileHandler:
             return False
 
     def _start_upload_queue(self):
-        """
-        启动上传队列处理线程
-        """
-        print(f"DEBUG: 尝试启动上传队列处理线程... 当前状态: {self._queue_running}")
-        with threading.Lock():
-            if not self._queue_running:
-                self._queue_running = True
+        """启动上传队列处理线程（按当前配置的工作线程数）"""
+        self._queue_running = True
+        self._sync_upload_workers()
 
-                print(f"DEBUG: 正在启动 {self.max_upload_workers} 个工作线程...")
-                # 启动指定数量的消费者线程
-                for i in range(self.max_upload_workers):
+    def _sync_upload_workers(self) -> None:
+        """
+        使实际工作线程数与 max_upload_workers 保持一致。
+
+        在线修改「同时上传数量」后立即生效：
+        - 调大并发：补足缺少的工作线程
+        - 调小并发：通知多余的工作线程在完成当前任务后退出
+        """
+        with self._worker_lock:
+            # 回收已经退出的线程
+            self._upload_workers = [
+                (thread, stop_event)
+                for thread, stop_event in self._upload_workers
+                if thread.is_alive()
+            ]
+
+            try:
+                target = max(1, int(self.max_upload_workers))
+            except (TypeError, ValueError):
+                target = 3
+            self.max_upload_workers = target
+
+            current = len(self._upload_workers)
+            if current < target:
+                for _ in range(target - current):
+                    self._worker_seq += 1
+                    stop_event = threading.Event()
                     thread = threading.Thread(
-                        target=self._worker_process_queue, args=(i + 1,), daemon=True
+                        target=self._worker_process_queue,
+                        args=(self._worker_seq, stop_event),
+                        daemon=True,
                     )
                     thread.start()
-                    self.logger.info(f"上传工作线程 #{i+1} 已启动")
-                    print(f"DEBUG: 工作线程 #{i+1} 已启动")
-            else:
-                print("DEBUG: 队列已经在运行中")
+                    self._upload_workers.append((thread, stop_event))
+                self.logger.info(
+                    f"上传工作线程已调整: {current} -> {len(self._upload_workers)}（并发上传数 {target}）"
+                )
+            elif current > target:
+                for _ in range(current - target):
+                    _, stop_event = self._upload_workers.pop()
+                    stop_event.set()
+                self.logger.info(
+                    f"上传工作线程已调整: {current} -> {len(self._upload_workers)}（多余线程将在当前任务完成后退出）"
+                )
 
-    def _worker_process_queue(self, worker_id):
+    def _worker_process_queue(
+        self, worker_id, stop_event: Optional[threading.Event] = None
+    ):
         """
         上传队列消费者工作函数
         Args:
             worker_id: 工作线程ID
+            stop_event: 通知该线程退出的信号（在线调小并发数时使用）
         """
-        print(f"DEBUG: 工作线程 #{worker_id} 进入主循环")
+        self.logger.debug(f"上传工作线程 #{worker_id} 进入主循环")
         while self._queue_running:
+            if stop_event is not None and stop_event.is_set():
+                break
             try:
-                # print(f"DEBUG: 工作线程 #{worker_id} 等待任务...")
                 # 从队列中获取文件路径，超时1秒
                 file_path = self._upload_queue.get(timeout=1)
                 if file_path is None:  # 退出信号
                     self._upload_queue.task_done()
-                    print(f"DEBUG: 工作线程 #{worker_id} 收到退出信号")
+                    self.logger.debug(f"上传工作线程 #{worker_id} 收到退出信号")
                     break
 
-                print(f"DEBUG: 工作线程 #{worker_id} 获取到任务: {file_path}")
+                self.logger.debug(f"上传工作线程 #{worker_id} 获取到任务: {file_path}")
 
                 # 显示队列状态
                 queue_size = self._upload_queue.qsize()
@@ -921,27 +962,24 @@ class VideoFileHandler:
             self._uploading_files.discard(file_path)
 
             # 如果配置了上传后删除文件，执行删除操作
+            #   - 文件来自下载器：先删下载任务，任务删掉后文件仍在（如 aria2）再兜底删除
+            #   - 下载器里还有未完成任务：暂不删除，避免破坏正在做种的种子
+            #   - 文件与下载器无关（例如手动放进媒体库）：直接删除
             deleted = False
             if self.delete_after_upload:
                 try:
-                    # 尝试从下载器中删除任务
-                    #   每次调用都会标记当前文件已上传完成
-                    #   qB 会在种子内所有视频都上传完后自动 deleteFiles=true
-                    task_removed = self._cleanup_download_task(file_path)
-
-                    if task_removed:
-                        deleted = True
-                        self.logger.info(f"下载任务已从下载器中删除: {file_path}")
-
-                        # 兜底：某些下载器（如 aria2）只删任务记录不删文件
-                        if os.path.exists(file_path):
-                            console_log(f"📁 [线程#{worker_id}] 文件仍存在，执行兜底删除")
-                            self._delete_file_with_background_retry(file_path)
-                    else:
-                        self.logger.info(f"[线程#{worker_id}] 下载器中仍有未完成的任务，文件暂不删除")
+                    outcome = cleanup_uploaded_source(
+                        file_path,
+                        downloader_cleanup=self._downloader_cleanup_state,
+                    )
+                    deleted = bool(outcome.get("deleted"))
+                    console_log(f"🗑️ [线程#{worker_id}] {outcome.get('reason')}: {file_path}")
+                    self.logger.info(
+                        f"上传后处理原文件: {outcome.get('reason')} - {file_path}"
+                    )
                 except Exception as e:
-                    console_log(f"❌ [线程#{worker_id}] 删除任务失败: {e}")
-                    self.logger.error(f"删除任务失败: {file_path}, 错误: {e}")
+                    console_log(f"❌ [线程#{worker_id}] 删除原文件失败: {e}")
+                    self.logger.error(f"删除原文件失败: {file_path}, 错误: {e}")
 
             # 更新日志
             log_success(
@@ -1055,14 +1093,30 @@ class VideoFileHandler:
 
     def stop_upload_queue(self):
         """停止上传队列处理线程"""
-        if self._queue_running:
-            self._queue_running = False
-            # 发送退出信号
+        self._queue_running = False
+        with self._worker_lock:
+            workers = list(self._upload_workers)
+            self._upload_workers = []
+        for _, stop_event in workers:
+            stop_event.set()
+        # 兼容旧逻辑：发送 None 退出信号，唤醒阻塞在队列上的线程
+        for _ in workers:
             self._upload_queue.put(None)
-            # 等待线程结束
-            if self._queue_thread and self._queue_thread.is_alive():
-                self._queue_thread.join(timeout=5)
+        for thread, _ in workers:
+            if thread.is_alive():
+                thread.join(timeout=5)
+        if workers:
             self.logger.info("上传队列处理线程已停止")
+
+    def get_upload_worker_count(self) -> int:
+        """当前存活的上传工作线程数"""
+        with self._worker_lock:
+            self._upload_workers = [
+                (thread, stop_event)
+                for thread, stop_event in self._upload_workers
+                if thread.is_alive()
+            ]
+            return len(self._upload_workers)
 
     def _reverse_apply_path_mapping(self, file_path: str) -> str:
         """
@@ -1100,6 +1154,37 @@ class VideoFileHandler:
 
         print(f"DEBUG: 未找到匹配的映射路径")
         return file_path
+
+    def _is_downloader_tracked(self, file_path: str) -> bool:
+        """文件是否与某个下载任务建立了映射
+
+        决定「上传后删除原文件」时是否走下载器逻辑：只有确实来自下载器的文件才需要
+        先删任务，避免误判成「下载器里还有未完成任务」而永远不删。
+        """
+        if not self._file_downloader_map:
+            return False
+        try:
+            downloader_file_path = self._reverse_apply_path_mapping(file_path)
+        except Exception:
+            downloader_file_path = file_path
+        candidates = [
+            file_path,
+            decode_file_path(file_path),
+            downloader_file_path,
+            decode_file_path(downloader_file_path),
+        ]
+        return any(key and key in self._file_downloader_map for key in candidates)
+
+    def _downloader_cleanup_state(self, file_path: str) -> Optional[bool]:
+        """供 core.source_cleanup 使用的三态回调
+
+        True  = 已从下载器删除任务
+        False = 下载器里还有未完成的任务，暂不删除文件
+        None  = 该文件与下载器无关，直接删除文件
+        """
+        if not self._is_downloader_tracked(file_path):
+            return None
+        return self._cleanup_download_task(file_path)
 
     def _cleanup_download_task(self, file_path) -> bool:
         """
@@ -1374,35 +1459,8 @@ class VideoFileHandler:
         Returns:
             bool: 是否成功启动了后台重试
         """
-        try:
-            ps_script = (
-                f'$path = "{file_path}"; '
-                f'$maxRetries = {max_retries}; '
-                f'$delay = {retry_interval}; '
-                "Start-Sleep -Seconds 3; "
-                "for($i=0; $i -lt $maxRetries; $i++) { "
-                "    if(Test-Path $path) { "
-                "        try { "
-                "            Remove-Item -LiteralPath $path -Force -ErrorAction Stop; "
-                "            exit 0 "
-                "        } catch { "
-                "            Start-Sleep -Seconds $delay "
-                "        } "
-                "    } else { "
-                "        exit 0 "
-                "    } "
-                "}; "
-                "exit 1"
-            )
-            subprocess.Popen(
-                ["powershell", "-NoProfile", "-Command", ps_script],
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            self.logger.info(f"已启动 PowerShell 后台重试删除文件: {file_path}")
-            return True
-        except Exception as e:
-            self.logger.warning(f"启动 PowerShell 后台重试失败: {e}")
-            return False
+        # 删除实现统一收敛到 core.source_cleanup.delete_file_with_retry
+        return delete_file_with_retry(file_path, max_retries, retry_interval)
 
     def _cleanup_old_records(self):
         """清理旧的处理记录，防止内存溢出"""
