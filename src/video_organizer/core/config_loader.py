@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 import configparser
@@ -7,6 +8,35 @@ from typing import Dict, Any, List, Optional
 
 # 配置日志记录器
 logger = logging.getLogger(__name__)
+
+# 支持多种下载器类型（同一类型可配置多个实例）
+KNOWN_DOWNLOADER_TYPES = ("aria2", "qbittorrent")
+
+
+def derive_downloader_type(instance_id: str) -> str:
+    """
+    从 downloader.<instance_id> 节名推导下载器类型。
+
+    支持同一类型配置多个实例：
+    - "aria2"       -> "aria2"
+    - "aria2_2"     -> "aria2"
+    - "qbittorrent" -> "qbittorrent"
+
+    Args:
+        instance_id: 配置节中 downloader. 后面的部分
+
+    Returns:
+        下载器类型，无法识别时返回清洗后的名称
+    """
+    text = (instance_id or "").strip().lower()
+    if not text:
+        return ""
+    if text in KNOWN_DOWNLOADER_TYPES:
+        return text
+    # 去掉结尾的实例序号，例如 aria2_2 / aria2-2 / aria2.2
+    base = re.sub(r"[\-_.]?\d+$", "", text)
+    return base or text
+
 
 # 默认配置值
 DEFAULT_CONFIG = {
@@ -279,16 +309,25 @@ def _config_to_dict(config: configparser.ConfigParser) -> Dict[str, Any]:
             "simple": config_dict["naming"].pop("simple_format"),
         }
     
-    # 特殊处理下载器配置
+    # 特殊处理下载器配置（支持同一类型多个实例，如 downloader.aria2_1 / downloader.aria2_2）
     config_dict["downloaders"] = []
     for section in config.sections():
         if section.startswith("downloader."):
-            downloader_config = {}
-            # 从section名称中提取下载器类型（例如：downloader.aria2 -> aria2）
-            downloader_type = section.split(".")[1] if "." in section else ""
-            downloader_config["type"] = downloader_type
+            instance_id = section.split(".", 1)[1]
+            explicit_type = (config[section].get("type") or "").strip().lower()
+            downloader_type = explicit_type or derive_downloader_type(instance_id)
+            if not downloader_type:
+                logger.warning(f"无法解析下载器类型，已跳过: {section}")
+                continue
+            downloader_config = {
+                "type": downloader_type,
+                "id": instance_id,
+                "section": section,
+            }
             for key, value in config[section].items():
                 downloader_config[key] = value
+            # 显式 type 字段优先，其余情况按节名推导
+            downloader_config["type"] = downloader_type
             config_dict["downloaders"].append(downloader_config)
     
     return config_dict

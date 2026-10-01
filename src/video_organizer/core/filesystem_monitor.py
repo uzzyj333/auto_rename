@@ -2,6 +2,7 @@
 File system monitoring module.
 """
 
+import json
 import logging
 import os
 import shutil
@@ -64,6 +65,8 @@ class FileSystemMonitor:
         # 初始化下载器监控器
         self.downloader_monitors = []
         self.downloader_configs = downloader_configs or []
+        self._downloader_signature = None  # 配置签名，用于判断是否需要热更新
+        self._downloader_running = False  # 监控器是否处于运行状态
 
         # 准备tmdb_config字典
         tmdb_config = {"api_key": tmdb_api_key, "retry_count": 3, "timeout": 30}
@@ -92,15 +95,31 @@ class FileSystemMonitor:
         # 初始化目录监控配置
         self._init_directory_monitor()
 
-    def _init_downloader_monitors(self):
-        """
-        Initialize downloader monitors based on the provided configs.
-        """
-        if not self.downloader_configs:
-            logger.warning("没有配置下载器，下载器监控功能将不可用")
-            return
+    @staticmethod
+    def _downloader_signature_for(configs) -> str:
+        """下载器配置签名，用于判断在线修改后是否需要重建监控器"""
+        normalized = []
+        for config in configs or []:
+            if not isinstance(config, dict):
+                continue
+            normalized.append(
+                {k: v for k, v in config.items() if k != "supported_extensions"}
+            )
+        try:
+            return json.dumps(
+                normalized, sort_keys=True, ensure_ascii=False, default=str
+            )
+        except Exception:
+            return str(normalized)
 
-        for config in self.downloader_configs:
+    def _build_downloader_monitors(self, configs) -> list:
+        """按配置创建下载器监控器（支持同一类型多个实例）"""
+        monitors = []
+        if not configs:
+            logger.warning("没有配置下载器，下载器监控功能将不可用")
+            return monitors
+
+        for config in configs:
             downloader_type = config.get("type")
             if not downloader_type:
                 logger.error("Downloader config missing 'type' field, skipping")
@@ -117,8 +136,65 @@ class FileSystemMonitor:
             )
 
             if monitor:
-                self.downloader_monitors.append(monitor)
-                logger.info(f"Initialized {downloader_type} monitor")
+                monitors.append(monitor)
+                logger.info(f"Initialized {downloader_type} monitor: {monitor.name}")
+        return monitors
+
+    def _init_downloader_monitors(self):
+        """
+        Initialize downloader monitors based on the provided configs.
+        """
+        self.downloader_monitors = self._build_downloader_monitors(
+            self.downloader_configs
+        )
+        self._downloader_signature = self._downloader_signature_for(
+            self.downloader_configs
+        )
+        if self.event_handler is not None:
+            self.event_handler.downloaders = list(self.downloader_monitors)
+
+    def reload_downloader_monitors(self, configs, force: bool = False) -> list:
+        """
+        在线修改下载器配置后重建监控器（无需重启容器）。
+
+        Args:
+            configs: 最新的 downloaders 配置列表
+            force: 是否强制重建（即使配置未变化）
+
+        Returns:
+            最新的下载器监控器列表
+        """
+        configs = list(configs or [])
+        signature = self._downloader_signature_for(configs)
+        if not force and signature == self._downloader_signature:
+            self.downloader_configs = configs
+            return list(self.downloader_monitors)
+
+        was_running = self._downloader_running
+        for monitor in self.downloader_monitors:
+            try:
+                # 有界等待，避免在线修改配置时被监控线程阻塞
+                monitor.stop(timeout=2.0)
+            except Exception as e:
+                logger.warning(f"停止下载器监控失败: {e}")
+
+        self.downloader_configs = configs
+        self.downloader_monitors = self._build_downloader_monitors(configs)
+        self._downloader_signature = signature
+
+        if was_running:
+            for monitor in self.downloader_monitors:
+                try:
+                    monitor.start()
+                except Exception as e:
+                    logger.error(f"启动下载器监控失败: {e}")
+
+        # 让文件处理器持有最新的下载器，确保删除原文件时能找到对应任务
+        if self.event_handler is not None:
+            self.event_handler.downloaders = list(self.downloader_monitors)
+
+        logger.info(f"下载器监控已热更新，共 {len(self.downloader_monitors)} 个实例")
+        return list(self.downloader_monitors)
 
     def _init_directory_monitor(self):
         """
@@ -883,6 +959,7 @@ class FileSystemMonitor:
         Start monitoring downloaders for completed downloads.
         """
         # 启动下载器监控器
+        self._downloader_running = True
         for monitor in self.downloader_monitors:
             monitor.start()
 
@@ -1005,6 +1082,7 @@ class FileSystemMonitor:
     def stop(self):
         """Stop monitoring."""
         # 停止下载器监控器
+        self._downloader_running = False
         for monitor in self.downloader_monitors:
             monitor.stop()
 

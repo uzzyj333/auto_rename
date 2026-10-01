@@ -33,6 +33,7 @@
 - **上传模块** (`upload/`): `upload_emos.py` — Emos 官方 API 上传（分片/直传 + save）
 - **数据库** (`database/`): SQLAlchemy，用于任务/配置持久化（默认 SQLite）
 - **配置文件:** `config.ini`（实际）、`config_template.ini`（模板），首次运行自动生成
+  - 下载器配置节 `downloader.<标识>` 支持同类型多实例：`downloader.aria2`、`downloader.aria2_2` 等，用 `type` 字段指定真实类型（aria2 / qbittorrent）
 - **打包:** `build.sh` — PyInstaller 构建，spec 内嵌生成
 
 ## 代码约定
@@ -76,4 +77,5 @@ python -c "import sys; sys.path.insert(0,'src'); from pathlib import Path; p=Pat
 - WebSocket: `/api/tasks/ws/progress`, `/api/tasks/ws/dashboard`, `/api/logs/ws/{filename}`
 - 在线识别上传: `GET /api/online-upload/config|roots|search|tasks`、`POST /api/online-upload/browse|scan|probe|recognize|tasks|save-internal`、`POST /api/online-upload/tasks/{id}/retry`、`DELETE /api/online-upload/tasks/{id}|tasks/clear`
 - Telegram 机器人: `GET /api/config/telegram/status`、`POST /api/config/telegram/test`（绑定 / 测试消息）
-- 配置在线修改后会自动热更新到视频处理器与在线识别上传服务，无需重启容器
+- 下载器: `GET /api/downloaders` 返回每个实例的 `id`（配置节标识）与 `type`，`/api/downloaders/{id}/{status|tasks|remove|pause|resume|processed}` 按实例标识访问
+- 配置在线修改后会自动热更新到视频处理器、在线识别上传服务、Telegram 机器人与下载器监控（新增/删除 aria2 实例、调整上传并发数均立即生效），无需重启容器

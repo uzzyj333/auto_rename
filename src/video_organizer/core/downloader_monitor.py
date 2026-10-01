@@ -169,15 +169,25 @@ class DownloaderMonitor(ABC):
     Abstract base class for downloader monitors.
     """
 
-    def __init__(self, callback: Callable[[str], None]):
+    def __init__(
+        self,
+        callback: Callable[[str], None],
+        name: Optional[str] = None,
+        identifier: Optional[str] = None,
+    ):
         """
         Initialize the downloader monitor.
 
         Args:
             callback: Callback function to call when a download is completed.
                       The callback should accept the file path as an argument.
+            name: 显示名称（支持同一类型配置多个下载器实例）
+            identifier: 实例唯一标识（对应配置节 downloader.<identifier>）
         """
         self.callback = callback
+        default_name = self.__class__.__name__.replace("Monitor", "").lower()
+        self.id = identifier or name or default_name
+        self.name = name or self.id
         self.running = False
         self.monitor_thread = None
 
@@ -189,9 +199,12 @@ class DownloaderMonitor(ABC):
         pass
 
     @abstractmethod
-    def stop(self):
+    def stop(self, timeout: Optional[float] = None):
         """
         Stop monitoring the downloader.
+
+        Args:
+            timeout: 后台线程的最长等待时间（秒），None 表示一直等待
         """
         pass
 
@@ -225,6 +238,8 @@ class Aria2Monitor(DownloaderMonitor):
         monitor_mode: str = "polling",
         path_mappings: Optional[Dict[str, str]] = None,
         websocket_reconnect_delay: int = 5,
+        name: Optional[str] = None,
+        identifier: Optional[str] = None,
     ):
         """
         Initialize the aria2 monitor.
@@ -239,7 +254,7 @@ class Aria2Monitor(DownloaderMonitor):
                           例如: {"/downloads": "F:/Downloads", "/data": "/mnt/data"}
             websocket_reconnect_delay: WebSocket 断线重连延迟（秒）
         """
-        super().__init__(callback)
+        super().__init__(callback, name=name, identifier=identifier)
         self.rpc_url = rpc_url
         self.secret = secret
         self.supported_extensions = supported_extensions
@@ -433,24 +448,27 @@ class Aria2Monitor(DownloaderMonitor):
         while self.running:
             time.sleep(60)  # 保持线程运行
 
-    def stop(self):
+    def stop(self, timeout: Optional[float] = None):
         """
         Stop monitoring aria2.
+
+        Args:
+            timeout: 后台线程的最长等待时间（秒），None 表示一直等待
         """
         self.running = False
         self._ws_running = False
-        
+
         if self._ws:
             try:
                 self._ws.close()
             except Exception:
                 pass
-        
+
         if self.monitor_thread:
-            self.monitor_thread.join()
+            self.monitor_thread.join(timeout=timeout)
         if self._ws_thread:
-            self._ws_thread.join()
-            
+            self._ws_thread.join(timeout=timeout)
+
         logger.info("Stopped aria2 monitor")
 
     def _websocket_loop(self):
@@ -778,6 +796,8 @@ class QBittorrentMonitor(DownloaderMonitor):
         password: str = "adminadmin",
         supported_extensions: tuple = (".mp4", ".mkv", ".avi", ".mov", ".wmv", ".strm"),
         path_mappings: Optional[Dict[str, str]] = None,
+        name: Optional[str] = None,
+        identifier: Optional[str] = None,
     ):
         """
         Initialize the qBittorrent monitor.
@@ -790,7 +810,7 @@ class QBittorrentMonitor(DownloaderMonitor):
             supported_extensions: Tuple of supported file extensions.
             path_mappings: 路径映射字典，将下载器返回的路径映射到主机实际路径
         """
-        super().__init__(callback)
+        super().__init__(callback, name=name, identifier=identifier)
         self.rpc_url = rpc_url
         self.username = username
         self.password = password
@@ -857,13 +877,16 @@ class QBittorrentMonitor(DownloaderMonitor):
         self.monitor_thread.start()
         logger.info(f"Started qBittorrent monitor with RPC URL: {self.rpc_url}")
 
-    def stop(self):
+    def stop(self, timeout: Optional[float] = None):
         """
         Stop monitoring qBittorrent.
+
+        Args:
+            timeout: 后台线程的最长等待时间（秒），None 表示一直等待
         """
         self.running = False
         if self.monitor_thread:
-            self.monitor_thread.join()
+            self.monitor_thread.join(timeout=timeout)
         logger.info("Stopped qBittorrent monitor")
 
     def is_connected(self) -> bool:
@@ -1376,6 +1399,8 @@ class DownloaderMonitorFactory:
                 callback,
                 rpc_url=rpc_url,
                 secret=config.get("secret") or config.get("password"),
+                name=config.get("name") or config.get("id") or downloader_type,
+                identifier=config.get("id") or config.get("name") or downloader_type,
                 supported_extensions=config.get(
                     "supported_extensions",
                     (".mp4", ".mkv", ".avi", ".mov", ".wmv", ".strm"),
@@ -1400,6 +1425,8 @@ class DownloaderMonitorFactory:
                 rpc_url=rpc_url,
                 username=config.get("username", "admin"),
                 password=config.get("password", "adminadmin"),
+                name=config.get("name") or config.get("id") or downloader_type,
+                identifier=config.get("id") or config.get("name") or downloader_type,
                 supported_extensions=config.get(
                     "supported_extensions",
                     (".mp4", ".mkv", ".avi", ".mov", ".wmv", ".strm"),

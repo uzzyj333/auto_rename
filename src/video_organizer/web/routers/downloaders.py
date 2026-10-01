@@ -17,8 +17,39 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _find_monitor(monitors, identifier: str):
+    """
+    按「实例名称」或「类型」查找下载器监控器。
+
+    支持同一类型配置多个实例（例如两个 aria2）：
+    1. 先按实例唯一标识精确匹配（downloader.<id>，如 aria2_2）
+    2. 再按显示名称匹配
+    3. 再按类型精确匹配（如 aria2，返回第一个）
+    4. 最后做前缀宽松匹配（如 aria2_9 -> aria2）
+    """
+    ident = (identifier or "").strip().lower()
+    if not ident:
+        return None
+    for monitor in monitors:
+        if str(getattr(monitor, "id", "")).lower() == ident:
+            return monitor
+    for monitor in monitors:
+        if str(getattr(monitor, "name", "")).lower() == ident:
+            return monitor
+    for monitor in monitors:
+        m_type = monitor.__class__.__name__.replace("Monitor", "").lower()
+        if m_type == ident:
+            return monitor
+    for monitor in monitors:
+        m_type = monitor.__class__.__name__.replace("Monitor", "").lower()
+        if m_type and ident.startswith(m_type):
+            return monitor
+    return None
+
+
 class DownloaderInfo(BaseModel):
     """下载器信息"""
+    id: str
     name: str
     type: str  # aria2, qbittorrent
     connected: bool
@@ -71,8 +102,12 @@ async def list_downloaders():
         
         downloaders = []
         for monitor in monitors:
+            fallback_name = monitor.__class__.__name__.replace("Monitor", "").lower()
+            monitor_id = getattr(monitor, "id", None) or fallback_name
+            monitor_name = getattr(monitor, "name", None) or monitor_id
             info = DownloaderInfo(
-                name=getattr(monitor, "name", "Unknown"),
+                id=monitor_id,
+                name=monitor_name,
                 type=monitor.__class__.__name__.replace("Monitor", "").lower(),
                 connected=False,
             )
@@ -109,12 +144,7 @@ async def get_downloader_status(downloader_type: str):
         state = get_state_manager()
         monitors = state.get_downloader_monitors()
         
-        monitor = None
-        for m in monitors:
-            m_type = m.__class__.__name__.replace("Monitor", "").lower()
-            if m_type == downloader_type.lower():
-                monitor = m
-                break
+        monitor = _find_monitor(monitors, downloader_type)
         
         if monitor is None:
             raise HTTPException(status_code=404, detail=f"下载器不存在: {downloader_type}")
@@ -159,12 +189,7 @@ async def get_downloader_tasks(downloader_type: str):
         state = get_state_manager()
         monitors = state.get_downloader_monitors()
         
-        monitor = None
-        for m in monitors:
-            m_type = m.__class__.__name__.replace("Monitor", "").lower()
-            if m_type == downloader_type.lower():
-                monitor = m
-                break
+        monitor = _find_monitor(monitors, downloader_type)
         
         if monitor is None:
             raise HTTPException(status_code=404, detail=f"下载器不存在: {downloader_type}")
@@ -218,12 +243,7 @@ async def remove_downloader_task(downloader_type: str, file_path: str, force: bo
         state = get_state_manager()
         monitors = state.get_downloader_monitors()
         
-        monitor = None
-        for m in monitors:
-            m_type = m.__class__.__name__.replace("Monitor", "").lower()
-            if m_type == downloader_type.lower():
-                monitor = m
-                break
+        monitor = _find_monitor(monitors, downloader_type)
         
         if monitor is None:
             raise HTTPException(status_code=404, detail=f"下载器不存在: {downloader_type}")
@@ -265,12 +285,7 @@ async def pause_downloader_task(downloader_type: str, file_path: str):
         state = get_state_manager()
         monitors = state.get_downloader_monitors()
         
-        monitor = None
-        for m in monitors:
-            m_type = m.__class__.__name__.replace("Monitor", "").lower()
-            if m_type == downloader_type.lower():
-                monitor = m
-                break
+        monitor = _find_monitor(monitors, downloader_type)
         
         if monitor is None:
             raise HTTPException(status_code=404, detail=f"下载器不存在: {downloader_type}")
@@ -309,12 +324,7 @@ async def resume_downloader_task(downloader_type: str, file_path: str):
         state = get_state_manager()
         monitors = state.get_downloader_monitors()
         
-        monitor = None
-        for m in monitors:
-            m_type = m.__class__.__name__.replace("Monitor", "").lower()
-            if m_type == downloader_type.lower():
-                monitor = m
-                break
+        monitor = _find_monitor(monitors, downloader_type)
         
         if monitor is None:
             raise HTTPException(status_code=404, detail=f"下载器不存在: {downloader_type}")
@@ -354,12 +364,7 @@ async def get_processed_files(downloader_type: str):
         state = get_state_manager()
         monitors = state.get_downloader_monitors()
         
-        monitor = None
-        for m in monitors:
-            m_type = m.__class__.__name__.replace("Monitor", "").lower()
-            if m_type == downloader_type.lower():
-                monitor = m
-                break
+        monitor = _find_monitor(monitors, downloader_type)
         
         if monitor is None:
             raise HTTPException(status_code=404, detail=f"下载器不存在: {downloader_type}")

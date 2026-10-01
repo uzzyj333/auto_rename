@@ -22,13 +22,23 @@ router = APIRouter()
 
 
 def _apply_runtime_config(config: Dict[str, Any]) -> None:
-    """把最新配置同步到视频处理器、在线识别上传服务与 Telegram 机器人（无需重启容器）"""
+    """把最新配置同步到视频处理器、下载器监控、在线识别上传服务与 Telegram 机器人（无需重启容器）"""
+    handler = None
     try:
         handler = get_state_manager().get_video_handler()
         if handler is not None and hasattr(handler, "apply_config"):
             handler.apply_config(config)
     except Exception as e:
         logger.warning(f"配置热更新同步到视频处理器失败: {e}")
+
+    # 下载器配置（含多个 aria2 实例）在线修改后立即生效，无需重启容器
+    try:
+        parent = getattr(handler, "_parent_monitor", None) if handler is not None else None
+        if parent is not None and hasattr(parent, "reload_downloader_monitors"):
+            monitors = parent.reload_downloader_monitors(config.get("downloaders") or [])
+            get_state_manager().set_downloader_monitors(monitors)
+    except Exception as e:
+        logger.warning(f"配置热更新同步到下载器监控失败: {e}")
     try:
         config_path = get_state_manager().get_config_path()
     except Exception:

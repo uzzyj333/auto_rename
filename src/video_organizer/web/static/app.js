@@ -1264,23 +1264,12 @@ async function processSelectedFiles() {
 async function loadDownloaders() {
     try {
         const result = await loadDownloadersFromApi();
-        const config = await loadConfigFromApi();
-        const nameMap = {};
-        if (config) {
-            Object.keys(config)
-                .filter(k => k.startsWith('downloader.'))
-                .forEach(k => {
-                    const sec = config[k];
-                    const type = sec.type || k.replace('downloader.', '');
-                    if (sec.name) nameMap[type] = sec.name;
-                });
-        }
         if (!result.downloaders || result.downloaders.length === 0) {
             el.downloaderList.innerHTML = `<tr><td colspan="3"><div class="empty-state"><p>暂无下载器</p></div></td></tr>`;
             return;
         }
         el.downloaderList.innerHTML = result.downloaders.map(d => `<tr>
-            <td>${escapeHtml(nameMap[d.type] || d.name)}</td>
+            <td>${escapeHtml(d.name || d.id || d.type)}</td>
             <td>${escapeHtml(d.type)}</td>
             <td><span class="badge ${d.connected ? 'badge-success' : 'badge-danger'}">${d.connected ? '已连接' : '未连接'}</span></td>
         </tr>`).join('');
@@ -1292,12 +1281,36 @@ async function loadDownloaders() {
 
 // ===== 下载器配置管理（INI 中的 downloader.* 节）=====
 
+const KNOWN_DOWNLOADER_TYPES = ['aria2', 'qbittorrent'];
+
+// 从 downloader.<id> 节名推导下载器类型，支持同一类型多个实例（如 aria2_2 -> aria2）
+function deriveDownloaderType(id) {
+    const text = String(id || '').trim().toLowerCase();
+    if (!text) return '';
+    if (KNOWN_DOWNLOADER_TYPES.includes(text)) return text;
+    const base = text.replace(/[\-_.]?\d+$/, '');
+    return base || text;
+}
+
+// 为新增下载器生成唯一标识（aria2、aria2_2、aria2_3 ...）
+function nextDownloaderId(baseType, existingIds) {
+    const ids = new Set((existingIds || []).map(x => String(x).toLowerCase()));
+    if (!ids.has(baseType)) return baseType;
+    let n = 2;
+    while (ids.has(`${baseType}_${n}`)) n++;
+    return `${baseType}_${n}`;
+}
+
 async function loadDownloaderConfigs() {
     try {
         const config = await loadConfigFromApi();
         const downloaders = Object.keys(config || {})
             .filter(k => k.startsWith('downloader.'))
-            .map(k => ({ section: k, type: k.replace('downloader.', ''), ...config[k] }));
+            .map(k => {
+                const id = k.slice('downloader.'.length);
+                const section = config[k] || {};
+                return { section: k, id, type: section.type || deriveDownloaderType(id), ...section };
+            });
         renderDownloaderConfigs(downloaders);
     } catch (e) {
         if (!e.message.includes('登录已过期')) console.error('加载下载器配置失败:', e);
@@ -1312,14 +1325,14 @@ function renderDownloaderConfigs(downloaders) {
         return;
     }
     el.downloaderConfigList.innerHTML = downloaders.map(d => {
-        const name = d.name || d.type || d.section.replace('downloader.', '');
-        const type = d.type || d.section.replace('downloader.', '');
+        const name = d.name || d.id || d.section.replace('downloader.', '');
+        const type = d.type || deriveDownloaderType(d.id);
         const host = d.host || '-';
         const port = d.port || '-';
         const user = d.username || '-';
         const rpc = d.rpc_url || (host !== '-' && port !== '-' ? `http://${host}:${port}${RPC_PATHS[type] || ''}` : '-');
         return `<tr>
-            <td><strong>${escapeHtml(name)}</strong></td>
+            <td><strong>${escapeHtml(name)}</strong><br><code style="font-size:0.7rem;color:var(--text-muted)">downloader.${escapeHtml(d.id || '')}</code></td>
             <td>${escapeHtml(type)}</td>
             <td>${escapeHtml(host)}</td>
             <td>${escapeHtml(port)}</td>
@@ -1334,9 +1347,10 @@ function renderDownloaderConfigs(downloaders) {
 }
 
 function editDownloaderConfig(data) {
-    const section = data.section;
-    const type = data.type || section.replace('downloader.', '');
-    el.modalTitle.textContent = '编辑下载器 — ' + type;
+    const section = data.section || '';
+    const id = data.id || (section ? section.replace('downloader.', '') : '');
+    const type = data.type || deriveDownloaderType(id) || 'aria2';
+    el.modalTitle.textContent = (section ? '编辑下载器 — ' : '添加下载器 — ') + type;
     el.modalBody.innerHTML = `
         <form id="downloaderForm" onsubmit="return false">
             <div class="form-group">
@@ -1344,14 +1358,15 @@ function editDownloaderConfig(data) {
                 <select id="dlType" class="form-input">
                     <option value="aria2" ${type==='aria2'?'selected':''}>Aria2</option>
                     <option value="qbittorrent" ${type==='qbittorrent'?'selected':''}>qBittorrent</option>
-                    <option value="transmission" ${type==='transmission'?'selected':''}>Transmission</option>
-                    <option value="rtorrent" ${type==='rtorrent'?'selected':''}>rTorrent</option>
-                    <option value="deluge" ${type==='deluge'?'selected':''}>Deluge</option>
                 </select>
             </div>
             <div class="form-group">
-                <label class="form-label">名称（标识）</label>
-                <input type="text" id="dlName" class="form-input" value="${escapeHtml(data.name||'')}" placeholder="My QBit">
+                <label class="form-label">标识（配置节名，同一类型多个实例必须唯一）</label>
+                <input type="text" id="dlId" class="form-input" value="${escapeHtml(id)}" placeholder="aria2_2">
+            </div>
+            <div class="form-group">
+                <label class="form-label">名称（显示用，可留空）</label>
+                <input type="text" id="dlName" class="form-input" value="${escapeHtml(data.name||'')}" placeholder="我的 Aria2">
             </div>
             <div class="form-group">
                 <label class="form-label">主机地址</label>
@@ -1362,12 +1377,12 @@ function editDownloaderConfig(data) {
                 <input type="text" id="dlPort" class="form-input" value="${escapeHtml(data.port||'')}" placeholder="6800">
             </div>
             <div class="form-group">
-                <label class="form-label">用户名</label>
-                <input type="text" id="dlUser" class="form-input" value="${escapeHtml(data.username||'')}" placeholder="">
+                <label class="form-label">RPC 密钥 / 密码</label>
+                <input type="password" id="dlSecret" class="form-input" value="${escapeHtml(data.secret||data.password||'')}" placeholder="">
             </div>
             <div class="form-group">
-                <label class="form-label">密码</label>
-                <input type="password" id="dlPass" class="form-input" value="${escapeHtml(data.password||'')}" placeholder="">
+                <label class="form-label">用户名（qBittorrent）</label>
+                <input type="text" id="dlUser" class="form-input" value="${escapeHtml(data.username||'')}" placeholder="">
             </div>
             <div class="form-group">
                 <label class="form-label">RPC URL（可选，留空自动拼接）</label>
@@ -1375,37 +1390,58 @@ function editDownloaderConfig(data) {
             </div>
         </form>
     `;
+    const typeSel = document.getElementById('dlType');
+    const idInput = document.getElementById('dlId');
+    typeSel.addEventListener('change', () => {
+        const cur = idInput.value.trim();
+        if (!cur || cur === type) idInput.value = typeSel.value;
+    });
     el.modalConfirmBtn.textContent = '保存';
     el.modalConfirmBtn.onclick = async () => {
-        const newType = document.getElementById('dlType').value;
-        const values = {};
+        const newType = typeSel.value;
+        let newId = idInput.value.trim().replace(/[^A-Za-z0-9_\-]/g, '');
+        if (!newId) newId = newType;
+        const values = { type: newType };
         const name = document.getElementById('dlName').value.trim();
         const host = document.getElementById('dlHost').value.trim();
         const port = document.getElementById('dlPort').value.trim();
         const user = document.getElementById('dlUser').value.trim();
-        const pass = document.getElementById('dlPass').value.trim();
+        const secret = document.getElementById('dlSecret').value.trim();
         const rpc = document.getElementById('dlRpcUrl').value.trim();
         if (name) values.name = name;
         if (host) values.host = host;
         if (port) values.port = port;
         if (user) values.username = user;
-        if (pass) values.password = pass;
+        if (secret) {
+            values.secret = secret;
+            values.password = secret;
+        }
         if (rpc) { values.rpc_url = rpc; }
         else if (host && port) { values.rpc_url = `http://${host}:${port}${RPC_PATHS[newType] || ''}`; }
+        const newSection = 'downloader.' + newId;
         try {
-            await saveConfigToApi('downloader.' + newType, values);
-            if (newType !== type) await deleteConfigSectionApi(section);
+            await saveConfigToApi(newSection, values);
+            if (section && section !== newSection) await deleteConfigSectionApi(section);
             showToast('下载器配置已保存', 'success');
             hideModal();
             await loadDownloaderConfigs();
+            await loadDownloaders();
         } catch (e) { showToast(`保存失败: ${e.message}`, 'error'); }
     };
     showModal();
 }
 window.editDownloaderConfig = editDownloaderConfig;
 
-function showAddDownloaderModal() {
-    editDownloaderConfig({ section: '', type: 'aria2' });
+async function showAddDownloaderModal() {
+    let existingIds = [];
+    try {
+        const config = await loadConfigFromApi();
+        existingIds = Object.keys(config || {})
+            .filter(k => k.startsWith('downloader.'))
+            .map(k => k.slice('downloader.'.length));
+    } catch (e) { /* ignore */ }
+    const id = nextDownloaderId('aria2', existingIds);
+    editDownloaderConfig({ section: '', id, type: 'aria2' });
     el.modalTitle.textContent = '添加下载器';
     el.modalConfirmBtn.textContent = '添加';
 }
@@ -1417,6 +1453,7 @@ async function deleteDownloaderConfig(section) {
         await deleteConfigSectionApi(section);
         showToast('下载器配置已删除', 'success');
         await loadDownloaderConfigs();
+        await loadDownloaders();
     } catch (e) { showToast(`删除失败: ${e.message}`, 'error'); }
 }
 window.deleteDownloaderConfig = deleteDownloaderConfig;
@@ -2238,7 +2275,8 @@ function renderOnlineTasks() {
                 '<div style="font-size:12px;color:var(--text-muted);margin-top:4px">' + escapeOnline(t.stage || '') + ' ' + progress.toFixed(1) + '%' +
                 (t.speed ? ' · ' + escapeOnline(t.speed) : '') + '</div></td>' +
             '<td style="color:' + color + '">' + escapeOnline(statusText) +
-                (t.error ? '<div style="font-size:12px">' + escapeOnline(t.error) + '</div>' : '') + '</td>' +
+                (t.error ? '<div style="font-size:12px">' + escapeOnline(t.error) + '</div>' : '') +
+                (t.original_deleted ? '<div style="font-size:12px;color:var(--text-muted)">已删除原文件</div>' : '') + '</td>' +
             '<td>' + actions + '</td>' +
         '</tr>';
     }).join('');
