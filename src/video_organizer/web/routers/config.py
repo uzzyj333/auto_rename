@@ -22,7 +22,7 @@ router = APIRouter()
 
 
 def _apply_runtime_config(config: Dict[str, Any]) -> None:
-    """把最新配置同步到视频处理器与在线识别上传服务（无需重启容器）"""
+    """把最新配置同步到视频处理器、在线识别上传服务与 Telegram 机器人（无需重启容器）"""
     try:
         handler = get_state_manager().get_video_handler()
         if handler is not None and hasattr(handler, "apply_config"):
@@ -30,11 +30,21 @@ def _apply_runtime_config(config: Dict[str, Any]) -> None:
     except Exception as e:
         logger.warning(f"配置热更新同步到视频处理器失败: {e}")
     try:
+        config_path = get_state_manager().get_config_path()
+    except Exception:
+        config_path = None
+    try:
         from ...core.online_upload import OnlineUploadService
 
-        OnlineUploadService.instance().configure(config)
+        OnlineUploadService.instance().configure(config, config_path)
     except Exception as e:
         logger.warning(f"配置热更新同步到在线识别上传服务失败: {e}")
+    try:
+        from ...core.telegram_bot import TelegramBotService
+
+        TelegramBotService.instance().configure(config, config_path)
+    except Exception as e:
+        logger.warning(f"配置热更新同步到 Telegram 机器人失败: {e}")
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -345,6 +355,39 @@ async def update_runtime_config(config_key: str, request: RuntimeConfigUpdateReq
 # ===== INI Config Endpoints =====
 
 
+# ===== Telegram 机器人 =====
+
+
+@router.get("/telegram/status")
+async def get_telegram_status():
+    """Telegram 机器人状态（运行中 / 已绑定 / 待回复报错数）"""
+    try:
+        from ...core.telegram_bot import TelegramBotService
+
+        state = get_state_manager()
+        service = TelegramBotService.instance()
+        service.configure(state.get_config(), state.get_config_path())
+        return {"success": True, **service.status()}
+    except Exception as e:
+        logger.error(f"获取 Telegram 状态失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取 Telegram 状态失败: {e}")
+
+
+@router.post("/telegram/test")
+async def send_telegram_test():
+    """发送一条 Telegram 测试消息，验证 bot_token / chat_id 是否可用"""
+    try:
+        from ...core.telegram_bot import TelegramBotService
+
+        state = get_state_manager()
+        service = TelegramBotService.instance()
+        service.configure(state.get_config(), state.get_config_path())
+        return service.test_message()
+    except Exception as e:
+        logger.error(f"发送 Telegram 测试消息失败: {e}")
+        raise HTTPException(status_code=500, detail=f"发送测试消息失败: {e}")
+
+
 @router.get("", response_model=ConfigResponse)
 async def get_config():
     try:
@@ -523,6 +566,17 @@ async def get_config_schema():
                 "tv_show": "电视剧命名模板",
                 "movie": "电影命名模板",
                 "anime": "动漫命名模板",
+            }
+        },
+        "telegram": {
+            "description": "Telegram 报错通知与机器人回复修正",
+            "fields": {
+                "bot_token": "Telegram Bot Token（@BotFather 获取）",
+                "chat_id": "绑定的会话 ID，留空可在 Telegram 发送 /bind 自动绑定",
+                "enabled": "是否启用 Telegram 通知",
+                "reply_enabled": "是否启用机器人回复修正（长轮询接收消息）",
+                "allowed_user_ids": "允许操作的用户 ID，逗号分隔，留空不限制",
+                "poll_timeout": "getUpdates 长轮询超时（秒）",
             }
         },
         "processing": {

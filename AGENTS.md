@@ -24,6 +24,7 @@
   - `tmdb_client.py` — TMDB API 客户端
   - `guessit_parser.py` — GuessIt 集成 + 中文文件名预处理
   - `emos_client.py` / `probe.py` / `online_upload.py` — Emos 官方 API 客户端、ffprobe 校验、在线识别上传服务
+  - `telegram_bot.py` — Telegram 机器人：上传报错通知 + 回复修正上传目标（长轮询 getUpdates）
 - **Web 后端** (`web/`):
   - `app.py` — FastAPI 应用创建，`create_app()`
   - `auth.py` — HMAC-SHA256 令牌认证（非标准 JWT），服务重启所有 token 失效
@@ -74,4 +75,5 @@ python -c "import sys; sys.path.insert(0,'src'); from pathlib import Path; p=Pat
 - `/api/auth/`、`/static/`、`/api/health` 无需认证
 - WebSocket: `/api/tasks/ws/progress`, `/api/tasks/ws/dashboard`, `/api/logs/ws/{filename}`
 - 在线识别上传: `GET /api/online-upload/config|roots|search|tasks`、`POST /api/online-upload/browse|scan|probe|recognize|tasks|save-internal`、`POST /api/online-upload/tasks/{id}/retry`、`DELETE /api/online-upload/tasks/{id}|tasks/clear`
+- Telegram 机器人: `GET /api/config/telegram/status`、`POST /api/config/telegram/test`（绑定 / 测试消息）
 - 配置在线修改后会自动热更新到视频处理器与在线识别上传服务，无需重启容器

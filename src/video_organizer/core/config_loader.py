@@ -70,7 +70,14 @@ DEFAULT_CONFIG = {
         "console_log": True,
         "file_log": False,
     },
-    "telegram": {"bot_token": "", "chat_id": ""},
+    "telegram": {
+        "bot_token": "",  # Telegram Bot Token（@BotFather 获取）
+        "chat_id": "",  # 绑定的会话 ID，可留空后在 Telegram 发送 /bind 自动绑定
+        "enabled": True,  # 是否启用 Telegram 通知
+        "reply_enabled": True,  # 是否启用机器人回复修正（长轮询接收消息）
+        "allowed_user_ids": "",  # 允许操作的用户 ID，逗号分隔，留空表示不限制
+        "poll_timeout": 30,  # getUpdates 长轮询超时（秒）
+    },
     "llm_fallback": {"enabled": False, "max_concurrent": 2},
     "llm_provider_1": {"name": "", "api_url": "", "api_key": "", "model": "", "enabled": False, "weight": 1, "timeout": 30, "max_retries": 2},
     "llm_provider_2": {"name": "", "api_url": "", "api_key": "", "model": "", "enabled": False, "weight": 1, "timeout": 30, "max_retries": 2},

@@ -318,3 +318,11 @@ async function clearOnlineTasksApi() {
 async function saveInternalOnlineApi(data) {
     return await apiRequest('/online-upload/save-internal', { method: 'POST', body: JSON.stringify(data) });
 }
+// ===== Telegram 机器人 API =====
+
+async function loadTelegramStatusApi() {
+    return await apiRequest('/config/telegram/status');
+}
+async function sendTelegramTestApi() {
+    return await apiRequest('/config/telegram/test', { method: 'POST' });
+}

@@ -44,6 +44,7 @@ class TaskCreateRequest(BaseModel):
     item_id: Any
     storage: Optional[str] = None
     title: Optional[str] = ""
+    media_type: Optional[str] = ""
     season_number: Optional[Any] = None
     episode_number: Optional[Any] = None
 

@@ -19,6 +19,7 @@
 | **手动规则 DSL** | 自定义屏蔽词、替换、定位截取、内嵌 TMDB ID |
 | **Web 管理后台** | FastAPI + SPA，实时仪表盘、配置管理、手动处理、日志查看 |
 | **Emos 上传** | 官方 API 上传 + 在线识别上传（浏览服务器视频、识别条目、手动选择目标）|
+| **Telegram 报错修正** | 上传失败推送报错到 TG，直接回复「剧名SxxExx」即可改传正确剧集 |
 | **下载器监控** | 自动监控 aria2 / qBittorrent 下载完成事件 |
 | **文件监控** | 目录轮询 + 文件稳定性检测，自动整理归档 |
 | **LLM 兜底** | 多 Provider 负载均衡（OpenAI / DeepSeek / 智谱等）|
@@ -153,7 +154,7 @@ python -m src.video_organizer.main --process "D:\video.mkv"
 | `[online_upload]` | 在线识别上传：视频根目录、ffprobe 开关与路径、path_type |
 | `[downloader.aria2]` | aria2 RPC 地址、密钥、监控模式（轮询/WebSocket/Webhook）|
 | `[downloader.qbittorrent]` | qBittorrent 地址、用户名、密码 |
-| `[telegram]` | Telegram 推送 Bot Token、Chat ID |
+| `[telegram]` | Telegram Bot Token / Chat ID、通知开关、回复修正开关、允许的用户 ID、长轮询超时 |
 | `[manual_rules]` | 手动规则列表（DSL 语法）|
 | `[logging]` | 日志级别、文件、控制台开关 |
 
@@ -219,6 +220,24 @@ when: 包含"1080p" => block: 4K
 - **自动上传** — 文件监控/下载器完成后自动识别 `getVideoId` 并分片上传
 - **断点续传** — google_drive 存储走 resumable 协议，其他存储走 multipart 分片 + 校验
 - **ffprobe 校验** — 上传前校验视频并提取分辨率/编码/时长等元数据
+
+### Telegram 报错通知与回复修正
+
+上传失败（识别不到条目、Emos 接口报错等）时，机器人会把报错推送到绑定的 Telegram 会话；
+直接**回复**那条报错信息并发送正确目标，就会用原文件重新上传到指定剧集：
+
+```
+时光代理人S04E09
+时光代理人 第4季第9集
+时光代理人 4x09
+时光代理人 S04
+时光代理人 (2024)      # 电影按年份匹配
+```
+
+- **绑定** — 在「配置管理 → Telegram」填写 `bot_token`，然后在 Telegram 里给机器人发送 `/bind`；
+  `chat_id` 会自动写回 `config.ini`（在线即时生效，无需重启容器），也可直接手填
+- **可用指令** — `/bind` 绑定会话、`/status` 查看状态、`/help` 查看用法
+- **在线页面** — 「在线识别上传」页面底部有机器人状态与测试消息按钮
 
 ### 下载器集成
 

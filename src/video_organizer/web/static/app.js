@@ -1779,6 +1779,7 @@ async function initOnlinePage() {
     startOnlinePolling();
     await loadOnlineConfig();
     await loadOnlineTasks();
+    await loadTelegramStatus();
 }
 
 function bindOnlineEvents() {
@@ -1786,7 +1787,9 @@ function bindOnlineEvents() {
         const node = document.getElementById(id);
         if (node) node.addEventListener('click', handler);
     };
-    bind('onlineRefreshBtn', async () => { await loadOnlineConfig(); await loadOnlineTasks(); });
+    bind('onlineRefreshBtn', async () => { await loadOnlineConfig(); await loadOnlineTasks(); await loadTelegramStatus(); });
+    bind('onlineTgRefreshBtn', () => loadTelegramStatus());
+    bind('onlineTgTestBtn', () => sendTelegramTest());
     bind('onlineBrowseBtn', () => browseOnline(onlineState.path));
     bind('onlineScanBtn', () => scanOnline());
     bind('onlineRecognizeBtn', () => recognizeSelected());
@@ -2156,6 +2159,7 @@ async function addOnlineTask(index) {
             item_id: String(item.target.item_id),
             storage: item.storage || null,
             title: meta.title || '',
+            media_type: meta.media_type || '',
             season_number: meta.season == null ? null : meta.season,
             episode_number: meta.episode == null ? null : meta.episode,
         }]);
@@ -2175,6 +2179,37 @@ async function loadOnlineTasks() {
         renderOnlineTasks();
     } catch (e) {
         console.error('加载在线任务失败:', e);
+    }
+}
+
+async function loadTelegramStatus() {
+    const box = document.getElementById('onlineTgStatus');
+    if (!box) return;
+    try {
+        const data = await loadTelegramStatusApi();
+        onlineState.telegram = data;
+        const parts = [
+            data.enabled ? '通知：已启用' : '通知：已禁用',
+            data.reply_enabled ? '回复修正：已启用' : '回复修正：已关闭',
+            data.token_configured ? 'bot_token：已配置' : 'bot_token：未配置',
+            data.bound ? ('已绑定 chat_id：' + data.chat_id) : '未绑定（给机器人发送 /bind）',
+            data.running ? '长轮询：运行中' : '长轮询：未运行',
+            '待回复报错：' + (data.pending_replies || 0),
+        ];
+        if (data.last_error) parts.push('最近错误：' + data.last_error);
+        box.textContent = parts.join(' · ');
+    } catch (e) {
+        box.textContent = '获取 Telegram 状态失败: ' + e.message;
+    }
+}
+
+async function sendTelegramTest() {
+    try {
+        const data = await sendTelegramTestApi();
+        alert(data.success ? '测试消息已发送' : ('发送失败: ' + (data.message || '')));
+        await loadTelegramStatus();
+    } catch (e) {
+        alert('发送失败: ' + e.message);
     }
 }
 

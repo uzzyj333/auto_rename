@@ -30,6 +30,9 @@ from ..core.emos_client import EmosApiError, EmosClient
 
 logger = logging.getLogger(__name__)
 
+# Telegram Bot API 根地址（如需自建反代可修改此处）
+_TG_API_BASE = "https://api.telegram.org"
+
 ProgressCallback = Callable[[float, int, int, str], None]
 
 DEFAULT_CHUNK_MB = 50
@@ -129,6 +132,7 @@ class RobustEmosVideoUploader:
         self._tg_message_id: Optional[int] = None
         self._tg_last_update = 0.0
         self._tg_interval = 3.0
+        self.last_error: str = ""  # 最近一次失败原因（供调用方展示 / 报错通知使用）
 
     # ------------------------------------------------------------------
     # 对外接口
@@ -464,6 +468,8 @@ class RobustEmosVideoUploader:
         error: Optional[str] = None,
     ) -> None:
         progress = max(0.0, min(100.0, float(progress)))
+        if error:
+            self.last_error = str(error)
         _report_upload_progress(
             file_path=file_path,
             filename=file_name,
@@ -516,7 +522,7 @@ class RobustEmosVideoUploader:
                 text = f"✅ Emos 上传完成\n文件: `{file_name}`" + (f"\n标题: {title}" if title else "")
         try:
             if self._tg_message_id is None:
-                url = f"https://api.telegram.org/bot{self.tg_bot_token}/sendMessage"
+                url = f"{_TG_API_BASE}/bot{self.tg_bot_token}/sendMessage"
                 payload = {"chat_id": self.tg_chat_id, "text": text, "parse_mode": "Markdown"}
                 response = requests.post(url, json=payload, timeout=10)
                 if response.status_code == 200:
@@ -524,7 +530,7 @@ class RobustEmosVideoUploader:
                     if body.get("ok"):
                         self._tg_message_id = body["result"]["message_id"]
             else:
-                url = f"https://api.telegram.org/bot{self.tg_bot_token}/editMessageText"
+                url = f"{_TG_API_BASE}/bot{self.tg_bot_token}/editMessageText"
                 payload = {
                     "chat_id": self.tg_chat_id,
                     "message_id": self._tg_message_id,

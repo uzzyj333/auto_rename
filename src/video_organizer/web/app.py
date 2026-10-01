@@ -75,12 +75,21 @@ def create_app(
             logger.warning(f"导入配置到数据库失败: {e}")
 
     # 初始化在线识别上传服务（配置在线修改后由配置路由热更新，无需重启）
+    active_config_path = state.get_config_path()
     try:
         from ..core.online_upload import OnlineUploadService
 
-        OnlineUploadService.instance().configure(config or {})
+        OnlineUploadService.instance().configure(config or {}, active_config_path)
     except Exception as e:
         logger.warning(f"初始化在线识别上传服务失败: {e}")
+
+    # 初始化 Telegram 机器人（填了 bot_token 且启用回复修正时长轮询会自动启动）
+    try:
+        from ..core.telegram_bot import TelegramBotService
+
+        TelegramBotService.instance().configure(config or {}, active_config_path)
+    except Exception as e:
+        logger.warning(f"初始化 Telegram 机器人失败: {e}")
 
     app = FastAPI(
         title=title,
@@ -153,6 +162,17 @@ def create_app(
         response = await call_next(request)
         return response
     
+    async def _stop_telegram_bot() -> None:
+        try:
+            from ..core.telegram_bot import TelegramBotService
+
+            TelegramBotService.instance().stop()
+        except Exception as e:
+            logger.warning(f"停止 Telegram 机器人失败: {e}")
+
+    # 用 router 注册，兼容新旧 Starlette（FastAPI 已移除顶层 add_event_handler）
+    app.router.add_event_handler("shutdown", _stop_telegram_bot)
+
     logger.info(f"FastAPI 应用已创建: {title} v{version}")
     return app
 
@@ -204,5 +224,13 @@ def run_server(
     )
 
 
-# 用于 uvicorn --factory 模式
-app = create_app()
+def __getattr__(name: str):
+    """延迟创建 ASGI 应用
+
+    模块导入时不再创建应用，避免「导入 web 包」这种副作用顺带重建
+    状态管理器 / 在线识别上传服务 / Telegram 机器人。
+    仍支持 ``uvicorn video_organizer.web.app:app`` 这种按属性名取用的方式。
+    """
+    if name == "app":
+        return create_app()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

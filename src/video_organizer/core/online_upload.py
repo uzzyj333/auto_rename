@@ -66,6 +66,7 @@ class OnlineUploadTask:
     item_id: str
     storage: str
     title: str = ""
+    media_type: str = ""
     season_number: Optional[int] = None
     episode_number: Optional[int] = None
     status: str = "queued"          # queued / uploading / completed / failed
@@ -91,6 +92,7 @@ class OnlineUploadTask:
             "item_id": self.item_id,
             "storage": self.storage,
             "title": self.title,
+            "media_type": self.media_type,
             "season_number": self.season_number,
             "episode_number": self.episode_number,
             "status": self.status,
@@ -126,6 +128,7 @@ class OnlineUploadService:
         self._tasks: Dict[str, OnlineUploadTask] = {}
         self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="online-upload")
         self._config: Dict[str, Any] = {}
+        self._config_path: Optional[str] = None
         self._client: Optional[EmosClient] = None
         self._renamer = None
         self._probe_cache: Dict[str, Dict[str, Any]] = {}
@@ -134,10 +137,12 @@ class OnlineUploadService:
     # 配置
     # ------------------------------------------------------------------
 
-    def configure(self, config: Optional[Dict[str, Any]]) -> None:
+    def configure(self, config: Optional[Dict[str, Any]], config_path: Optional[Any] = None) -> None:
         """更新配置（在线修改配置后立即生效，无需重启）"""
         with self._lock:
             self._config = dict(config or {})
+            if config_path is not None:
+                self._config_path = str(config_path)
             self._client = None
             self._renamer = None
             self._probe_cache.clear()
@@ -493,6 +498,7 @@ class OnlineUploadService:
         season: Optional[int],
         episode: Optional[int],
         media_type: str,
+        year: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """从目录树候选中挑选目标（没有 TMDB ID 时使用）"""
         for video in candidates or []:
@@ -502,6 +508,10 @@ class OnlineUploadService:
             if media_type == "movie" or not seasons:
                 item_id = video.get("item_id")
                 if media_type == "movie" and item_id:
+                    if year is not None:
+                        date_air = str(video.get("date_air") or "")
+                        if date_air[:4].isdigit() and date_air[:4] != str(year):
+                            continue
                     return {
                         "item_type": video.get("item_type") or "vl",
                         "item_id": str(item_id),
@@ -539,6 +549,17 @@ class OnlineUploadService:
                         "season_number": season_number,
                     }
         return None
+
+    def pick_target(
+        self,
+        candidates: List[Dict[str, Any]],
+        season: Optional[int] = None,
+        episode: Optional[int] = None,
+        media_type: str = "",
+        year: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """公开的目标选择入口（在线识别与 Telegram 修正共用）"""
+        return self._pick_from_candidates(candidates, season, episode, media_type, year=year)
 
     def search_targets(
         self,
@@ -627,6 +648,21 @@ class OnlineUploadService:
                 created.append(self.create_task(item))
             except Exception as exc:
                 errors.append(f"{item.get('file_path', '')}: {exc}")
+                self._notify_failure(
+                    {
+                        "file_path": item.get("file_path"),
+                        "file_name": os.path.basename(str(item.get("file_path") or "")),
+                        "title": item.get("title"),
+                        "media_type": item.get("media_type"),
+                        "item_type": item.get("item_type"),
+                        "item_id": item.get("item_id"),
+                        "storage": item.get("storage"),
+                        "season_number": item.get("season_number"),
+                        "episode_number": item.get("episode_number"),
+                    },
+                    str(exc),
+                    header="上传任务创建失败",
+                )
         return {"success": not errors, "tasks": created, "errors": errors}
 
     def create_task(self, item: Dict[str, Any]) -> Dict[str, Any]:
@@ -651,6 +687,7 @@ class OnlineUploadService:
             item_id=item_id,
             storage=storage,
             title=str(item.get("title") or ""),
+            media_type=str(item.get("media_type") or ""),
             season_number=_to_int(item.get("season_number")),
             episode_number=_to_int(item.get("episode_number")),
             total_bytes=stat.st_size,
@@ -714,6 +751,15 @@ class OnlineUploadService:
                 setattr(task, key, value)
             task.updated_at = _now()
 
+    def _notify_failure(self, context: Dict[str, Any], error: str, header: str = "上传失败") -> None:
+        """上传失败时推送 Telegram 报错信息（推送失败不影响主流程）"""
+        try:
+            from .telegram_bot import TelegramBotService
+
+            TelegramBotService.instance().notify_error(context or {}, error, header=header)
+        except Exception as exc:
+            logger.debug("推送 Telegram 报错信息失败: %s", exc)
+
     def _run_task(self, task_id: str) -> None:
         """后台执行上传"""
         with self._lock:
@@ -772,7 +818,10 @@ class OnlineUploadService:
                     error="",
                 )
             else:
-                self._update_task(task_id, status="failed", stage="上传失败", error="上传失败，请查看日志")
+                reason = str(getattr(uploader, "last_error", "") or "上传失败，请查看日志")
+                self._update_task(task_id, status="failed", stage="上传失败", error=reason)
+                self._notify_failure(snapshot, reason)
         except Exception as exc:
             logger.error("在线识别上传失败: %s", exc)
             self._update_task(task_id, status="failed", stage="上传失败", error=str(exc))
+            self._notify_failure(snapshot, str(exc))
