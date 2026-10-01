@@ -32,23 +32,29 @@
 ### 使用 Docker（推荐）
 
 ```bash
-# 克隆仓库
-git clone https://github.com/uzzyj333/auto_rename.git
-cd auto_rename
+# 1. 创建目录并拉取代码
+sudo mkdir -p /opt/auto-rename && sudo chown "$(id -u)":"$(id -g)" /opt/auto-rename
+git clone https://github.com/uzzyj333/auto_rename.git /opt/auto-rename
+cd /opt/auto-rename
 
-# 创建数据目录（容器内以 uid 1000 运行，需要确保目录可写）
-mkdir -p data && chown -R 1000:1000 data
+# 2. 创建数据 / 下载 / 媒体目录，并授权给容器内的 uid 1000
+mkdir -p data downloads media
+sudo chown -R 1000:1000 data downloads
 
-# 编辑 docker-compose.yml 修改挂载路径后启动
-docker compose up -d
+# 3. 准备环境变量（按需修改端口与挂载路径）
+cp .env.example .env
 
-# 查看日志获取管理员密码
-docker compose logs | grep "管理员密码"
+# 4. 构建并启动
+docker compose up -d --build
 
-# 访问 Web 界面：http://localhost:8080
+# 5. 获取首次登录密码
+curl -s http://127.0.0.1:8080/api/auth/first-run-credentials
+#    或：docker compose logs video-organizer | grep -A3 "首次运行"
+
+# 6. 访问 Web 界面：http://<服务器IP>:8080
 ```
 
-完整 Docker 部署文档：[DOCKER.md](DOCKER.md) | [快速开始](DOCKER_QUICKSTART.md)
+完整部署步骤（含 compose 文件、下载器/Telegram 配置、升级备份、排障）：**[DEPLOY.md](DEPLOY.md)**
 
 > 说明：`./data` 是唯一的持久化目录（`config.ini`、日志、SQLite 数据库都在里面），日志不再映射宿主机路径；
 > 在 Web「配置管理」里修改的配置会立即生效，无需重启容器。
@@ -286,10 +292,10 @@ python package.py
 ### Docker
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
 
-详细文档：[DOCKER.md](DOCKER.md)
+详细部署步骤：[DEPLOY.md](DEPLOY.md)（从创建目录到 compose 启动）| [DOCKER.md](DOCKER.md) | [快速开始](DOCKER_QUICKSTART.md)
 
 ---
 

@@ -1,30 +1,32 @@
-# Docker 部署指南
+> 最完整的从零部署步骤（含 compose 文件内容、下载器 / Telegram 配置、升级备份、排障）见 **[DEPLOY.md](DEPLOY.md)**。
+> 本文档侧重于 Docker 命令与配置项参考。
 
 ## 快速开始
 
 ### 1. 使用 Docker Compose（推荐）
 
 ```bash
-# 克隆仓库
-git clone https://github.com/uzzyj333/auto_rename.git
-cd auto_rename
+# 1) 创建部署目录并拉取代码
+sudo mkdir -p /opt/auto-rename && sudo chown "$(id -u)":"$(id -g)" /opt/auto-rename
+git clone https://github.com/uzzyj333/auto_rename.git /opt/auto-rename
+cd /opt/auto-rename
 
-# 创建数据目录
-mkdir -p data
+# 2) 创建数据 / 下载 / 媒体目录（容器内以 uid 1000 运行，需要可写）
+mkdir -p data downloads media
+sudo chown -R 1000:1000 data downloads
 
-# 编辑 docker-compose.yml，修改挂载路径：
-# - /path/to/downloads:/downloads  （你的下载目录）
-# - /path/to/media:/media           （你的媒体库目录）
+# 3) 环境变量（端口、挂载路径）
+cp .env.example .env
 
-# 启动服务（Web + 文件监控）
-docker compose up -d
+# 4) 构建并启动服务（Web + 下载器监控）
+docker compose up -d --build
 
-# 查看日志
-docker compose logs -f
+# 5) 首次登录密码
+curl -s http://127.0.0.1:8080/api/auth/first-run-credentials
+#    或：docker compose logs video-organizer | grep -A3 "首次运行"
 
-# 访问 Web 管理界面
-# http://localhost:8080
-# 首次启动会在日志中显示随机管理员密码
+# 6) 访问 Web 管理界面
+# http://<服务器IP>:8080
 ```
 
 ## 使用 Docker 命令
@@ -106,10 +108,14 @@ docker rm video-organizer
 
 ### 1. 获取管理员密码
 
-首次启动时，容器会生成随机管理员密码并输出到日志：
+首次启动会生成随机管理员密码，可任选一种方式获取：
 
 ```bash
-docker compose logs | grep "管理员密码"
+# 接口方式（登录成功后该接口不再返回密码）
+curl -s http://127.0.0.1:8080/api/auth/first-run-credentials
+
+# 日志方式（首次运行会打印「首次运行，已生成随机密码」）
+docker compose logs video-organizer | grep -A3 "首次运行"
 ```
 
 ### 2. 修改配置
@@ -130,35 +136,49 @@ docker compose restart
 
 ### 3. 配置下载器监控（可选）
 
-如果使用 aria2 或 qBittorrent：
+支持同一类型配置多个实例（节名 `downloader.<标识>` 中的标识必须唯一）：
 
 ```ini
 [downloader.aria2]
-enabled = True
-url = http://aria2:6800/jsonrpc
+type = aria2
+name = 主 Aria2
+rpc_url = http://aria2:6800/jsonrpc
+secret = your_secret
+monitor_mode = polling
+path_mappings = /downloads:/downloads
+
+[downloader.aria2_2]
+type = aria2
+rpc_url = http://aria2-2:6800/jsonrpc
 secret = your_secret
 
 [downloader.qbittorrent]
-enabled = True
-url = http://qbittorrent:8080
+type = qbittorrent
+rpc_url = http://qbittorrent:8080/api/v2
 username = admin
 password = admin
 ```
 
 **注意**：如果下载器也在 Docker 中运行，使用容器名或网络 IP，而不是 `localhost`。
+在 Web「下载器」页面增删实例会立即生效，无需重启容器。
 
 ## 路径映射
 
-如果你的下载器在 Docker 中运行，需要配置路径映射：
+如果下载器看到的路径与本容器内的路径不一致，需要在该下载器配置节里映射（格式：`下载器路径:本容器路径`，多个用逗号分隔）：
 
 ```ini
-[monitoring]
-path_mappings = {
-    "/downloads": "/media/downloads"
-}
+[downloader.aria2]
+type = aria2
+rpc_url = http://aria2:6800/jsonrpc
+secret = your_secret
+; aria2 内是 /data/downloads，本容器内是 /downloads
+path_mappings = /data/downloads:/downloads
 ```
 
-例如，qBittorrent 容器中的路径是 `/downloads/video.mkv`，在宿主机是 `/media/downloads/video.mkv`。
+例如 qBittorrent 容器里显示 `/downloads/video.mkv`，而本容器挂载到 `/media/downloads/video.mkv`：
+`path_mappings = /downloads:/media/downloads`
+
+映射配错会表现为「找不到下载任务 / 上传后删不掉原文件」。注意路径映射填在 `[downloader.*]` 节里，不是 `[monitoring]`。
 
 ## 常见问题
 
