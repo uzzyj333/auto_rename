@@ -310,6 +310,8 @@ class RobustEmosVideoUploader:
         self._progress_total_parts = 0
         self.last_error: str = ""  # 最近一次失败原因（供调用方展示 / 报错通知使用）
         self._skip_reason: str = ""  # 命中「已上传过」跳过传输时的说明
+        # Emos 用户 ID（tusd 上传的 pre-create 钩子必须校验 user_id + file_id）
+        self._emos_user_id: Optional[str] = None
 
     def close(self) -> None:
         """释放底层会话"""
@@ -997,14 +999,43 @@ class RobustEmosVideoUploader:
         chunk = max(8 * 1024 * 1024, min(chunk, TUS_MAX_CHUNK_SIZE))
         return max(min(chunk, file_size), 1)
 
-    @staticmethod
-    def _tus_metadata(token: Dict[str, Any]) -> str:
-        """构造 ``Upload-Metadata``（值必须是 base64）"""
-        file_id = str(token.get("file_id") or "").strip()
+    def _user_id(self) -> str:
+        """当前账号的 Emos 用户 ID（tusd 上传必需，结果缓存）"""
+        if self._emos_user_id is None:
+            value = ""
+            try:
+                base = self.client.get_user_base() or {}
+                value = str(base.get("user_id") or base.get("id") or "").strip()
+            except Exception as exc:
+                logger.debug("获取 Emos 用户 ID 失败: %s", exc)
+            self._emos_user_id = value
+        return self._emos_user_id
+
+    def _tus_metadata(self, token: Dict[str, Any]) -> str:
+        """构造 ``Upload-Metadata``（值必须是 base64）
+
+        Emos 的 tusd 服务在 pre-create 阶段会同时校验 ``user_id`` 与 ``file_id``：
+        - 只带 file_id  -> HTTP 422「参数错误」
+        - 只带 user_id  -> HTTP 422「无文件ID」
+        - 两者不匹配    -> HTTP 422「参数验证失败」
+        所以这里必须把 user_id 一起带上（官方 wiki 的 tus-js-client 示例同样如此）。
+        """
+        data = token.get("data") if isinstance(token.get("data"), dict) else {}
+        file_id = str(token.get("file_id") or data.get("file_id") or "").strip()
         if not file_id:
             return ""
-        encoded = base64.b64encode(file_id.encode("utf-8")).decode("ascii")
-        return f"file_id {encoded}"
+        user_id = str(
+            token.get("user_id") or data.get("user_id") or self._user_id() or ""
+        ).strip()
+        if not user_id:
+            logger.warning("未取得 Emos 用户 ID，tusd 上传可能被拒绝（HTTP 422 参数错误）")
+        fields = [("file_id", file_id)]
+        if user_id:
+            fields.append(("user_id", user_id))
+        return ",".join(
+            f"{key} {base64.b64encode(value.encode('utf-8')).decode('ascii')}"
+            for key, value in fields
+        )
 
     @staticmethod
     def _parse_tus_offset(value: Optional[str]) -> Optional[int]:
@@ -1012,6 +1043,62 @@ class RobustEmosVideoUploader:
             return int(str(value).strip())
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _tus_endpoint_candidates(endpoint: str) -> List[str]:
+        """tusd 的 base path 通常是 ``/files/``，但 Emos 返回的 upload_url 有时没有结尾斜杠
+
+        实测 ``https://file.emos.best/files``（无斜杠）POST 会 404，
+        ``https://file.emos.best/files/`` 才会进 tusd，所以两种写法都试一遍。
+        """
+        candidates = [endpoint]
+        if endpoint.endswith("/"):
+            stripped = endpoint.rstrip("/")
+            if stripped:
+                candidates.append(stripped)
+        else:
+            candidates.append(endpoint + "/")
+        return candidates
+
+    def _create_tus_upload(self, endpoint: str, file_size: int, metadata: str) -> str:
+        """POST 创建 tus 上传，返回 PATCH 用的上传地址"""
+        last_error: Optional[EmosApiError] = None
+        for url in self._tus_endpoint_candidates(endpoint):
+            headers = {"Tus-Resumable": "1.0.0", "Upload-Length": str(file_size)}
+            if metadata:
+                headers["Upload-Metadata"] = metadata
+            try:
+                response = self.storage_session.post(url, headers=headers, timeout=self.timeout)
+            except requests.exceptions.RequestException as exc:
+                raise EmosApiError(f"tusd 创建上传失败: {exc}") from exc
+            try:
+                status = response.status_code
+                location = str(response.headers.get("Location") or "").strip()
+                body = "" if 200 <= status < 300 else self._response_snippet(response)
+            finally:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+            if 200 <= status < 300:
+                if not location:
+                    raise EmosApiError("tusd 创建上传失败: 响应缺少 Location")
+                if location.lower().startswith(("http://", "https://")):
+                    return location
+                # base 补上结尾斜杠后再 join：
+                # - Location 是 /files/abc（绝对路径）-> 替换路径部分
+                # - Location 是 abc（相对路径）-> 拼在 base path 后面
+                base = url if url.endswith("/") else url + "/"
+                return urljoin(base, location)
+            detail = f" - {body}" if body else ""
+            last_error = EmosApiError(f"tusd 创建上传失败: HTTP {status}{detail}")
+            if status in {404, 405}:
+                logger.warning(
+                    "tusd 上传地址 %s 返回 HTTP %s，改用另一种结尾斜杠写法重试", url, status
+                )
+                continue
+            raise last_error
+        raise last_error or EmosApiError("tusd 创建上传失败")
 
     def _upload_tus(
         self,
@@ -1026,38 +1113,11 @@ class RobustEmosVideoUploader:
         必须按 tus 协议先 POST 创建上传、再 PATCH 写入数据。
         参考：https://tus.github.io/tusd/getting-started/usage/
         """
-        endpoint = str((token.get("data") or {}).get("upload_url") or "")
+        endpoint = str((token.get("data") or {}).get("upload_url") or "").strip()
         if not endpoint:
             raise EmosApiError("tusd 上传地址缺失")
 
-        create_headers = {
-            "Tus-Resumable": "1.0.0",
-            "Upload-Length": str(file_size),
-        }
-        metadata = self._tus_metadata(token)
-        if metadata:
-            create_headers["Upload-Metadata"] = metadata
-        try:
-            response = self.storage_session.post(
-                endpoint, headers=create_headers, timeout=self.timeout
-            )
-        except requests.exceptions.RequestException as exc:
-            raise EmosApiError(f"tusd 创建上传失败: {exc}") from exc
-        try:
-            status = response.status_code
-            location = str(response.headers.get("Location") or "").strip()
-            body = "" if 200 <= status < 300 else self._response_snippet(response)
-        finally:
-            try:
-                response.close()
-            except Exception:
-                pass
-        if not (200 <= status < 300):
-            detail = f" - {body}" if body else ""
-            raise EmosApiError(f"tusd 创建上传失败: HTTP {status}{detail}")
-        if not location:
-            raise EmosApiError("tusd 创建上传失败: 响应缺少 Location")
-        upload_url = urljoin(endpoint, location)
+        upload_url = self._create_tus_upload(endpoint, file_size, self._tus_metadata(token))
 
         chunk_size = self._tus_chunk_size(file_size)
         started_at = time.time()

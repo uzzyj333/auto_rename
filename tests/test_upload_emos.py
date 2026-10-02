@@ -97,6 +97,30 @@ class _RecordingTusSession:
         self.closed = True
 
 
+class _SlashAwareTusSession:
+    """模拟 Emos 的 tusd：``/files`` 返回 404，``/files/`` 才是真正的 base path"""
+
+    def __init__(self, location="https://file.emos.best/files/abc"):
+        self.calls = []
+        self.location = location
+        self.closed = False
+
+    def post(self, url, **kwargs):
+        self.calls.append(("POST", url, kwargs))
+        if url.endswith("/"):
+            return _FakeResponse(201, {"Location": self.location})
+        return _FakeResponse(404, {}, b"")
+
+    def patch(self, url, **kwargs):
+        self.calls.append(("PATCH", url, kwargs))
+        data = kwargs.get("data") or b""
+        offset = int(kwargs["headers"].get("Upload-Offset") or 0)
+        return _FakeResponse(204, {"Upload-Offset": str(offset + len(data))})
+
+    def close(self):
+        self.closed = True
+
+
 class _FailingTusSession:
     """创建上传直接失败（用于验证错误提示）"""
 
@@ -801,6 +825,9 @@ class TestUploadEmosSubtitles(unittest.TestCase):
             uploader._tus_chunk_size = lambda size: 8
             session = _RecordingTusSession(location="/files/abc")
             uploader.storage_session = session
+            uploader.client.get_user_base = MagicMock(
+                return_value={"user_id": "u1", "username": "tester"}
+            )
             token = {
                 "file_id": "f1",
                 "type": "tusd",
@@ -817,9 +844,13 @@ class TestUploadEmosSubtitles(unittest.TestCase):
             self.assertEqual(url, "https://emos.best/tus/")
             self.assertEqual(kwargs["headers"]["Tus-Resumable"], "1.0.0")
             self.assertEqual(kwargs["headers"]["Upload-Length"], "20")
+            # tusd 的 pre-create 钩子要求同时带 user_id + file_id，否则 422
             self.assertEqual(
                 kwargs["headers"]["Upload-Metadata"],
-                "file_id " + base64.b64encode(b"f1").decode("ascii"),
+                "file_id "
+                + base64.b64encode(b"f1").decode("ascii")
+                + ",user_id "
+                + base64.b64encode(b"u1").decode("ascii"),
             )
             # Location 是绝对路径（tusd 的 /files/<id>）时替换 endpoint 的路径部分
             self.assertEqual(session.calls[1][1], "https://emos.best/files/abc")
@@ -858,6 +889,78 @@ class TestUploadEmosSubtitles(unittest.TestCase):
         finally:
             os.remove(path)
 
+    def test_upload_tus_metadata_user_id_from_token_data(self):
+        """token.data 里带 user_id 时优先使用，不再请求 /api/user/base"""
+        uploader = RobustEmosVideoUploader(
+            auth_token="t", base_url="https://emos.best"
+        )
+        uploader.client.get_user_base = MagicMock(
+            side_effect=AssertionError("不应调用 get_user_base")
+        )
+        token = {
+            "file_id": "f1",
+            "type": "tusd",
+            "data": {"upload_url": "https://emos.best/tus/", "user_id": "u9"},
+        }
+
+        metadata = uploader._tus_metadata(token)
+
+        self.assertEqual(
+            metadata,
+            "file_id "
+            + base64.b64encode(b"f1").decode("ascii")
+            + ",user_id "
+            + base64.b64encode(b"u9").decode("ascii"),
+        )
+
+    def test_upload_tus_metadata_without_user_id_falls_back_to_file_id(self):
+        """拿不到用户 ID 时只带 file_id（避免完全不上传）"""
+        uploader = RobustEmosVideoUploader(
+            auth_token="t", base_url="https://emos.best"
+        )
+        uploader.client.get_user_base = MagicMock(return_value={})
+        token = {"file_id": "f1", "type": "tusd", "data": {}}
+
+        self.assertEqual(
+            uploader._tus_metadata(token),
+            "file_id " + base64.b64encode(b"f1").decode("ascii"),
+        )
+
+    def test_upload_tus_create_retries_other_slash_form(self):
+        """Emos 的 upload_url 少了结尾斜杠时（/files 404）自动补斜杠重试"""
+        handle, path = tempfile.mkstemp(suffix=".srt")
+        os.write(handle, b"x" * 20)
+        os.close(handle)
+        try:
+            uploader = RobustEmosVideoUploader(
+                auth_token="t", base_url="https://emos.best"
+            )
+            uploader._tus_chunk_size = lambda size: 8
+            uploader.client.get_user_base = MagicMock(return_value={"user_id": "u1"})
+            session = _SlashAwareTusSession()
+            uploader.storage_session = session
+            token = {
+                "file_id": "f1",
+                "type": "tusd",
+                "data": {"upload_url": "https://file.emos.best/files"},
+            }
+
+            uploader._upload_tus(Path(path), token, 20, report=False)
+
+            posts = [call[1] for call in session.calls if call[0] == "POST"]
+            self.assertEqual(
+                posts,
+                [
+                    "https://file.emos.best/files",
+                    "https://file.emos.best/files/",
+                ],
+            )
+            patches = [call[1] for call in session.calls if call[0] == "PATCH"]
+            self.assertTrue(patches)
+            self.assertEqual(patches[0], "https://file.emos.best/files/abc")
+        finally:
+            os.remove(path)
+
     def test_upload_subtitle_file_uses_tus_when_token_type_is_tusd(self):
         """字幕走 tusd 时也要能上传（官方已对字幕暂停 r2）"""
         handle, path = tempfile.mkstemp(suffix=".srt")
@@ -882,6 +985,7 @@ class TestUploadEmosSubtitles(unittest.TestCase):
             )
             session = _RecordingTusSession()
             uploader.storage_session = session
+            uploader.client.get_user_base = MagicMock(return_value={"user_id": "u1"})
 
             subtitle_id = uploader._upload_subtitle_file(
                 Path(path), "ve", "1", "internal"
