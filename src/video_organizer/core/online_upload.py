@@ -60,6 +60,20 @@ def _to_int(value: Any) -> Optional[int]:
         return None
 
 
+def _normalize_title(value: Any) -> str:
+    """标题归一化：去掉空格/标点并转小写，便于比较中英文标题"""
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(value or "").lower())
+
+
+def _title_matches(candidate: Any, query: Any) -> bool:
+    """候选标题与搜索标题是否相关（互为子串即视为相关）"""
+    left = _normalize_title(candidate)
+    right = _normalize_title(query)
+    if not left or not right:
+        return False
+    return left == right or left in right or right in left
+
+
 @dataclass
 class OnlineUploadTask:
     """在线识别上传任务"""
@@ -521,7 +535,9 @@ class OnlineUploadService:
                     todb_id=None,
                 )
                 # 没有 TMDB ID（或接口未返回具体集）时，用目录树候选自动定位季/集
-                match = self._pick_from_candidates(candidates, season, episode, media_type)
+                match = self._pick_from_candidates(
+                    candidates, season, episode, media_type, title=title
+                )
             if not match and (media_type == "tv" or (media_type != "movie" and episode is not None)):
                 if episode is None:
                     errors.append("未能从文件名解析出季/集号，无法定位到具体某一集")
@@ -664,9 +680,28 @@ class OnlineUploadService:
         episode: Optional[int],
         media_type: str,
         year: Optional[int] = None,
+        title: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """从目录树候选中挑选目标（没有 TMDB ID 时使用）"""
-        for video in candidates or []:
+        """从目录树候选中挑选目标（没有 TMDB ID 时使用）
+
+        去掉类型过滤兜底搜索时可能一次返回多个作品，这里优先在标题相关的
+        候选里定位季/集，避免把别的剧的同名集号当成目标。
+        """
+        ordered = list(candidates or [])
+        if title:
+            matched = [
+                video
+                for video in ordered
+                if isinstance(video, dict) and _title_matches(video.get("title"), title)
+            ]
+            if matched:
+                rest = [
+                    video
+                    for video in ordered
+                    if not (isinstance(video, dict) and _title_matches(video.get("title"), title))
+                ]
+                ordered = matched + rest
+        for video in ordered:
             if not isinstance(video, dict):
                 continue
             seasons = video.get("seasons") or []
@@ -722,9 +757,12 @@ class OnlineUploadService:
         episode: Optional[int] = None,
         media_type: str = "",
         year: Optional[int] = None,
+        title: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """公开的目标选择入口（在线识别与 Telegram 修正共用）"""
-        return self._pick_from_candidates(candidates, season, episode, media_type, year=year)
+        return self._pick_from_candidates(
+            candidates, season, episode, media_type, year=year, title=title
+        )
 
     def search_targets(
         self,
@@ -736,6 +774,11 @@ class OnlineUploadService:
         if not (title or todb_id):
             return []
         tree = self.get_client().get_video_tree(video_type=video_type, title=title, todb_id=todb_id)
+        if not tree and video_type:
+            # Emos 的 type 过滤值不稳定（带 type=tv 时可能什么都搜不到），
+            # 去掉类型再搜一次兜底，否则 TG 回复修正会误报「未在 Emos 中找到匹配条目」
+            logger.debug("带 video_type=%s 搜索无结果，去掉类型重试: %s", video_type, title)
+            tree = self.get_client().get_video_tree(title=title, todb_id=todb_id)
         results: List[Dict[str, Any]] = []
         for item in tree:
             if not isinstance(item, dict):

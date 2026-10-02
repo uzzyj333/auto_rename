@@ -1957,6 +1957,9 @@ const onlineState = {
     selected: new Set(),
     recognized: [],
     tasks: [],
+    groupList: [],
+    groupResults: {},
+    groupKeywords: {},
     timer: null,
 };
 
@@ -1976,6 +1979,35 @@ function yearOfItem(item) {
     const air = String((item && item.date_air) || '');
     const match = air.match(/^(\d{4})/);
     return match ? match[1] : '';
+}
+
+// 按「识别出的剧名 / 电影名」给识别结果分组；解析不出标题时退回文件名里
+// 第一个 SxxExx / Ep xx / 第 x 集 之前的前缀。这样同前缀的文件可以一次性
+// 搜索并匹配同一个 Emos 条目，不同前缀的文件各自独立搜索，互不影响。
+function onlineGroupKey(item) {
+    const meta = (item && item.metadata) || {};
+    const title = String(meta.title || meta.show_name || meta.movie_name || '').trim();
+    if (title) return title;
+    const name = String((item && item.file_name) || '');
+    const match = name.match(/^(.*?)[.\s_-]+(?:[Ss]\d{1,2}[Ee]\d{1,3}|[Ee][Pp]?\.?\s?\d{1,3}|第\s?\d{1,3}\s?[集话話])/);
+    if (match && match[1]) return match[1].replace(/[.\s_-]+$/, '').trim();
+    return name.replace(/\.[^.]+$/, '').trim() || '未分组';
+}
+
+function buildOnlineGroups(items) {
+    const groups = [];
+    const byKey = new Map();
+    (items || []).forEach((item, index) => {
+        const key = onlineGroupKey(item);
+        let group = byKey.get(key);
+        if (!group) {
+            group = { key: key, items: [] };
+            byKey.set(key, group);
+            groups.push(group);
+        }
+        group.items.push({ item: item, index: index });
+    });
+    return groups;
 }
 
 async function initOnlinePage() {
@@ -2201,6 +2233,8 @@ async function recognizeSelected() {
         }
     }
     onlineState.recognized = results.map(buildRecognizedItem);
+    onlineState.groupResults = {};
+    onlineState.groupKeywords = {};
     renderOnlineRecognize();
     if (btn) { btn.disabled = false; btn.textContent = '识别选中文件'; }
 }
@@ -2280,8 +2314,28 @@ function renderOnlineRecognize() {
     const storages = (onlineState.config && onlineState.config.storages) || ['internal'];
     const defaultStorage = (onlineState.config && onlineState.config.default_storage) || 'internal';
 
-    let html = '<div class="config-section">';
-    items.forEach((item, index) => {
+    // 按前缀分组，组内共享一个搜索框：一个搜索名称只能匹配一组，多组互不干扰
+    const groups = buildOnlineGroups(items);
+    onlineState.groupList = groups;
+    let html = '';
+    groups.forEach((group, gi) => {
+        const matched = group.items.filter(entry => entry.item.target).length;
+        html += '<div class="config-section" style="margin-bottom:16px">' +
+            '<div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center;border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:12px">' +
+                '<div>' +
+                    '<div style="font-weight:600">📁 ' + escapeOnline(group.key) + '</div>' +
+                    '<div style="font-size:12px;color:var(--text-muted)">' + group.items.length + ' 个文件 · 已匹配目标 ' + matched + '/' + group.items.length + '</div>' +
+                '</div>' +
+                '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+                    '<input type="text" class="form-input" data-online-group-input="' + gi + '" value="' + escapeOnline((onlineState.groupKeywords || {})[gi] || group.key) + '" placeholder="搜索 Emos 条目（可改成别名）" style="min-width:200px">' +
+                    '<button class="btn btn-secondary btn-sm" data-online-group-search="' + gi + '">搜索并匹配本组</button>' +
+                    '<button class="btn btn-secondary btn-sm" data-online-group-clear="' + gi + '">清除本组目标</button>' +
+                '</div>' +
+            '</div>' +
+            '<div data-online-group-results="' + gi + '"></div>';
+        group.items.forEach(entry => {
+        const item = entry.item;
+        const index = entry.index;
         const meta = item.metadata || {};
         const optionHtml = item.options.length
             ? ((item.target ? '' : '<option value="-1">请选择上传目标…</option>') + item.options.map((t, i) =>
@@ -2313,8 +2367,9 @@ function renderOnlineRecognize() {
                 '</div>' +
             '</div>' +
         '</div>';
+        });
+        html += '</div>';
     });
-    html += '</div>';
     box.innerHTML = html;
 
     box.querySelectorAll('[data-online-target]').forEach(node => node.addEventListener('change', () => {
@@ -2330,6 +2385,95 @@ function renderOnlineRecognize() {
     box.querySelectorAll('[data-online-add]').forEach(node => node.addEventListener('click', () => {
         addOnlineTask(parseInt(node.getAttribute('data-online-add'), 10));
     }));
+    box.querySelectorAll('[data-online-group-search]').forEach(node => node.addEventListener('click', () => {
+        searchOnlineGroupTargets(parseInt(node.getAttribute('data-online-group-search'), 10));
+    }));
+    box.querySelectorAll('[data-online-group-input]').forEach(node => node.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') searchOnlineGroupTargets(parseInt(node.getAttribute('data-online-group-input'), 10));
+    }));
+    box.querySelectorAll('[data-online-group-clear]').forEach(node => node.addEventListener('click', () => {
+        clearOnlineGroupTargets(parseInt(node.getAttribute('data-online-group-clear'), 10));
+    }));
+    // 重新渲染后把本组上次的搜索结果也画回来，方便连续调整
+    (onlineState.groupList || []).forEach((group, gi) => {
+        if ((onlineState.groupResults || {})[gi]) paintOnlineGroupResults(gi);
+    });
+}
+
+async function searchOnlineGroupTargets(groupIndex) {
+    const group = (onlineState.groupList || [])[groupIndex];
+    if (!group) return;
+    const input = document.querySelector('[data-online-group-input="' + groupIndex + '"]');
+    const keyword = input ? input.value.trim() : '';
+    if (!keyword) { alert('请输入搜索关键词'); return; }
+    onlineState.groupKeywords[groupIndex] = keyword;
+    const box = document.querySelector('[data-online-group-results="' + groupIndex + '"]');
+    if (box) box.innerHTML = '<div style="font-size:12px;color:var(--text-muted)">搜索中…</div>';
+    try {
+        const data = await searchOnlineTargetsApi(keyword);
+        onlineState.groupResults[groupIndex] = data.results || [];
+        paintOnlineGroupResults(groupIndex);
+    } catch (e) {
+        if (box) box.innerHTML = '<div style="font-size:12px;color:#e5534b">搜索失败: ' + escapeOnline(e.message) + '</div>';
+    }
+}
+
+function paintOnlineGroupResults(groupIndex) {
+    const box = document.querySelector('[data-online-group-results="' + groupIndex + '"]');
+    if (!box) return;
+    const results = (onlineState.groupResults || {})[groupIndex] || [];
+    if (!results.length) {
+        box.innerHTML = '<div class="empty-state"><p>未搜索到 Emos 条目</p></div>';
+        return;
+    }
+    let html = '<div class="table-container" style="max-height:240px;overflow:auto"><table>' +
+        '<thead><tr><th>标题</th><th style="width:70px">年份</th><th style="width:90px">类型</th><th style="width:140px">item_id</th><th style="width:110px">TMDB</th><th style="width:130px">操作</th></tr></thead><tbody>';
+    results.forEach((item, i) => {
+        html += '<tr><td>' + escapeOnline(item.title || '') + '</td>' +
+            '<td>' + escapeOnline(yearOfItem(item) || '-') + '</td>' +
+            '<td>' + escapeOnline(item.video_type || '') + '</td>' +
+            '<td>' + escapeOnline(item.item_type + '/' + item.item_id) + '</td>' +
+            '<td>' + tmdbLinkHtml(item.tmdb_id, item.video_type) + '</td>' +
+            '<td><button class="btn btn-secondary btn-sm" data-online-group-apply="' + i + '">应用到本组</button></td></tr>';
+    });
+    html += '</tbody></table></div>';
+    box.innerHTML = html;
+    box.querySelectorAll('[data-online-group-apply]').forEach(node => node.addEventListener('click', () => {
+        applyOnlineGroupResult(groupIndex, parseInt(node.getAttribute('data-online-group-apply'), 10));
+    }));
+}
+
+// 把某个 Emos 条目应用到整组：组内每个文件按自己的季/集号落到对应的 ve，
+// 没有季/集号的电视剧不硬塞 vl，避免上传接口 404
+function applyOnlineGroupResult(groupIndex, resultIndex) {
+    const group = (onlineState.groupList || [])[groupIndex];
+    const result = ((onlineState.groupResults || {})[groupIndex] || [])[resultIndex];
+    if (!group || !result) return;
+    const isMovie = /movie|电影/i.test(String(result.video_type || ''));
+    let applied = 0;
+    let skipped = 0;
+    group.items.forEach(entry => {
+        const item = entry.item;
+        const isSubtitle = item.fileKind === 'subtitle';
+        const option = buildOnlineTargetOption(result, item);
+        if (!isMovie && !isSubtitle && option.kind !== 'episode') { skipped += 1; return; }
+        if (!item.options.some(t => t.item_type === option.item_type && String(t.item_id) === String(option.item_id))) {
+            item.options.unshift(option);
+        }
+        item.target = option;
+        applied += 1;
+    });
+    renderOnlineRecognize();
+    if (skipped) {
+        alert('已为 ' + applied + ' 个文件设置目标；另有 ' + skipped + ' 个文件没有解析出季/集号，未自动匹配，请在下方手动选择。');
+    }
+}
+
+function clearOnlineGroupTargets(groupIndex) {
+    const group = (onlineState.groupList || [])[groupIndex];
+    if (!group) return;
+    group.items.forEach(entry => { entry.item.target = null; });
+    renderOnlineRecognize();
 }
 
 async function searchOnlineTargets() {

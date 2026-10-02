@@ -108,6 +108,7 @@ tests/
 - **File stability check:** Files aren't processed until size stabilizes (checked 3 times at 1s intervals).
 - **Subtitle handling:** `SubtitleHandler.find_matching_video` 只匹配真实视频（排除字幕自身和其它字幕扩展名），并支持 `A_track9_chi` / `A.chs` / `A-eng` 这类「视频主名 + 分隔符」后缀；当同目录没有视频（视频已上传并删除）或视频已上传但仍保留在本地时，`VideoFileHandler._upload_standalone_subtitle` 会按字幕自身识别目标并单独上传（只调 Emos 的 subtitle/save），是否启用受 `emos.upload_subtitles` 控制。
 - **Telegram 报错通知:** TMDB 没搜到条目、TMDB 请求失败、字幕识别不到上传目标、上传失败或被 Emos 拒绝重复上传，都会推送 Telegram 报错（同一文件同类报错 5 分钟只推一次）；直接「回复」该消息写 `标题 S01E01` / `标题 第4季第9集` / `标题 (2024)` 即可修正目标并重传。
+- **在线识别目标搜索:** Emos 的 `/api/video/tree` 带 `type=tv` 过滤时可能搜不到已存在的条目（Web 搜索不带 type 却能搜到），所以 `OnlineUploadService.search_targets` 带类型搜不到时会去掉类型再搜一次；从候选里定位季/集时优先选标题相关的作品，避免把别的剧的同名集号当成目标。「在线识别上传」页会按识别出的剧名/文件名前缀给结果分组，每组一个搜索框，「搜索并匹配本组」按各文件自己的季/集号批量落到对应的 ve。
 
 ## Gotchas
 - **Imports in tests:** `pythonpath = ["src"]` in `pyproject.toml` means pytest imports `from video_organizer.core...`. But `run_organizer.py` uses `sys.path.append("src")` so it imports `from src.video_organizer...`.

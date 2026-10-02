@@ -638,7 +638,9 @@ class TelegramBotService:
             self.send_text(f"查询 Emos 失败：{exc}", reply_to=reply_to, chat_id=chat_id)
             return
 
-        match = service.pick_target(candidates, expr.season, expr.episode, media_type, year=expr.year)
+        match = service.pick_target(
+            candidates, expr.season, expr.episode, media_type, year=expr.year, title=expr.title
+        )
         if not match:
             hint = self._candidate_hint(candidates)
             message = f"未在 Emos 中找到匹配条目：{expr.describe()}"
