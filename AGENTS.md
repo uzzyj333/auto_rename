@@ -35,7 +35,7 @@
 - **配置文件:** `config.ini`（实际）、`config_template.ini`（模板），首次运行自动生成
   - 下载器配置节 `downloader.<标识>` 支持同类型多实例：`downloader.aria2`、`downloader.aria2_2` 等，用 `type` 字段指定真实类型（aria2 / qbittorrent）
 - **打包:** `build.sh` — PyInstaller 构建，spec 内嵌生成
-- **部署文档:** `DEPLOY.md` — 从创建目录到 `docker compose up -d --build` 的完整步骤（含 compose 文件、下载器/Telegram 配置、升级备份、排障）
+- **部署文档:** `DEPLOY.md` — 从创建目录到 `docker compose up -d --build` 的精简部署步骤（compose 文件即仓库根目录 `docker-compose.yml`）
 
 ## 代码约定
 
