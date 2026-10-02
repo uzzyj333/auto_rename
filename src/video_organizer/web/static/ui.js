@@ -149,14 +149,19 @@ function processToastQueue() {
 // ===== 模态框 =====
 let modalConfirmCallback = null;
 
-function showModal() {
+function showModal(showFooter = true) {
     const overlay = document.getElementById('modalOverlay');
     if (overlay) overlay.classList.add('show');
+    // 文件浏览等弹窗不需要底部按钮，其余弹窗必须恢复底部按钮（否则没有「保存」）
+    const footer = document.getElementById('modalFooter');
+    if (footer) footer.style.display = showFooter === false ? 'none' : 'flex';
 }
 
 function hideModal() {
     const overlay = document.getElementById('modalOverlay');
     if (overlay) overlay.classList.remove('show');
+    const footer = document.getElementById('modalFooter');
+    if (footer) footer.style.display = 'flex';
     modalConfirmCallback = null;
 }
 

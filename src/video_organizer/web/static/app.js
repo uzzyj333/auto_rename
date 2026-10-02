@@ -1186,9 +1186,7 @@ function showBrowseModal(data) {
             parentBtn.addEventListener('click', () => browsePath(parentBtn.dataset.path));
         }
     }
-    const footer = document.getElementById('modalFooter');
-    if (footer) footer.style.display = 'none';
-    showModal();
+    showModal(false);
 }
 
 function onFileListClick(e) {
