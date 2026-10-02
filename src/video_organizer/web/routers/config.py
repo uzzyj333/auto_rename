@@ -57,6 +57,13 @@ def _apply_runtime_config(config: Dict[str, Any]) -> None:
             parent.update_supported_extensions(extensions)
     except Exception as e:
         logger.warning(f"配置热更新同步支持的扩展名失败: {e}")
+    # 监控器自身持有的配置（路径映射等）也要刷新，否则在线改完不生效
+    try:
+        parent = getattr(handler, "_parent_monitor", None) if handler is not None else None
+        if parent is not None and hasattr(parent, "apply_config"):
+            parent.apply_config(config)
+    except Exception as e:
+        logger.warning(f"配置热更新同步到监控器失败: {e}")
     try:
         config_path = get_state_manager().get_config_path()
     except Exception:
@@ -453,7 +460,15 @@ async def update_config_item(request: ConfigUpdateRequest):
         config_path = state.get_config_path()
         if request.section not in config:
             raise HTTPException(status_code=404, detail=f"配置节 '{request.section}' 不存在")
-        config[request.section][request.key] = request.value
+        value = request.value
+        # 路径映射这类字典配置在 Web 端是文本框，保存的是字符串；
+        # 直接写回共享配置字典会让监控器读到字符串并抛
+        # 'str' object has no attribute 'items'，导致下载完成后不再自动上传
+        if request.key == "path_mappings":
+            from ...core.config_loader import normalize_path_mappings
+
+            value = normalize_path_mappings(value)
+        config[request.section][request.key] = value
         if config_path:
             from ...core.config_loader import update_config
             update_config(config, config_path)
@@ -477,7 +492,12 @@ async def update_config_section(request: ConfigSectionUpdateRequest):
         config_path = state.get_config_path()
         if request.section not in config:
             config[request.section] = {}
-        config[request.section].update(request.values)
+        values = dict(request.values or {})
+        if "path_mappings" in values:
+            from ...core.config_loader import normalize_path_mappings
+
+            values["path_mappings"] = normalize_path_mappings(values["path_mappings"])
+        config[request.section].update(values)
         if config_path:
             from ...core.config_loader import update_config, load_config
             update_config(config, config_path)

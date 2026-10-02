@@ -13,6 +13,115 @@ logger = logging.getLogger(__name__)
 KNOWN_DOWNLOADER_TYPES = ("aria2", "qbittorrent")
 
 
+def normalize_extensions(value) -> List[str]:
+    """把「支持的扩展名」配置统一成小写扩展名列表
+
+    配置可能来自 INI 字符串（``.mp4,.mkv``）或 Web 端 JSON 数组；
+    如果直接对字符串做迭代会得到单个字符（``['.', 'm', 'p', ...]``），
+    导致 ``str.endswith()`` 匹配到几乎所有文件。这里统一按逗号 / 空白切分。
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = [item for item in re.split(r"[,\s;]+", value) if item.strip()]
+    elif isinstance(value, (list, tuple, set)):
+        parts = []
+        for item in value:
+            if item is None:
+                continue
+            parts.extend(
+                [piece for piece in re.split(r"[,\s;]+", str(item)) if piece.strip()]
+            )
+    else:
+        parts = [str(value)]
+    normalized: List[str] = []
+    for item in parts:
+        text = str(item).strip().lower()
+        if not text:
+            continue
+        if not text.startswith("."):
+            text = "." + text
+        if text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
+def _split_path_mapping(text: str):
+    """拆分 ``下载器路径:本地路径``（Windows 盘符里的冒号不算分隔符）"""
+    text = text.strip()
+    if not text:
+        return None
+    start = 2 if (len(text) > 2 and text[1] == ":" and text[2] in "\\/") else 0
+    idx = text.find(":", start)
+    if idx == -1:
+        return None
+    key = text[:idx].strip()
+    value = text[idx + 1 :].strip()
+    if not key or not value:
+        return None
+    return key, value
+
+
+def normalize_path_mappings(value) -> Dict[str, str]:
+    """把「路径映射」配置统一成 ``{下载器路径: 本地路径}`` 字典
+
+    支持多种来源：INI 旧格式字符串（``/downloads:F:/Downloads``）、
+    Web 端 JSON 字符串（``{"\\/downloads": "F:/Downloads"}``）、
+    以及已经是字典 / 列表的情况。
+
+    以前只有 ``load_config`` 会做转换，Web 端把表单文本直接写回内存里的
+    共享配置字典，``path_mappings`` 就变成字符串；下载完成事件在
+    ``path_mappings.items()`` 处抛 ``'str' object has no attribute 'items'``，
+    表现就是「下载完了却一直不识别 / 不自动上传」。
+    """
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return {
+            str(k).strip(): str(v).strip()
+            for k, v in value.items()
+            if str(k).strip()
+        }
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        # Web 端可能写入 json.dumps 的结果
+        if text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                return {
+                    str(k).strip(): str(v).strip()
+                    for k, v in parsed.items()
+                    if str(k).strip()
+                }
+        items = [item for item in re.split(r"[,\n;]+", text) if item.strip()]
+    else:
+        return {}
+    result: Dict[str, str] = {}
+    for item in items:
+        if isinstance(item, dict):
+            for k, v in item.items():
+                key = str(k).strip()
+                if key:
+                    result[key] = str(v).strip()
+            continue
+        pair = _split_path_mapping(str(item))
+        if pair:
+            result[pair[0]] = pair[1]
+    return result
+
+
+def format_path_mappings(mappings) -> str:
+    """把路径映射序列化成 INI 旧格式字符串（``a:b,c:d``），便于 load_config 解析回来"""
+    return ",".join(f"{k}:{v}" for k, v in normalize_path_mappings(mappings).items())
+
+
 def derive_downloader_type(instance_id: str) -> str:
     """
     从 downloader.<instance_id> 节名推导下载器类型。
@@ -271,16 +380,9 @@ def _config_to_dict(config: configparser.ConfigParser) -> Dict[str, Any]:
                     elif isinstance(default_options[key], dict):
                         # 特殊处理字典类型，用于path_mappings配置
                         if key == "path_mappings":
-                            mappings_str = config[section].get(key, "")
-                            mappings = {}
-                            if mappings_str:
-                                for mapping in mappings_str.split(","):
-                                    mapping = mapping.strip()
-                                    if mapping:
-                                        parts = mapping.split(":", 1)
-                                        if len(parts) == 2:
-                                            mappings[parts[0].strip()] = parts[1].strip()
-                            config_dict[section][key] = mappings
+                            config_dict[section][key] = normalize_path_mappings(
+                                config[section].get(key, "")
+                            )
                         else:
                             config_dict[section][key] = config[section].get(key)
                     else:
@@ -449,7 +551,10 @@ def update_config(
                 # manual_rules.rules 由下面的 ruleN 写回，跳过
                 if section == "manual_rules" and key == "rules":
                     continue
-                if isinstance(value, list):
+                if key == "path_mappings":
+                    # 统一写成 INI 旧格式，保证 load_config 能原样解析回来
+                    config[section][key] = format_path_mappings(value)
+                elif isinstance(value, list):
                     try:
                         config[section][key] = ",".join(value)
                     except TypeError:
@@ -479,7 +584,10 @@ def update_config(
                 continue
             config[section_name] = {}
             for key, value in options.items():
-                config[section_name][key] = str(value)
+                if key == "path_mappings":
+                    config[section_name][key] = format_path_mappings(value)
+                else:
+                    config[section_name][key] = str(value)
     
     # 保存配置文件
     parent_dir = os.path.dirname(config_path)

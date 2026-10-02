@@ -167,6 +167,86 @@ class TestDownloaderMonitorHotReload(_TempDbMixin, unittest.TestCase):
         self.assertIs(_find_monitor(monitors, "aria2"), monitors[0])
 
 
+class TestDownloaderMonitorResilience(_TempDbMixin, unittest.TestCase):
+    """单个下载器配置异常时不能拖垮其它实例的监控"""
+
+    def setUp(self):
+        self._setup_temp_db()
+        self.configs = [
+            {"type": "aria2", "id": "aria2", "rpc_url": "http://127.0.0.1:6800/jsonrpc"},
+            {
+                "type": "qbittorrent",
+                "id": "qbittorrent",
+                "name": "qb",
+                "rpc_url": "http://127.0.0.1:8091/api/v2",
+            },
+        ]
+        self.monitor = FileSystemMonitor(
+            watch_path=str(Path(self._db_tmp.name) / "watch"),
+            processed_path=str(Path(self._db_tmp.name) / "out"),
+            tmdb_api_key="",
+            supported_extensions=[".mp4"],
+            downloader_configs=list(self.configs),
+            config={"monitoring": {}, "downloaders": list(self.configs)},
+        )
+
+    def tearDown(self):
+        self.monitor.stop()
+        self._teardown_temp_db()
+
+    def test_broken_instance_does_not_drop_other_monitors(self):
+        from unittest.mock import patch
+
+        from src.video_organizer.core import downloader_monitor as dm
+
+        real_create = dm.DownloaderMonitorFactory.create_monitor
+
+        def flaky(downloader_type, callback, config):
+            if downloader_type == "qbittorrent":
+                raise ValueError("bad qb config")
+            return real_create(downloader_type, callback, config)
+
+        changed = [dict(cfg) for cfg in self.configs]
+        changed[1]["name"] = "qb 改了名字（触发重建）"
+
+        with patch.object(
+            dm.DownloaderMonitorFactory, "create_monitor", staticmethod(flaky)
+        ):
+            monitors = self.monitor.reload_downloader_monitors(changed)
+
+        self.assertEqual([m.id for m in monitors], ["aria2"])
+
+    def test_rebuild_failure_keeps_previous_monitors(self):
+        from unittest.mock import patch
+
+        before = [id(m) for m in self.monitor.downloader_monitors]
+
+        changed = [dict(cfg) for cfg in self.configs]
+        changed[0]["rpc_url"] = "http://127.0.0.1:6899/jsonrpc"
+
+        with patch.object(
+            self.monitor,
+            "_build_downloader_monitors",
+            side_effect=RuntimeError("boom"),
+        ):
+            monitors = self.monitor.reload_downloader_monitors(changed)
+
+        self.assertEqual([id(m) for m in monitors], before)
+        self.assertEqual([id(m) for m in self.monitor.downloader_monitors], before)
+
+    def test_unknown_monitor_mode_falls_back_to_polling(self):
+        from src.video_organizer.core.downloader_monitor import MonitorMode
+
+        self.assertEqual(
+            Aria2Monitor(lambda path: None, monitor_mode="").monitor_mode,
+            MonitorMode.POLLING,
+        )
+        self.assertEqual(
+            Aria2Monitor(lambda path: None, monitor_mode="nonsense").monitor_mode,
+            MonitorMode.POLLING,
+        )
+
+
 class TestSupportedExtensionsHotReload(_TempDbMixin, unittest.TestCase):
     """在线修改「支持的扩展名」后立即生效（以前改完不重启容器不生效）"""
 

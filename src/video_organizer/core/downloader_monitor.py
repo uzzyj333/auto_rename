@@ -279,7 +279,14 @@ class Aria2Monitor(DownloaderMonitor):
         self.rpc_url = rpc_url
         self.secret = secret
         self.supported_extensions = supported_extensions
-        self.monitor_mode = MonitorMode(monitor_mode.lower())
+        try:
+            self.monitor_mode = MonitorMode(str(monitor_mode or "polling").strip().lower())
+        except ValueError:
+            logger.warning(
+                "未知的 aria2 监控模式 %r，回退为 polling（可用: polling/websocket/webhook）",
+                monitor_mode,
+            )
+            self.monitor_mode = MonitorMode.POLLING
         self.path_mappings = path_mappings or {}
         self.websocket_reconnect_delay = websocket_reconnect_delay
         
@@ -294,24 +301,6 @@ class Aria2Monitor(DownloaderMonitor):
         # Webhook 相关
         self._webhook_server = None
         self._webhook_thread = None
-
-    def start(self):
-        """
-        Start monitoring aria2 for completed downloads.
-        """
-        self.running = True
-        self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self.monitor_thread.start()
-        logger.info(f"Started aria2 monitor with RPC URL: {self.rpc_url}")
-
-    def stop(self):
-        """
-        Stop monitoring aria2.
-        """
-        self.running = False
-        if self.monitor_thread:
-            self.monitor_thread.join()
-        logger.info("Stopped aria2 monitor")
 
     def is_connected(self) -> bool:
         """
@@ -909,10 +898,11 @@ class QBittorrentMonitor(DownloaderMonitor):
         """
         Start monitoring qBittorrent for completed downloads.
         """
-        # 尝试登录
+        # 尝试登录；失败也照样启动监控线程，循环里会每 10 秒重试登录。
+        # 以前这里直接 return，容器启动时 qBittorrent 还没就绪就会永久不监控，
+        # 表现为「qb 一直不监控」且只能重启容器恢复。
         if not self._login():
-            logger.error("Failed to login to qBittorrent, cannot start monitor")
-            return
+            logger.warning("qBittorrent 登录失败，监控线程仍会启动并自动重试登录")
 
         self.running = True
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)

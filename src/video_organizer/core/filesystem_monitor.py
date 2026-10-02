@@ -16,6 +16,7 @@ from typing import Dict, Optional, List
 # 导入更新后的VideoFileHandler
 from .video_file_handler import VideoFileHandler
 from .downloader_monitor import DownloaderMonitorFactory, decode_file_path, resolve_file_path
+from .config_loader import normalize_extensions, normalize_path_mappings
 
 logger = logging.getLogger(__name__)
 
@@ -139,19 +140,27 @@ class FileSystemMonitor:
                 logger.error("Downloader config missing 'type' field, skipping")
                 continue
 
-            # 将 supported_extensions 添加到配置中
+            # 将 supported_extensions 添加到配置中（统一成小写扩展名，
+            # 避免 INI 字符串被逐字符拆分后匹配到几乎所有文件）
             config_with_extensions = config.copy()
             config_with_extensions["supported_extensions"] = tuple(
-                self.supported_extensions
-            )
+                normalize_extensions(self.supported_extensions)
+            ) or tuple(self.supported_extensions)
 
-            monitor = DownloaderMonitorFactory.create_monitor(
-                downloader_type, self._on_download_completed, config_with_extensions
-            )
+            # 单个下载器配置有问题时不能让其它下载器一起失去监控
+            try:
+                monitor = DownloaderMonitorFactory.create_monitor(
+                    downloader_type, self._on_download_completed, config_with_extensions
+                )
+            except Exception as exc:
+                logger.error(f"创建 {downloader_type} 监控器失败（已跳过该实例）: {exc}")
+                continue
 
             if monitor:
                 monitors.append(monitor)
                 logger.info(f"Initialized {downloader_type} monitor: {monitor.name}")
+            else:
+                logger.warning(f"未创建 {downloader_type} 监控器（类型不受支持？）")
         return monitors
 
     def _init_downloader_monitors(self):
@@ -172,9 +181,7 @@ class FileSystemMonitor:
 
         以前这个配置只在启动时读取，界面上改完不重启容器不生效。
         """
-        normalized = tuple(
-            str(ext).strip().lower() for ext in (extensions or []) if str(ext).strip()
-        )
+        normalized = tuple(normalize_extensions(extensions))
         if not normalized:
             return
         self.supported_extensions = list(normalized)
@@ -201,6 +208,15 @@ class FileSystemMonitor:
             self.downloader_configs = configs
             return list(self.downloader_monitors)
 
+        # 先按新配置构建，构建失败时保留原有监控器继续运行：
+        # 以前是「先停掉所有监控器再重建」，一旦重建抛异常（例如某个下载器
+        # monitor_mode 配错）就会变成所有下载器都不监控，而且只在日志里留一条 warning
+        try:
+            new_monitors = self._build_downloader_monitors(configs)
+        except Exception as exc:
+            logger.error(f"下载器监控重建失败，保留原有监控器: {exc}")
+            return list(self.downloader_monitors)
+
         was_running = self._downloader_running
         for monitor in self.downloader_monitors:
             try:
@@ -210,7 +226,7 @@ class FileSystemMonitor:
                 logger.warning(f"停止下载器监控失败: {e}")
 
         self.downloader_configs = configs
-        self.downloader_monitors = self._build_downloader_monitors(configs)
+        self.downloader_monitors = new_monitors
         self._downloader_signature = signature
 
         if was_running:
@@ -226,6 +242,19 @@ class FileSystemMonitor:
 
         logger.info(f"下载器监控已热更新，共 {len(self.downloader_monitors)} 个实例")
         return list(self.downloader_monitors)
+
+    def apply_config(self, config: Optional[dict]) -> None:
+        """在线修改配置后刷新监控器持有的配置（路径映射 / 支持的扩展名）
+
+        ``_apply_path_mapping`` 读的是 ``self.config``，配置热更新后必须同步，
+        否则路径映射改动不会生效。
+        """
+        if not config:
+            return
+        self.config = config
+        extensions = (config.get("monitoring") or {}).get("supported_extensions")
+        if extensions:
+            self.update_supported_extensions(extensions)
 
     def _init_directory_monitor(self):
         """
@@ -386,8 +415,8 @@ class FileSystemMonitor:
         Returns:
             str: 转换后的主机实际路径
         """
-        # 从配置中获取路径映射
-        path_mappings = (
+        # 从配置中获取路径映射（归一化成字典：Web 端表单保存的是字符串）
+        path_mappings = normalize_path_mappings(
             self.config.get("monitoring", {}).get("path_mappings", {})
             if hasattr(self, "config")
             else {}
