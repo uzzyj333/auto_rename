@@ -30,6 +30,7 @@ from .emos_client import EmosApiError, EmosClient
 from .probe import probe_summary_for_upload, probe_video
 from ..upload.upload_emos import (
     DEFAULT_UPLOAD_CONCURRENCY,
+    SUBTITLE_EXTENSIONS,
     RobustEmosVideoUploader,
     find_subtitle_files,
     format_size,
@@ -382,13 +383,13 @@ class OnlineUploadService:
             try:
                 if child.is_dir():
                     entries.append({"name": child.name, "path": str(child), "kind": "directory", "file_count": None})
-                elif child.suffix.lower() in VIDEO_EXTENSIONS:
+                elif child.suffix.lower() in VIDEO_EXTENSIONS or child.suffix.lower() in SUBTITLE_EXTENSIONS:
                     stat = child.stat()
                     entries.append(
                         {
                             "name": child.name,
                             "path": str(child),
-                            "kind": "video",
+                            "kind": "subtitle" if child.suffix.lower() in SUBTITLE_EXTENSIONS else "video",
                             "size": stat.st_size,
                             "size_text": format_size(stat.st_size),
                             "modified_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
@@ -414,7 +415,10 @@ class OnlineUploadService:
         iterator = directory.rglob("*") if recursive else directory.glob("*")
         for item in iterator:
             try:
-                if not item.is_file() or item.suffix.lower() not in VIDEO_EXTENSIONS:
+                suffix = item.suffix.lower()
+                if not item.is_file() or (
+                    suffix not in VIDEO_EXTENSIONS and suffix not in SUBTITLE_EXTENSIONS
+                ):
                     continue
                 stat = item.stat()
             except OSError:
@@ -424,6 +428,7 @@ class OnlineUploadService:
                     "id": f"{item}:{stat.st_size}:{int(stat.st_mtime)}",
                     "name": item.name,
                     "path": str(item),
+                    "kind": "subtitle" if suffix in SUBTITLE_EXTENSIONS else "video",
                     "size": stat.st_size,
                     "size_text": format_size(stat.st_size),
                     "modified_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
@@ -473,6 +478,7 @@ class OnlineUploadService:
         if not path.is_file():
             raise FileNotFoundError(f"文件不存在: {path}")
 
+        is_subtitle = path.suffix.lower() in SUBTITLE_EXTENSIONS
         metadata: Dict[str, Any] = {}
         errors: List[str] = []
         try:
@@ -549,7 +555,8 @@ class OnlineUploadService:
             },
             "match": match,
             "candidates": candidates,
-            "subtitles": [item.name for item in find_subtitle_files(path)],
+            "file_kind": "subtitle" if is_subtitle else "video",
+            "subtitles": [] if is_subtitle else [item.name for item in find_subtitle_files(path)],
             "error": "；".join(errors),
         }
 
@@ -942,7 +949,10 @@ class OnlineUploadService:
             emos = self._emos_config()
             metadata: Dict[str, Any] = {}
             online = self._online_config()
-            if bool(online.get("probe_enabled", True)):
+            is_subtitle = str(snapshot.get("file_path") or "").lower().endswith(
+                tuple(SUBTITLE_EXTENSIONS)
+            )
+            if not is_subtitle and bool(online.get("probe_enabled", True)):
                 try:
                     metadata = probe_summary_for_upload(self.probe(snapshot["file_path"]))
                 except Exception as exc:
@@ -961,13 +971,21 @@ class OnlineUploadService:
             )
             try:
                 self._update_task(task_id, stage="获取上传凭证")
-                result = uploader.upload_video(
-                    snapshot["file_path"],
-                    snapshot["item_type"],
-                    snapshot["item_id"],
-                    snapshot["storage"],
-                    metadata=metadata or None,
-                )
+                if is_subtitle:
+                    result = uploader.upload_subtitle(
+                        snapshot["file_path"],
+                        snapshot["item_type"],
+                        snapshot["item_id"],
+                        snapshot["storage"],
+                    )
+                else:
+                    result = uploader.upload_video(
+                        snapshot["file_path"],
+                        snapshot["item_type"],
+                        snapshot["item_id"],
+                        snapshot["storage"],
+                        metadata=metadata or None,
+                    )
             finally:
                 uploader.close()
             if result and result.get("deferred"):
@@ -979,23 +997,37 @@ class OnlineUploadService:
                 )
                 self._notify_failure(snapshot, reason)
             elif result:
-                # 上传成功后按配置处理原文件（手动选片 / 自动上传 / Telegram 修正三条链路一致）
-                deleted, delete_note = self._delete_source_if_configured(snapshot["file_path"])
-                if deleted:
-                    self._delete_uploaded_subtitles(result)
-                subtitle_note = self._subtitle_stage_note(result.get("subtitles"))
-                self._update_task(
-                    task_id,
-                    status="completed",
-                    stage="已完成" + subtitle_note + delete_note,
-                    progress=100.0,
-                    uploaded_bytes=snapshot["file_size"],
-                    total_bytes=snapshot["file_size"],
-                    file_id=str(result.get("file_id") or ""),
-                    media_id=str(result.get("media_id") or ""),
-                    original_deleted=deleted,
-                    error="",
-                )
+                if is_subtitle:
+                    deleted, delete_note = self._delete_source_if_configured(snapshot["file_path"])
+                    self._update_task(
+                        task_id,
+                        status="completed",
+                        stage="字幕已上传" + delete_note,
+                        progress=100.0,
+                        uploaded_bytes=snapshot["file_size"],
+                        total_bytes=snapshot["file_size"],
+                        media_id=str(result.get("subtitle_id") or ""),
+                        original_deleted=deleted,
+                        error="",
+                    )
+                else:
+                    # 上传成功后按配置处理原文件（手动选片 / 自动上传 / Telegram 修正三条链路一致）
+                    deleted, delete_note = self._delete_source_if_configured(snapshot["file_path"])
+                    if deleted:
+                        self._delete_uploaded_subtitles(result)
+                    subtitle_note = self._subtitle_stage_note(result.get("subtitles"))
+                    self._update_task(
+                        task_id,
+                        status="completed",
+                        stage="已完成" + subtitle_note + delete_note,
+                        progress=100.0,
+                        uploaded_bytes=snapshot["file_size"],
+                        total_bytes=snapshot["file_size"],
+                        file_id=str(result.get("file_id") or ""),
+                        media_id=str(result.get("media_id") or ""),
+                        original_deleted=deleted,
+                        error="",
+                    )
             else:
                 reason = str(getattr(uploader, "last_error", "") or "上传失败，请查看日志")
                 self._update_task(task_id, status="failed", stage="上传失败", error=reason)

@@ -2060,11 +2060,14 @@ async function browseOnline(path) {
         }
         for (const entry of entries) {
             const isDir = entry.kind === 'directory' || entry.kind === 'root';
+            const isSubtitle = entry.kind === 'subtitle';
             const action = isDir
                 ? '<a href="#" data-online-dir="' + escapeOnline(entry.path) + '">打开</a>'
-                : '<a href="#" data-online-probe="' + escapeOnline(entry.path) + '">探测</a>';
-            html += '<tr><td>' + (isDir ? '📁 ' : '🎬 ') + escapeOnline(entry.name) + '</td>' +
-                '<td>' + (isDir ? '目录' : '视频') + '</td>' +
+                : (isSubtitle
+                    ? '<span style="color:var(--text-muted)">字幕</span>'
+                    : '<a href="#" data-online-probe="' + escapeOnline(entry.path) + '">探测</a>');
+            html += '<tr><td>' + (isDir ? '📁 ' : (isSubtitle ? '📄 ' : '🎬 ')) + escapeOnline(entry.name) + '</td>' +
+                '<td>' + (isDir ? '目录' : (isSubtitle ? '字幕' : '视频')) + '</td>' +
                 '<td>' + escapeOnline(entry.size_text || '') + '</td>' +
                 '<td>' + action + '</td></tr>';
         }
@@ -2118,7 +2121,7 @@ function renderOnlineVideos() {
             '<tr>' +
                 '<td><input type="checkbox" data-online-video="' + escapeOnline(v.path) + '"' +
                     (onlineState.selected.has(v.path) ? ' checked' : '') + '></td>' +
-                '<td>' + escapeOnline(v.name) +
+                '<td>' + (v.kind === 'subtitle' ? '📄 ' : '🎬 ') + escapeOnline(v.name) +
                     '<div style="font-size:12px;color:var(--text-muted)">' + escapeOnline(v.path) + '</div></td>' +
                 '<td>' + escapeOnline(v.size_text || '') + '</td>' +
                 '<td><a href="#" data-online-probe="' + escapeOnline(v.path) + '">探测</a></td>' +
@@ -2222,6 +2225,7 @@ function buildRecognizedItem(data) {
         match: data.match || null,
         candidates: data.candidates || [],
         subtitles: data.subtitles || [],
+        fileKind: data.file_kind || 'video',
         options: options,
         target: target,
         storage: '',
@@ -2261,6 +2265,7 @@ function renderOnlineRecognize() {
                         escapeOnline(meta.title || '-') + ' · TMDB: ' + escapeOnline(meta.tmdb_id || '-') +
                         ' · 类型: ' + escapeOnline(meta.media_type || '-') + escapeOnline(seasonText) + '</div>' +
                     ((item.subtitles && item.subtitles.length) ? '<div style="font-size:12px;color:var(--text-muted);margin-top:4px">📎 将同时上传字幕: ' + escapeOnline(item.subtitles.join('、')) + '</div>' : '') +
+                    ((item.fileKind === 'subtitle') ? '<div style="font-size:12px;color:var(--text-muted);margin-top:4px">📎 字幕文件：将作为外挂字幕补传到所选条目（无需再传视频）</div>' : '') +
                     (item.error ? '<div style="font-size:12px;color:#e5534b;margin-top:4px">' + escapeOnline(item.error) + '</div>' : '') +
                 '</div>' +
                 '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +

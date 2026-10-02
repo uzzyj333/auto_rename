@@ -578,6 +578,28 @@ class RobustEmosVideoUploader:
             )
         return summary
 
+    def upload_subtitle(
+        self,
+        subtitle_path: Any,
+        item_type: str,
+        item_id: Any,
+        file_storage: str = "internal",
+    ) -> Dict[str, Any]:
+        """单独上传一个外挂字幕文件并绑定到指定视频/剧集
+
+        用于视频已不在本地（比如上传后删源、字幕单独下载）时，把字幕单独补传到目标条目。
+        """
+        path = Path(subtitle_path)
+        if not path.is_file():
+            raise EmosApiError(f"字幕文件不存在: {path}")
+        if path.suffix.lower() not in SUBTITLE_EXTENSIONS:
+            raise EmosApiError(f"不支持的字幕格式: {path.name}")
+        subtitle_id = self._upload_subtitle_file(
+            path, item_type, item_id, file_storage or "internal"
+        )
+        logger.info("字幕单独上传成功: %s -> %s", path.name, subtitle_id)
+        return {"subtitle_id": subtitle_id, "kind": "subtitle"}
+
     def _upload_subtitle_file(
         self,
         path: Path,

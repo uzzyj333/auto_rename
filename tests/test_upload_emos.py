@@ -609,6 +609,91 @@ class TestUploadEmosSubtitles(unittest.TestCase):
         self.assertEqual(find_subtitle_files(Path("Z:/not-exists/a.mkv")), [])
         self.assertEqual(find_subtitle_files(Path("")), [])
 
+    def test_find_subtitle_files_matches_underscore_track_suffix(self):
+        """下划线/短横线分隔的轨道、语言标签也要能匹配（..._track9_chi.ass）"""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            name = (
+                "迪迦奥特曼.Ultraman.Tiga.EP01.光的继承者.1996.BluRay.1080p.x264.LPCM."
+                "国粤日台多音轨.内封多字幕.FFans@星星"
+            )
+            video = base / f"{name}.mkv"
+            video.write_bytes(b"v")
+            (base / f"{name}_track9_chi.ass").write_bytes(b"s")
+            (base / f"{name}-chi.srt").write_bytes(b"s")
+            (base / f"{name} chi.srt").write_bytes(b"s")
+
+            found = {p.name for p in find_subtitle_files(video)}
+
+            self.assertEqual(
+                found,
+                {
+                    f"{name}_track9_chi.ass",
+                    f"{name}-chi.srt",
+                    f"{name} chi.srt",
+                },
+            )
+
+    def test_find_subtitle_files_keeps_subtitles_of_other_videos(self):
+        """A_2.srt 属于 A_2.mkv，不能挂到 A.mkv 上"""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "A.mkv").write_bytes(b"v")
+            (base / "A_2.mkv").write_bytes(b"v")
+            (base / "A_2.srt").write_bytes(b"s")
+            (base / "A.ass").write_bytes(b"s")
+
+            self.assertEqual(
+                [p.name for p in find_subtitle_files(base / "A.mkv")], ["A.ass"]
+            )
+            self.assertEqual(
+                [p.name for p in find_subtitle_files(base / "A_2.mkv")], ["A_2.srt"]
+            )
+
+    def test_upload_subtitle_binds_standalone_subtitle(self):
+        """视频不在本地时也要能单独补传字幕"""
+        handle, path = tempfile.mkstemp(suffix=".ass")
+        os.write(handle, b"[Script Info]\n")
+        os.close(handle)
+        try:
+            uploader = RobustEmosVideoUploader(
+                auth_token="t", base_url="https://emos.best"
+            )
+            uploader.client.get_upload_token = MagicMock(
+                return_value={
+                    "file_id": "f1",
+                    "type": "r2",
+                    "data": {"upload_url": "https://r2.example/x"},
+                }
+            )
+            uploader.client.save_subtitle = MagicMock(
+                return_value={"subtitle_id": "sub9"}
+            )
+            uploader._upload_google_drive = MagicMock()
+
+            result = uploader.upload_subtitle(Path(path), "ve", "42", "internal")
+
+            self.assertEqual(result.get("subtitle_id"), "sub9")
+            self.assertEqual(result.get("kind"), "subtitle")
+            uploader.client.save_subtitle.assert_called_once_with("ve", "42", "f1")
+        finally:
+            os.remove(path)
+
+    def test_upload_subtitle_rejects_unsupported_file(self):
+        handle, path = tempfile.mkstemp(suffix=".mkv")
+        os.write(handle, b"v")
+        os.close(handle)
+        try:
+            uploader = RobustEmosVideoUploader(
+                auth_token="t", base_url="https://emos.best"
+            )
+            with self.assertRaises(EmosApiError):
+                uploader.upload_subtitle(Path(path), "ve", "1")
+            with self.assertRaises(EmosApiError):
+                uploader.upload_subtitle(Path(path).with_suffix(".srt"), "ve", "1")
+        finally:
+            os.remove(path)
+
     def test_save_subtitle_posts_to_subtitle_endpoint(self):
         client = EmosClient(base_url="https://emos.best", auth_token="t")
         captured = {}
