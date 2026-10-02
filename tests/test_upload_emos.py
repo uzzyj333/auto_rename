@@ -8,6 +8,8 @@
 另外覆盖分片并发上传与 Telegram 进度文本格式。
 """
 
+import base64
+import json
 import os
 import sys
 import tempfile
@@ -23,6 +25,7 @@ from src.video_organizer.core.emos_client import EmosApiError, EmosClient
 from src.video_organizer.upload.upload_emos import (
     RobustEmosVideoUploader,
     _recall_tg_message,
+    find_subtitle_files,
     format_time,
     progress_bar,
 )
@@ -70,6 +73,46 @@ class _BarrierSession:
 
     def close(self):
         self.closed = True
+
+
+class _RecordingTusSession:
+    """记录 tusd 的 POST / PATCH 请求"""
+
+    def __init__(self, location="/files/abc"):
+        self.calls = []
+        self.location = location
+        self.closed = False
+
+    def post(self, url, **kwargs):
+        self.calls.append(("POST", url, kwargs))
+        return _FakeResponse(201, {"Location": self.location})
+
+    def patch(self, url, **kwargs):
+        self.calls.append(("PATCH", url, kwargs))
+        data = kwargs.get("data") or b""
+        offset = int(kwargs["headers"].get("Upload-Offset") or 0)
+        return _FakeResponse(204, {"Upload-Offset": str(offset + len(data))})
+
+    def close(self):
+        self.closed = True
+
+
+class _FailingTusSession:
+    """创建上传直接失败（用于验证错误提示）"""
+
+    def __init__(self, status=403):
+        self.status = status
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append(("POST", url, kwargs))
+        return _FakeResponse(self.status, {}, b"forbidden")
+
+    def patch(self, url, **kwargs):
+        raise AssertionError("创建失败时不应发送 PATCH")
+
+    def close(self):
+        pass
 
 
 class TestUploadEmosDirectPut(unittest.TestCase):
@@ -512,6 +555,419 @@ class TestUploadEmosAlreadyUploaded(unittest.TestCase):
 
         uploader.client.get_video_base = MagicMock(side_effect=RuntimeError("boom"))
         self.assertFalse(uploader._episode_has_media("ve", 1, "a.mkv", 7))
+
+
+class TestUploadEmosSubtitles(unittest.TestCase):
+    """视频上传成功后顺带上传同目录同名的外挂字幕（/api/upload/subtitle/save）"""
+
+    def test_find_subtitle_files_matches_same_stem_and_language_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            video = base / "Show.S01E01.mkv"
+            video.write_bytes(b"v")
+            (base / "Show.S01E01.srt").write_bytes(b"s")
+            (base / "Show.S01E01.chs.ass").write_bytes(b"s")
+            (base / "Show.S01E01.zh-Hans.vtt").write_bytes(b"s")
+            (base / "Show.S01E01.mkv.srt").write_bytes(b"s")
+            (base / "Show.S01E02.srt").write_bytes(b"s")
+            (base / "Other.srt").write_bytes(b"s")
+            (base / "Show.S01E01.txt").write_bytes(b"s")
+
+            found = {p.name for p in find_subtitle_files(video)}
+
+            self.assertEqual(
+                found,
+                {
+                    "Show.S01E01.srt",
+                    "Show.S01E01.chs.ass",
+                    "Show.S01E01.zh-Hans.vtt",
+                    "Show.S01E01.mkv.srt",
+                },
+            )
+
+    def test_find_subtitle_files_skips_subtitles_of_sibling_videos(self):
+        """同目录同一集有多个格式时，别把 A.ts 的字幕挂到 A.m2ts 上"""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            ts_video = base / "Show.S01E01.ts"
+            ts_video.write_bytes(b"v")
+            m2ts_video = base / "Show.S01E01.m2ts"
+            m2ts_video.write_bytes(b"v")
+            (base / "Show.S01E01.ts.ass").write_bytes(b"s")
+            (base / "Show.S01E01.m2ts.ass").write_bytes(b"s")
+
+            self.assertEqual(
+                [p.name for p in find_subtitle_files(m2ts_video)],
+                ["Show.S01E01.m2ts.ass"],
+            )
+            self.assertEqual(
+                [p.name for p in find_subtitle_files(ts_video)],
+                ["Show.S01E01.ts.ass"],
+            )
+
+    def test_find_subtitle_files_handles_missing_directory(self):
+        self.assertEqual(find_subtitle_files(Path("Z:/not-exists/a.mkv")), [])
+        self.assertEqual(find_subtitle_files(Path("")), [])
+
+    def test_save_subtitle_posts_to_subtitle_endpoint(self):
+        client = EmosClient(base_url="https://emos.best", auth_token="t")
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            text = '{"subtitle_id": "s1", "carrot": 0}'
+
+            def close(self):
+                pass
+
+        def fake_request(method, url, **kwargs):
+            captured["method"] = method
+            captured["url"] = url
+            captured["payload"] = json.loads(kwargs["data"].decode("utf-8"))
+            return _Resp()
+
+        client.session.request = fake_request
+
+        result = client.save_subtitle("ve", 12, "f1")
+
+        self.assertEqual(result.get("subtitle_id"), "s1")
+        self.assertEqual(captured["method"], "POST")
+        self.assertTrue(captured["url"].endswith("/api/upload/subtitle/save"))
+        self.assertEqual(
+            captured["payload"], {"item_type": "ve", "item_id": 12, "file_id": "f1"}
+        )
+
+    def test_upload_subtitle_file_uses_subtitle_resource_type(self):
+        handle, path = tempfile.mkstemp(suffix=".srt")
+        os.write(handle, b"1\n00:00:00,000 --> 00:00:01,000\nhi\n")
+        os.close(handle)
+        try:
+            uploader = RobustEmosVideoUploader(
+                auth_token="t", base_url="https://emos.best"
+            )
+            uploader.client.get_upload_token = MagicMock(
+                return_value={
+                    "file_id": "f1",
+                    "type": "r2",
+                    "data": {"upload_url": "https://r2.example/x"},
+                }
+            )
+            uploader.client.save_subtitle = MagicMock(
+                return_value={"subtitle_id": "sub1"}
+            )
+            uploader._upload_google_drive = MagicMock()
+
+            subtitle_id = uploader._upload_subtitle_file(
+                Path(path), "ve", "1", "internal"
+            )
+
+            self.assertEqual(subtitle_id, "sub1")
+            kwargs = uploader.client.get_upload_token.call_args.kwargs
+            self.assertEqual(kwargs["resource_type"], "subtitle")
+            self.assertEqual(kwargs["file_name"], os.path.basename(path))
+            self.assertEqual(kwargs["file_storage"], "internal")
+            uploader._upload_google_drive.assert_called_once()
+            uploader.client.save_subtitle.assert_called_once_with("ve", "1", "f1")
+        finally:
+            os.remove(path)
+
+    def test_subtitle_upload_does_not_report_video_progress(self):
+        """字幕直传不能上报进度，否则会覆盖视频任务/Telegram 进度"""
+        handle, path = tempfile.mkstemp(suffix=".srt")
+        os.write(handle, b"1\n00:00:00,000 --> 00:00:01,000\nhi\n")
+        os.close(handle)
+        try:
+            reports = []
+            uploader = RobustEmosVideoUploader(
+                auth_token="t",
+                base_url="https://emos.best",
+                progress_callback=lambda *args: reports.append(args),
+            )
+            uploader.storage_session = _RecordingSession(
+                _FakeResponse(200, {"ETag": '"e1"'})
+            )
+            uploader.client.get_upload_token = MagicMock(
+                return_value={
+                    "file_id": "f1",
+                    "type": "r2",
+                    "data": {"upload_url": "https://r2.example/x"},
+                }
+            )
+            uploader.client.save_subtitle = MagicMock(
+                return_value={"subtitle_id": "s1"}
+            )
+
+            uploader._upload_subtitle_file(Path(path), "ve", "1", "internal")
+
+            self.assertEqual(reports, [])
+            self.assertEqual(len(uploader.storage_session.calls), 1)
+        finally:
+            os.remove(path)
+
+    def test_upload_tus_creates_then_patches(self):
+        """tusd 必须先 POST 创建拿 Location，再按 Upload-Offset 逐段 PATCH"""
+        handle, path = tempfile.mkstemp(suffix=".srt")
+        os.write(handle, b"x" * 20)
+        os.close(handle)
+        try:
+            uploader = RobustEmosVideoUploader(
+                auth_token="t", base_url="https://emos.best"
+            )
+            uploader._tus_chunk_size = lambda size: 8
+            session = _RecordingTusSession(location="/files/abc")
+            uploader.storage_session = session
+            token = {
+                "file_id": "f1",
+                "type": "tusd",
+                "data": {"upload_url": "https://emos.best/tus/"},
+            }
+
+            uploader._upload_tus(Path(path), token, 20, report=False)
+
+            self.assertEqual(
+                [call[0] for call in session.calls],
+                ["POST", "PATCH", "PATCH", "PATCH"],
+            )
+            _, url, kwargs = session.calls[0]
+            self.assertEqual(url, "https://emos.best/tus/")
+            self.assertEqual(kwargs["headers"]["Tus-Resumable"], "1.0.0")
+            self.assertEqual(kwargs["headers"]["Upload-Length"], "20")
+            self.assertEqual(
+                kwargs["headers"]["Upload-Metadata"],
+                "file_id " + base64.b64encode(b"f1").decode("ascii"),
+            )
+            # Location 是绝对路径（tusd 的 /files/<id>）时替换 endpoint 的路径部分
+            self.assertEqual(session.calls[1][1], "https://emos.best/files/abc")
+            self.assertEqual(
+                [int(call[2]["headers"]["Upload-Offset"]) for call in session.calls[1:]],
+                [0, 8, 16],
+            )
+            self.assertEqual(
+                session.calls[1][2]["headers"]["Content-Type"],
+                "application/offset+octet-stream",
+            )
+        finally:
+            os.remove(path)
+
+    def test_upload_tus_create_failure_is_reported(self):
+        handle, path = tempfile.mkstemp(suffix=".srt")
+        os.write(handle, b"x" * 20)
+        os.close(handle)
+        try:
+            uploader = RobustEmosVideoUploader(
+                auth_token="t", base_url="https://emos.best"
+            )
+            session = _FailingTusSession(403)
+            uploader.storage_session = session
+            token = {
+                "file_id": "f1",
+                "type": "tusd",
+                "data": {"upload_url": "https://emos.best/tus/"},
+            }
+
+            with self.assertRaises(EmosApiError) as ctx:
+                uploader._upload_tus(Path(path), token, 20)
+
+            self.assertIn("tusd 创建上传失败", str(ctx.exception))
+            self.assertIn("403", str(ctx.exception))
+        finally:
+            os.remove(path)
+
+    def test_upload_subtitle_file_uses_tus_when_token_type_is_tusd(self):
+        """字幕走 tusd 时也要能上传（官方已对字幕暂停 r2）"""
+        handle, path = tempfile.mkstemp(suffix=".srt")
+        os.write(handle, b"x" * 20)
+        os.close(handle)
+        try:
+            reports = []
+            uploader = RobustEmosVideoUploader(
+                auth_token="t",
+                base_url="https://emos.best",
+                progress_callback=lambda *args: reports.append(args),
+            )
+            uploader.client.get_upload_token = MagicMock(
+                return_value={
+                    "file_id": "f1",
+                    "type": "tusd",
+                    "data": {"upload_url": "https://emos.best/tus/"},
+                }
+            )
+            uploader.client.save_subtitle = MagicMock(
+                return_value={"subtitle_id": "s1"}
+            )
+            session = _RecordingTusSession()
+            uploader.storage_session = session
+
+            subtitle_id = uploader._upload_subtitle_file(
+                Path(path), "ve", "1", "internal"
+            )
+
+            self.assertEqual(subtitle_id, "s1")
+            self.assertEqual([call[0] for call in session.calls], ["POST", "PATCH"])
+            self.assertEqual(reports, [])
+            uploader.client.save_subtitle.assert_called_once_with("ve", "1", "f1")
+        finally:
+            os.remove(path)
+
+    def test_subtitle_multipart_uses_subtitle_mime_and_no_progress(self):
+        handle, path = tempfile.mkstemp(suffix=".srt")
+        os.write(handle, b"x" * 16)
+        os.close(handle)
+        try:
+            reports = []
+            uploader = RobustEmosVideoUploader(
+                auth_token="t",
+                base_url="https://emos.best",
+                progress_callback=lambda *args: reports.append(args),
+            )
+            uploader.client.get_upload_token = MagicMock(
+                return_value={
+                    "file_id": "f1",
+                    "type": "multipart",
+                    "data": {"multipart_size": {"min": 0, "max": 0}},
+                }
+            )
+            uploader.client.multipart_presign = MagicMock(
+                return_value=[{"number": 1, "upload_url": "https://r2.example.com/p1"}]
+            )
+            uploader.client.multipart_complete = MagicMock(return_value={})
+            uploader.client.save_subtitle = MagicMock(
+                return_value={"subtitle_id": "s1"}
+            )
+            session = _RecordingSession(_FakeResponse(200, {"ETag": '"e1"'}))
+            uploader.storage_session = session
+
+            subtitle_id = uploader._upload_subtitle_file(
+                Path(path), "ve", "1", "internal"
+            )
+
+            self.assertEqual(subtitle_id, "s1")
+            _, kwargs = session.calls[0]
+            self.assertEqual(kwargs["headers"]["Content-Type"], "application/x-subrip")
+            self.assertEqual(reports, [])
+            uploader.client.multipart_complete.assert_called_once()
+            uploader.client.save_subtitle.assert_called_once_with("ve", "1", "f1")
+        finally:
+            os.remove(path)
+
+    def test_upload_subtitle_files_continues_after_one_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            video = base / "A.mkv"
+            video.write_bytes(b"v")
+            (base / "A.srt").write_bytes(b"s")
+            (base / "A.ass").write_bytes(b"s")
+            uploader = RobustEmosVideoUploader(
+                auth_token="t", base_url="https://emos.best"
+            )
+
+            def fake_upload(path, item_type, item_id, file_storage):
+                if path.suffix == ".ass":
+                    raise EmosApiError("Emos 接口返回 HTTP 422")
+                return "sub-1"
+
+            uploader._upload_subtitle_file = fake_upload
+
+            summary = uploader.upload_subtitle_files(str(video), "ve", "1")
+
+            self.assertEqual(summary["found"], 2)
+            self.assertEqual(summary["uploaded"], ["A.srt"])
+            self.assertEqual(len(summary["failed"]), 1)
+            self.assertEqual(summary["failed"][0]["name"], "A.ass")
+            self.assertEqual(summary["paths"], [str(base / "A.srt")])
+
+    def test_upload_video_uploads_sibling_subtitles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            video = base / "A.mkv"
+            video.write_bytes(b"x" * 16)
+            (base / "A.chs.srt").write_bytes(b"1\n")
+            uploader = RobustEmosVideoUploader(
+                auth_token="t", base_url="https://emos.best"
+            )
+            uploader.client.get_video_base = MagicMock(return_value={"title": "T"})
+            uploader.client.get_upload_token = MagicMock(
+                return_value={
+                    "file_id": "f1",
+                    "type": "r2",
+                    "data": {"upload_url": "https://r2.example/x"},
+                }
+            )
+            uploader.client.save_video = MagicMock(return_value={"media_id": "m1"})
+            uploader.client.save_subtitle = MagicMock(
+                return_value={"subtitle_id": "s1"}
+            )
+            uploader._upload_google_drive = MagicMock()
+
+            result = uploader.upload_video(str(video), "ve", "1")
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["subtitles"]["found"], 1)
+            self.assertEqual(result["subtitles"]["uploaded"], ["A.chs.srt"])
+            self.assertEqual(result["subtitle_paths"], [str(base / "A.chs.srt")])
+            uploader.client.save_video.assert_called_once()
+            uploader.client.save_subtitle.assert_called_once_with("ve", "1", "f1")
+            self.assertIn("📎 字幕", uploader._tg_result_extra)
+
+    def test_upload_video_can_skip_subtitles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            video = base / "A.mkv"
+            video.write_bytes(b"x" * 16)
+            (base / "A.srt").write_bytes(b"1\n")
+            uploader = RobustEmosVideoUploader(
+                auth_token="t",
+                base_url="https://emos.best",
+                upload_subtitles=False,
+            )
+            uploader.client.get_video_base = MagicMock(return_value={"title": "T"})
+            uploader.client.get_upload_token = MagicMock(
+                return_value={
+                    "file_id": "f1",
+                    "type": "r2",
+                    "data": {"upload_url": "https://r2.example/x"},
+                }
+            )
+            uploader.client.save_video = MagicMock(return_value={"media_id": "m1"})
+            uploader.client.save_subtitle = MagicMock()
+            uploader._upload_google_drive = MagicMock()
+
+            result = uploader.upload_video(str(video), "ve", "1")
+
+            self.assertIsNotNone(result)
+            self.assertNotIn("subtitles", result)
+            uploader.client.save_subtitle.assert_not_called()
+
+    def test_subtitle_summary_text_reports_failures(self):
+        text = RobustEmosVideoUploader._subtitle_summary_text(
+            {
+                "found": 2,
+                "uploaded": ["a.srt"],
+                "failed": [{"name": "b.ass", "error": "HTTP 422"}],
+            }
+        )
+
+        self.assertIn("1/2", text)
+        self.assertIn("b.ass", text)
+        self.assertIn("HTTP 422", text)
+        self.assertEqual(
+            RobustEmosVideoUploader._subtitle_summary_text({"found": 0}), ""
+        )
+
+    def test_completed_telegram_text_includes_subtitles(self):
+        uploader = RobustEmosVideoUploader(
+            auth_token="t", base_url="https://emos.best"
+        )
+        uploader.tg_bot_token = "bot"
+        uploader.tg_chat_id = "1"
+        sent = []
+        uploader._tg_send = lambda text: sent.append(text)
+        uploader._tg_result_extra = "📎 字幕: 1/1 已上传"
+
+        uploader._tg_update("A.mkv", 100, 16, 16, "", "completed")
+
+        self.assertTrue(sent)
+        self.assertIn("📎 字幕: 1/1 已上传", sent[-1])
 
 
 if __name__ == "__main__":

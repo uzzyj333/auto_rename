@@ -31,6 +31,7 @@ from .probe import probe_summary_for_upload, probe_video
 from ..upload.upload_emos import (
     DEFAULT_UPLOAD_CONCURRENCY,
     RobustEmosVideoUploader,
+    find_subtitle_files,
     format_size,
 )
 
@@ -251,6 +252,34 @@ class OnlineUploadService:
             self._downloader_cleanup = cleanup
             return cleanup
         return None
+
+    @staticmethod
+    def _subtitle_stage_note(summary: Optional[Dict[str, Any]]) -> str:
+        """把字幕上传结果整理成任务阶段文案后缀"""
+        if not isinstance(summary, dict):
+            return ""
+        try:
+            found = int(summary.get("found") or 0)
+        except (TypeError, ValueError):
+            return ""
+        if not found:
+            return ""
+        uploaded = len(summary.get("uploaded") or [])
+        if uploaded == found:
+            return f"（含 {found} 个字幕）"
+        return f"（字幕 {uploaded}/{found}）"
+
+    @staticmethod
+    def _delete_uploaded_subtitles(result: Dict[str, Any]) -> None:
+        """视频源文件已删除时，顺带清理已上传成功的外挂字幕"""
+        for raw in result.get("subtitle_paths") or []:
+            try:
+                Path(raw).unlink()
+                logger.info("已删除已上传的字幕: %s", raw)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                logger.warning("删除字幕失败: %s - %s", raw, exc)
 
     def config_snapshot(self) -> Dict[str, Any]:
         """返回前端需要的配置信息（不含 token 明文）"""
@@ -520,6 +549,7 @@ class OnlineUploadService:
             },
             "match": match,
             "candidates": candidates,
+            "subtitles": [item.name for item in find_subtitle_files(path)],
             "error": "；".join(errors),
         }
 
@@ -925,6 +955,7 @@ class OnlineUploadService:
                 upload_concurrency=int(
                     emos.get("upload_concurrency") or DEFAULT_UPLOAD_CONCURRENCY
                 ),
+                upload_subtitles=bool(emos.get("upload_subtitles", True)),
                 telegram_config=self._config.get("telegram") or {},
                 progress_callback=on_progress,
             )
@@ -950,10 +981,13 @@ class OnlineUploadService:
             elif result:
                 # 上传成功后按配置处理原文件（手动选片 / 自动上传 / Telegram 修正三条链路一致）
                 deleted, delete_note = self._delete_source_if_configured(snapshot["file_path"])
+                if deleted:
+                    self._delete_uploaded_subtitles(result)
+                subtitle_note = self._subtitle_stage_note(result.get("subtitles"))
                 self._update_task(
                     task_id,
                     status="completed",
-                    stage="已完成" + delete_note,
+                    stage="已完成" + subtitle_note + delete_note,
                     progress=100.0,
                     uploaded_bytes=snapshot["file_size"],
                     total_bytes=snapshot["file_size"],

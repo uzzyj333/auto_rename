@@ -599,6 +599,7 @@ const FIELD_LABELS = {
         auth_token: 'Emos 认证令牌', base_url: 'Emos 服务地址',
         file_storage: '默认存储类型', file_storages: '可选存储类型',
         chunk_size_mb: '分片大小（MB）', upload_concurrency: '分片并发上传数',
+        upload_subtitles: '上传视频时顺带上传外挂字幕',
         timeout: '请求超时（秒）',
     },
     online_upload: {
@@ -2220,6 +2221,7 @@ function buildRecognizedItem(data) {
         metadata: data.metadata || {},
         match: data.match || null,
         candidates: data.candidates || [],
+        subtitles: data.subtitles || [],
         options: options,
         target: target,
         storage: '',
@@ -2258,6 +2260,7 @@ function renderOnlineRecognize() {
                     '<div style="font-size:12px;color:var(--text-muted);margin-top:4px">识别: ' +
                         escapeOnline(meta.title || '-') + ' · TMDB: ' + escapeOnline(meta.tmdb_id || '-') +
                         ' · 类型: ' + escapeOnline(meta.media_type || '-') + escapeOnline(seasonText) + '</div>' +
+                    ((item.subtitles && item.subtitles.length) ? '<div style="font-size:12px;color:var(--text-muted);margin-top:4px">📎 将同时上传字幕: ' + escapeOnline(item.subtitles.join('、')) + '</div>' : '') +
                     (item.error ? '<div style="font-size:12px;color:#e5534b;margin-top:4px">' + escapeOnline(item.error) + '</div>' : '') +
                 '</div>' +
                 '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +

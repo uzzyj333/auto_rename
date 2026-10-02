@@ -492,6 +492,29 @@ class EmosClient:
         )
         return data if isinstance(data, dict) else {}
 
+    def save_subtitle(
+        self,
+        item_type: str,
+        item_id: Any,
+        file_id: str,
+    ) -> Dict[str, Any]:
+        """保存字幕上传结果（将字幕绑定到指定视频/剧集）
+
+        官方接口与视频不同：字幕不需要先取 base 信息，上传完直接 save 即可。
+        """
+        body: Dict[str, Any] = {
+            "item_type": item_type,
+            "item_id": self._as_id(item_id),
+            "file_id": file_id,
+        }
+        data = self._json(
+            "POST",
+            "/api/upload/subtitle/save",
+            json_body=body,
+            expected=[200, 201, 204],
+        )
+        return data if isinstance(data, dict) else {}
+
     def save_internal(
         self,
         item_type: str,

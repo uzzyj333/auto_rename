@@ -203,6 +203,8 @@ class VideoFileHandler:
             )
         except (TypeError, ValueError):
             self.emos_upload_concurrency = DEFAULT_UPLOAD_CONCURRENCY
+        # 视频上传成功后是否顺带上传同目录同名的外挂字幕
+        self.emos_upload_subtitles = bool(emos.get("upload_subtitles", True))
 
     def _build_emos_client(self) -> None:
         """构建 Emos 官方 API 客户端（用于在线识别）"""
@@ -1034,6 +1036,7 @@ class VideoFileHandler:
                 base_url=self.emos_base_url,
                 chunk_size_mb=int(self.emos_chunk_size_mb),
                 upload_concurrency=int(self.emos_upload_concurrency),
+                upload_subtitles=bool(self.emos_upload_subtitles),
                 telegram_config=self.telegram_config,
             )
             try:
@@ -1091,6 +1094,14 @@ class VideoFileHandler:
             record_task(file_path, "completed", end_time=datetime.now())
             self._uploading_files.discard(file_path)
 
+            subtitle_summary = upload_result.get("subtitles") or {}
+            if subtitle_summary.get("found"):
+                console_log(
+                    f"📎 [线程#{worker_id}] 字幕: "
+                    f"{len(subtitle_summary.get('uploaded') or [])}/"
+                    f"{subtitle_summary.get('found')} 已上传"
+                )
+
             # 如果配置了上传后删除文件，执行删除操作
             #   - 文件来自下载器：先删下载任务，任务删掉后文件仍在（如 aria2）再兜底删除
             #   - 下载器里还有未完成任务：暂不删除，避免破坏正在做种的种子
@@ -1110,6 +1121,10 @@ class VideoFileHandler:
                 except Exception as e:
                     console_log(f"❌ [线程#{worker_id}] 删除原文件失败: {e}")
                     self.logger.error(f"删除原文件失败: {file_path}, 错误: {e}")
+
+            # 视频源文件已删除时，顺带清理已上传成功的外挂字幕
+            if deleted:
+                self._delete_uploaded_subtitles(upload_result, worker_id)
 
             # 更新日志
             log_success(
@@ -1463,6 +1478,19 @@ class VideoFileHandler:
 
         self.logger.debug(f"未能从下载器强制删除任务: {file_path}")
         return False
+
+    def _delete_uploaded_subtitles(self, upload_result, worker_id: int = 0) -> None:
+        """删除已上传成功的外挂字幕（仅在视频源文件已删除时调用）"""
+        for raw in (upload_result or {}).get("subtitle_paths") or []:
+            try:
+                Path(raw).unlink()
+                console_log(f"🗑️ [线程#{worker_id}] 已删除已上传的字幕: {raw}")
+                self.logger.info(f"已删除已上传的字幕: {raw}")
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                console_log(f"❌ [线程#{worker_id}] 删除字幕失败: {e}")
+                self.logger.error(f"删除字幕失败: {raw}, 错误: {e}")
 
     def _process_subtitle_file(self, subtitle_path: str) -> bool:
         """

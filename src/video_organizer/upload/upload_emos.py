@@ -8,15 +8,18 @@
     PUT  <presigned-url>                        # google_drive 直传 / multipart 分片
     POST /api/upload/multipart/{file_id}/complete
     POST /api/upload/video/save                 # 绑定到 item_type / item_id
+    POST /api/upload/subtitle/save              # 外挂字幕绑定（同目录同名 .srt/.ass 等）
 
 同时支持：
 
 * 分片上传（R2 等对象存储）与 Google Drive 断点续传直传
+* 视频上传成功后顺带上传同目录同名的外挂字幕（可在配置里关闭）
 * 上传进度回调（Web 仪表盘 + Telegram 通知）
 """
 
 from __future__ import annotations
 
+import base64
 import logging
 import math
 import os
@@ -24,8 +27,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import urlsplit
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -65,6 +68,55 @@ MAX_PARTS = 1000
 DEFAULT_UPLOAD_CONCURRENCY = 10
 MIN_UPLOAD_CONCURRENCY = 1
 MAX_UPLOAD_CONCURRENCY = 32
+
+# tus 单次 PATCH 上限（官方建议不要超过 100MB）
+TUS_MAX_CHUNK_SIZE = 100 * 1024 * 1024
+
+# 外挂字幕扩展名（与 Emos 字幕资源类型对应）
+SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt", ".sub"}
+
+
+def find_subtitle_files(video_path: Any) -> List[Path]:
+    """找出与视频同目录同名的外挂字幕
+
+    同时兼容两种常见写法：
+
+    * ``A.mkv`` -> ``A.srt`` / ``A.chs.srt`` / ``A.zh-Hans.ass``
+    * ``A.mkv`` -> ``A.mkv.srt``（字幕名直接跟着视频全名）
+
+    会排除属于同目录其它视频的字幕，例如 ``A.ts.ass`` 不会被当成 ``A.m2ts`` 的字幕。
+    """
+    path = Path(video_path)
+    directory = path.parent
+    if not directory.is_dir():
+        return []
+    stem = path.stem
+    if not stem:
+        return []
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError:
+        return []
+    matches: List[Path] = []
+    for item in entries:
+        try:
+            if not item.is_file() or item.suffix.lower() not in SUBTITLE_EXTENSIONS:
+                continue
+        except OSError:
+            continue
+        sub_stem = item.stem
+        if sub_stem == stem:
+            matches.append(item)
+            continue
+        if not sub_stem.startswith(stem + "."):
+            continue
+        # 去掉字幕扩展名后正好是同目录另一个文件的名字时，这份字幕属于那个文件：
+        # 例如 A.ts.ass 属于 A.ts，不应该挂到同目录的 A.m2ts 上。
+        # 而 A.mkv.srt 的 stem 正好是本视频的文件名，属于正常写法，要保留。
+        if sub_stem != path.name and (directory / sub_stem).is_file():
+            continue
+        matches.append(item)
+    return matches
 
 
 def _report_upload_progress(
@@ -155,6 +207,7 @@ class RobustEmosVideoUploader:
         base_url: str = "https://emos.best",
         chunk_size_mb: int = DEFAULT_CHUNK_MB,
         upload_concurrency: int = DEFAULT_UPLOAD_CONCURRENCY,
+        upload_subtitles: bool = True,
         telegram_config: Optional[Dict[str, Any]] = None,
         timeout: int = 60,
         max_retries: int = 3,
@@ -197,6 +250,8 @@ class RobustEmosVideoUploader:
         self.timeout = int(timeout or 60)
         self.max_retries = max(1, int(max_retries or 1))
         self.progress_callback = progress_callback
+        # 视频上传成功后是否顺带上传同目录同名的外挂字幕
+        self.upload_subtitles = bool(upload_subtitles)
 
         telegram_config = telegram_config or {}
         self.tg_bot_token = str(telegram_config.get("bot_token", "") or "").strip()
@@ -212,6 +267,7 @@ class RobustEmosVideoUploader:
         self._tg_worker: Optional[threading.Thread] = None
         self._tg_finalized = False
         self._tg_base_text: Optional[str] = None  # 最近一条进度文本（结果追加在它后面）
+        self._tg_result_extra: str = ""  # 终态消息里额外追加的内容（如字幕上传结果）
         self._tg_message_key = ""  # 同文件复用同一条 Telegram 消息
         # 进度上下文（用于 Telegram 进度消息中的分片 / 速度 / 剩余时间）
         self._progress_started_at = 0.0
@@ -240,6 +296,7 @@ class RobustEmosVideoUploader:
         file_storage: str = "internal",
         enable_resume: bool = True,
         metadata: Optional[Dict[str, Any]] = None,
+        upload_subtitles: Optional[bool] = None,
     ) -> Optional[Dict[str, Any]]:
         """上传视频并绑定到指定的 Emos 条目
 
@@ -250,6 +307,8 @@ class RobustEmosVideoUploader:
             file_storage: 存储位置（internal / global / google_drive ...）
             enable_resume: 兼容旧参数，分片上传本身支持失败重试
             metadata: 额外写入的 file_metadata
+            upload_subtitles: 是否顺带上传同目录同名的外挂字幕；
+                留空则使用实例配置（默认上传）
 
         Returns:
             成功返回结果字典，失败返回 None
@@ -268,6 +327,7 @@ class RobustEmosVideoUploader:
         self._skip_reason = ""
         self._tg_finalized = False
         self._tg_base_text = None
+        self._tg_result_extra = ""
         self._tg_message_key = f"{self.tg_chat_id}:{file_name}"
         self._tg_message_id = _recall_tg_message(self._tg_message_key)
         self._report(str(path), file_name, 0, 0, file_size, "", "uploading")
@@ -341,16 +401,42 @@ class RobustEmosVideoUploader:
                     token.get("message") or token.get("msg") or "该资源此前已上传过"
                 )
                 logger.info("该资源此前已上传过，跳过文件传输直接入库: %s", file_name)
-            elif token_type == "multipart" or (not token_data.get("upload_url") and token_data.get("multipart_size")):
+            elif token_type == "tusd":
+                # tusd 必须走 tus 协议（POST 创建 + PATCH 上传），直传 PUT 会被拒绝
+                self._upload_tus(path, token, file_size)
+            elif token_type == "multipart" or (
+                not token_data.get("upload_url") and token_data.get("multipart_size")
+            ):
                 self._upload_multipart(path, token, file_size)
             elif token_data.get("upload_url"):
-                # 官方 API 里 internal / global / google_drive 等存储都会返回 upload_url
+                # 官方 API 里 internal / global / google_drive / r2 等存储都会返回 upload_url
                 self._upload_google_drive(path, token, file_size)
             else:
                 raise EmosApiError(f"不支持的上传方式: {token_type or '未知'}")
 
             self._report(str(path), file_name, 97, file_size, file_size, "", "uploading")
             save_result = self.client.save_video(item_type, item_id, file_id, metadata)
+
+            result: Dict[str, Any] = dict(save_result or {})
+            result.setdefault("file_id", file_id)
+            result["title"] = title
+
+            # 视频入库成功后顺带上传同目录同名的外挂字幕：
+            # 字幕很小（单请求直传即可），失败只记录、不影响视频上传结果
+            if self._should_upload_subtitles(upload_subtitles):
+                try:
+                    subtitle_summary = self.upload_subtitle_files(
+                        str(path), item_type, item_id, file_storage
+                    )
+                except Exception as exc:
+                    # 字幕问题绝不能影响已经成功的视频上传
+                    logger.warning("字幕上传异常（忽略）: %s", exc)
+                else:
+                    result["subtitles"] = subtitle_summary
+                    result["subtitle_paths"] = subtitle_summary.pop("paths", [])
+                    self._tg_result_extra = self._subtitle_summary_text(
+                        subtitle_summary
+                    )
 
             elapsed = max(time.time() - started_at, 0.001)
             self._report(
@@ -364,9 +450,6 @@ class RobustEmosVideoUploader:
             )
             self._tg_finish(file_name, title)
 
-            result: Dict[str, Any] = dict(save_result or {})
-            result.setdefault("file_id", file_id)
-            result["title"] = title
             logger.info("上传完成: %s -> %s", file_name, result.get("media_id"))
             return result
 
@@ -407,6 +490,116 @@ class RobustEmosVideoUploader:
         return False
 
     # ------------------------------------------------------------------
+    # 字幕上传
+    # ------------------------------------------------------------------
+
+    def _should_upload_subtitles(self, override: Optional[bool] = None) -> bool:
+        if override is not None:
+            return bool(override)
+        return bool(self.upload_subtitles)
+
+    def upload_subtitle_files(
+        self,
+        video_path: Any,
+        item_type: str,
+        item_id: Any,
+        file_storage: str = "internal",
+    ) -> Dict[str, Any]:
+        """上传视频的外挂字幕（同目录同名的 .srt/.ass/.ssa/.vtt/.sub）
+
+        官方接口与视频不同：字幕不需要先取 base 信息，上传完直接
+        ``POST /api/upload/subtitle/save`` 即可。单个字幕上传失败不影响其它字幕，
+        也不影响视频本身的上传结果。
+
+        Returns:
+            {"found": n, "uploaded": [文件名], "failed": [{"name","error"}],
+             "paths": [已上传字幕的本地路径]}
+        """
+        summary: Dict[str, Any] = {
+            "found": 0,
+            "uploaded": [],
+            "failed": [],
+            "paths": [],
+        }
+        subtitles = find_subtitle_files(video_path)
+        summary["found"] = len(subtitles)
+        for subtitle in subtitles:
+            try:
+                subtitle_id = self._upload_subtitle_file(
+                    subtitle, item_type, item_id, file_storage
+                )
+            except Exception as exc:
+                logger.warning("字幕上传失败: %s - %s", subtitle.name, exc)
+                summary["failed"].append({"name": subtitle.name, "error": str(exc)})
+                continue
+            summary["uploaded"].append(subtitle.name)
+            summary["paths"].append(str(subtitle))
+            logger.info("字幕上传完成: %s -> %s", subtitle.name, subtitle_id)
+        if summary["found"]:
+            logger.info(
+                "字幕处理完成: %d/%d 成功",
+                len(summary["uploaded"]),
+                summary["found"],
+            )
+        return summary
+
+    def _upload_subtitle_file(
+        self,
+        path: Path,
+        item_type: str,
+        item_id: Any,
+        file_storage: str,
+    ) -> str:
+        """上传单个字幕文件并绑定到目标条目，返回 subtitle_id"""
+        file_size = path.stat().st_size
+        token = self.client.get_upload_token(
+            file_name=path.name,
+            file_size=file_size,
+            file_storage=file_storage,
+            resource_type="subtitle",
+        )
+        file_id = str(token.get("file_id") or "")
+        token_data = token.get("data") if isinstance(token.get("data"), dict) else {}
+        token_type = str(token.get("type") or "").lower()
+        if not file_id:
+            if EmosClient.is_already_uploaded(token):
+                raise EmosApiError(
+                    str(token.get("message") or token.get("msg") or "该字幕此前已上传过")
+                )
+            raise EmosApiError("获取字幕上传凭证失败: 响应缺少 file_id")
+
+        if token_type == "tusd":
+            self._upload_tus(path, token, file_size, report=False)
+        elif token_type == "multipart" or (
+            not token_data.get("upload_url") and token_data.get("multipart_size")
+        ):
+            self._upload_multipart(
+                path, token, file_size, resource_type="subtitle", report=False
+            )
+        elif token_data.get("upload_url"):
+            # internal / r2 / local / google_drive 等都会返回 upload_url
+            self._upload_google_drive(path, token, file_size, report=False)
+        else:
+            raise EmosApiError(f"不支持的字幕上传方式: {token_type or '未知'}")
+
+        saved = self.client.save_subtitle(item_type, item_id, file_id)
+        return str(saved.get("subtitle_id") or "")
+
+    @staticmethod
+    def _subtitle_summary_text(summary: Dict[str, Any]) -> str:
+        """把字幕上传结果整理成 Telegram 终态消息里的附加行"""
+        found = int(summary.get("found") or 0)
+        if not found:
+            return ""
+        uploaded = len(summary.get("uploaded") or [])
+        lines = [f"📎 字幕: {uploaded}/{found} 已上传"]
+        for item in summary.get("failed") or []:
+            # 文件名放进 code span：下划线 / 星号会破坏 Telegram Markdown 解析
+            name = str(item.get("name") or "").replace("`", "'")
+            lines.append(f"　❌ `{name}`: {item.get('error')}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # 分片上传
     # ------------------------------------------------------------------
 
@@ -425,7 +618,14 @@ class RobustEmosVideoUploader:
             part_size = min(part_size, max_size)
         return max(part_size, 1024 * 1024)
 
-    def _upload_multipart(self, path: Path, token: Dict[str, Any], file_size: int) -> None:
+    def _upload_multipart(
+        self,
+        path: Path,
+        token: Dict[str, Any],
+        file_size: int,
+        resource_type: str = "video",
+        report: bool = True,
+    ) -> None:
         file_id = str(token.get("file_id"))
         part_size = self._multipart_part_size(token)
         number = max(1, math.ceil(file_size / part_size))
@@ -434,7 +634,7 @@ class RobustEmosVideoUploader:
             number = max(1, math.ceil(file_size / part_size))
 
         presigns = self.client.multipart_presign(file_id, number)
-        file_type = detect_video_mime(path.name, "video")
+        file_type = detect_video_mime(path.name, resource_type)
         if presigns and isinstance(presigns[0], dict):
             first = presigns[0]
             host = urlsplit(
@@ -498,6 +698,8 @@ class RobustEmosVideoUploader:
                 done = uploaded_bytes
             # 进度上报（含 Telegram / Web 推送）放在锁外，
             # 避免网络请求占着锁把其它分片线程一起堵住
+            if not report:
+                return {"number": part_number, "etag": etag}
             progress = 10 + 85 * (done / file_size) if file_size else 95
             elapsed = max(time.time() - started_at, 0.001)
             self._report(
@@ -619,7 +821,13 @@ class RobustEmosVideoUploader:
     # Google Drive 直传（支持断点续传）
     # ------------------------------------------------------------------
 
-    def _upload_google_drive(self, path: Path, token: Dict[str, Any], file_size: int) -> None:
+    def _upload_google_drive(
+        self,
+        path: Path,
+        token: Dict[str, Any],
+        file_size: int,
+        report: bool = True,
+    ) -> None:
         upload_url = str((token.get("data") or {}).get("upload_url") or "")
         if not upload_url:
             raise EmosApiError("Google Drive 上传地址缺失")
@@ -630,7 +838,9 @@ class RobustEmosVideoUploader:
         self._progress_total_parts = 0
         self._progress_parts_done = 0
         for _ in range(5):
-            status, headers = self._put_google_range(upload_url, path, offset, file_size, started_at)
+            status, headers = self._put_google_range(
+                upload_url, path, offset, file_size, started_at, report=report
+            )
             if 200 <= status < 300:
                 return
             if status == 308:
@@ -652,6 +862,7 @@ class RobustEmosVideoUploader:
         offset: int,
         file_size: int,
         started_at: float,
+        report: bool = True,
     ):
         """上传 [offset, file_size) 区间的数据，返回 (status, headers)"""
         headers = {
@@ -661,22 +872,22 @@ class RobustEmosVideoUploader:
         if offset:
             headers["Content-Range"] = f"bytes {offset}-{file_size - 1}/{file_size}"
 
+        def on_progress(uploaded: int) -> None:
+            if not report:
+                return
+            self._report(
+                str(path),
+                path.name,
+                10 + 85 * (uploaded / file_size) if file_size else 95,
+                uploaded,
+                file_size,
+                format_speed(uploaded / max(time.time() - started_at, 0.001)),
+                "uploading",
+            )
+
         with open(path, "rb") as handle:
             handle.seek(offset)
-            reader = _ProgressReader(
-                handle,
-                offset,
-                file_size,
-                lambda uploaded: self._report(
-                    str(path),
-                    path.name,
-                    10 + 85 * (uploaded / file_size) if file_size else 95,
-                    uploaded,
-                    file_size,
-                    format_speed(uploaded / max(time.time() - started_at, 0.001)),
-                    "uploading",
-                ),
-            )
+            reader = _ProgressReader(handle, offset, file_size, on_progress)
             try:
                 response = self.storage_session.put(
                     upload_url,
@@ -718,6 +929,152 @@ class RobustEmosVideoUploader:
             return int(end) + 1
         except ValueError:
             return None
+
+    # ------------------------------------------------------------------
+    # tusd 上传（tus 1.0.0）
+    # ------------------------------------------------------------------
+
+    def _tus_chunk_size(self, file_size: int) -> int:
+        """tus 分片大小（官方建议单次不要超过 100MB）"""
+        chunk = max(int(self.chunk_size_mb), 1) * 1024 * 1024
+        chunk = max(8 * 1024 * 1024, min(chunk, TUS_MAX_CHUNK_SIZE))
+        return max(min(chunk, file_size), 1)
+
+    @staticmethod
+    def _tus_metadata(token: Dict[str, Any]) -> str:
+        """构造 ``Upload-Metadata``（值必须是 base64）"""
+        file_id = str(token.get("file_id") or "").strip()
+        if not file_id:
+            return ""
+        encoded = base64.b64encode(file_id.encode("utf-8")).decode("ascii")
+        return f"file_id {encoded}"
+
+    @staticmethod
+    def _parse_tus_offset(value: Optional[str]) -> Optional[int]:
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
+    def _upload_tus(
+        self,
+        path: Path,
+        token: Dict[str, Any],
+        file_size: int,
+        report: bool = True,
+    ) -> None:
+        """tusd 上传（tus 1.0.0：POST 创建 + PATCH 上传）
+
+        Emos 对字幕 / 图片暂停了 r2 并改用 tusd，这类文件不能再直传 PUT，
+        必须按 tus 协议先 POST 创建上传、再 PATCH 写入数据。
+        参考：https://tus.github.io/tusd/getting-started/usage/
+        """
+        endpoint = str((token.get("data") or {}).get("upload_url") or "")
+        if not endpoint:
+            raise EmosApiError("tusd 上传地址缺失")
+
+        create_headers = {
+            "Tus-Resumable": "1.0.0",
+            "Upload-Length": str(file_size),
+        }
+        metadata = self._tus_metadata(token)
+        if metadata:
+            create_headers["Upload-Metadata"] = metadata
+        try:
+            response = self.storage_session.post(
+                endpoint, headers=create_headers, timeout=self.timeout
+            )
+        except requests.exceptions.RequestException as exc:
+            raise EmosApiError(f"tusd 创建上传失败: {exc}") from exc
+        try:
+            status = response.status_code
+            location = str(response.headers.get("Location") or "").strip()
+            body = "" if 200 <= status < 300 else self._response_snippet(response)
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
+        if not (200 <= status < 300):
+            detail = f" - {body}" if body else ""
+            raise EmosApiError(f"tusd 创建上传失败: HTTP {status}{detail}")
+        if not location:
+            raise EmosApiError("tusd 创建上传失败: 响应缺少 Location")
+        upload_url = urljoin(endpoint, location)
+
+        chunk_size = self._tus_chunk_size(file_size)
+        started_at = time.time()
+        self._progress_started_at = started_at
+        self._progress_total_parts = 0
+        self._progress_parts_done = 0
+
+        offset = 0
+        while offset < file_size:
+            length = min(chunk_size, file_size - offset)
+            with open(path, "rb") as handle:
+                handle.seek(offset)
+                payload = handle.read(length)
+            headers = {
+                "Tus-Resumable": "1.0.0",
+                "Upload-Offset": str(offset),
+                "Content-Type": "application/offset+octet-stream",
+                "Content-Length": str(len(payload)),
+            }
+            status, next_offset, body = self._patch_tus(upload_url, payload, headers)
+            if not (200 <= status < 300):
+                detail = f" - {body}" if body else ""
+                raise EmosApiError(f"tusd 上传失败: HTTP {status}{detail}")
+            if next_offset is None or next_offset <= offset:
+                raise EmosApiError("tusd 上传失败: 未返回有效的 Upload-Offset")
+            offset = min(next_offset, file_size)
+            if report and file_size:
+                self._report(
+                    str(path),
+                    path.name,
+                    10 + 85 * (offset / file_size),
+                    offset,
+                    file_size,
+                    format_speed(offset / max(time.time() - started_at, 0.001)),
+                    "uploading",
+                )
+
+    def _patch_tus(
+        self, upload_url: str, payload: bytes, headers: Dict[str, str]
+    ) -> Tuple[int, Optional[int], str]:
+        """发送一个 tus PATCH（带重试），返回 (status, 新 offset, 响应体片段)"""
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = self.storage_session.patch(
+                    upload_url,
+                    data=payload,
+                    headers=headers,
+                    timeout=max(self.timeout, 600),
+                )
+            except requests.exceptions.RequestException as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    time.sleep(min(attempt, 5))
+                    continue
+                raise EmosApiError(f"tusd 上传失败: {exc}") from exc
+            try:
+                status = response.status_code
+                body = "" if 200 <= status < 300 else self._response_snippet(response)
+                next_offset = self._parse_tus_offset(
+                    response.headers.get("Upload-Offset")
+                )
+            finally:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+            if 200 <= status < 300:
+                return status, next_offset, ""
+            if status in {408, 425, 429, 500, 502, 503, 504} and attempt < self.max_retries:
+                time.sleep(min(attempt, 5))
+                continue
+            return status, next_offset, body
+        raise EmosApiError(f"tusd 上传失败: {last_error}")
 
     # ------------------------------------------------------------------
     # 进度上报
@@ -783,6 +1140,8 @@ class RobustEmosVideoUploader:
                 )
             else:
                 text = f"✅ 上传完成\n文件: `{file_name}`\n大小: {format_size(total)}"
+                if self._tg_result_extra:
+                    text = f"{text}\n{self._tg_result_extra}"
         else:
             text = f"❌ Emos 上传失败\n文件: `{file_name}`\n原因: {error or '未知错误'}"
         self._tg_finish(None, None, text=text)
@@ -858,6 +1217,8 @@ class RobustEmosVideoUploader:
                 block = f"✅ 上传完成\n文件: `{file_name}`" + (
                     f"\n标题: {title}" if title else ""
                 )
+                if self._tg_result_extra:
+                    block = f"{block}\n{self._tg_result_extra}"
         else:
             block = text
         # 上传过程中不覆盖进度消息，只在最后追加结果（进度条 / 速度信息保留下来）

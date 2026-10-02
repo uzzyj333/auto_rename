@@ -74,7 +74,7 @@ tests/
 - `[llm_fallback]` — LLM fallback enabled/max_concurrent
 - `[llm_provider_1/2/3]` — Multiple providers (GLM, DeepSeek, OpenAI) with weighted round-robin
 - `[guessit]` — enabled, prefer_guessit
-- `[emos]` — auth_token, base_url (default https://emos.best), file_storage, file_storages, chunk_size_mb, timeout
+- `[emos]` — auth_token, base_url (default https://emos.best), file_storage, file_storages, chunk_size_mb, upload_concurrency, upload_subtitles (上传视频时顺带上传同目录同名的外挂字幕), timeout
 - `[online_upload]` — video_root, probe_enabled, ffprobe_path, path_type (在线识别上传)
 - `[processing]` — upload_targets (fixed to emos), delete_after_upload, max_upload_workers
 - `[telegram]` — Bot notifications: bot_token, chat_id, channel_chat_id
