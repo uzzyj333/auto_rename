@@ -119,6 +119,14 @@ def create_app(
     
     # 认证中间件（对 API 请求进行登录检查）
     app.middleware("http")(auth_middleware)
+
+    # 首页与静态资源不做强缓存：升级容器后浏览器会立即拿到新前端，避免看到旧界面
+    @app.middleware("http")
+    async def no_cache_static(request, call_next):
+        response = await call_next(request)
+        if not request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
     
     # 静态文件目录（兼容 PyInstaller）
     if getattr(sys, 'frozen', False):
