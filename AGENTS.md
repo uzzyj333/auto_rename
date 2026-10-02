@@ -34,6 +34,8 @@
 - **数据库** (`database/`): SQLAlchemy，用于任务/配置持久化（默认 SQLite）
 - **配置文件:** `config.ini`（实际）、`config_template.ini`（模板），首次运行自动生成
   - 下载器配置节 `downloader.<标识>` 支持同类型多实例：`downloader.aria2`、`downloader.aria2_2` 等，用 `type` 字段指定真实类型（aria2 / qbittorrent）
+  - 下载器可在「下载器管理」或「配置管理 → 下载器配置」里在线增删改，保存后立即生效（无需重启容器）
+  - `[logging]` 只有 `log_level` 需要在界面配置：日志文件固定写入统一日志目录 `video-organizer.log`（控制台 + 文件始终开启），「日志查看」页面只需选等级并自动展示最新日志
 - **打包:** `build.sh` — PyInstaller 构建，spec 内嵌生成
 - **部署文档:** `DEPLOY.md` — 从创建目录到 `docker compose up -d --build` 的精简部署步骤（compose 文件即仓库根目录 `docker-compose.yml`）
 
