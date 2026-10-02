@@ -374,6 +374,32 @@ class VideoFileHandler:
 
     def _notify_match_error(self, file_path, title, media_type, season, episode, reason):
         """识别不到 Emos 上传目标时推送 Telegram 报错，便于用户回复修正"""
+        self._notify_upload_error(
+            file_path,
+            reason,
+            title=title,
+            media_type=media_type,
+            season=season,
+            episode=episode,
+            header="未找到 Emos 上传目标",
+        )
+
+    def _notify_upload_error(
+        self,
+        file_path,
+        reason,
+        title="",
+        media_type="",
+        season=None,
+        episode=None,
+        item_type="",
+        item_id="",
+        header="上传失败",
+    ):
+        """上传阶段出错（含被 Emos 拒绝重复上传）时推送 Telegram 报错
+
+        同一文件的同类报错 5 分钟内只推一次，用户可回复该消息修正目标后重传。
+        """
         try:
             from .telegram_bot import TelegramBotService
 
@@ -385,13 +411,16 @@ class VideoFileHandler:
                     "media_type": media_type,
                     "season_number": season,
                     "episode_number": episode,
+                    "item_type": item_type,
+                    "item_id": item_id,
                     "storage": getattr(self, "emos_file_storage", None),
                 },
                 reason,
-                header="未找到 Emos 上传目标",
+                header=header,
             )
         except Exception as exc:
             self.logger.debug("推送 Telegram 报错信息失败: %s", exc)
+
 
     def add_downloader(self, downloader):
         """
@@ -1056,6 +1085,17 @@ class VideoFileHandler:
                 # 因此只记录一次失败、保留本地文件、不加入重试队列
                 reason = str(upload_result.get("reason") or "Emos 暂不允许上传该资源")
                 console_log(f"\n⏸️ [线程#{worker_id}] {reason}")
+                self._notify_upload_error(
+                    file_path,
+                    reason,
+                    title=title,
+                    media_type=media_type,
+                    season=(metadata or {}).get("season"),
+                    episode=(metadata or {}).get("episode"),
+                    item_type=matched_item_type,
+                    item_id=matched_item_id,
+                    header="上传被 Emos 拒绝",
+                )
                 self._uploading_files.discard(file_path)
                 self._failed_files[file_path] = reason
                 record_task(
@@ -1069,6 +1109,17 @@ class VideoFileHandler:
             if not upload_result:
                 reason = "Emos 上传失败"
                 console_log(f"\n❌ [线程#{worker_id}] {reason}!")
+                self._notify_upload_error(
+                    file_path,
+                    reason,
+                    title=title,
+                    media_type=media_type,
+                    season=(metadata or {}).get("season"),
+                    episode=(metadata or {}).get("episode"),
+                    item_type=matched_item_type,
+                    item_id=matched_item_id,
+                    header="上传失败",
+                )
                 self._uploading_files.discard(file_path)
                 self._failed_files[file_path] = reason
                 record_task(file_path, "failed", error_message=reason, end_time=datetime.now())
@@ -1149,6 +1200,17 @@ class VideoFileHandler:
             self._cleanup_old_records()
         except Exception as e:
             console_log(f"\n❌ [线程#{worker_id}] 视频上传错误: {e}")
+            self._notify_upload_error(
+                file_path,
+                f"上传异常: {e}",
+                title=title,
+                media_type=media_type,
+                season=(metadata or {}).get("season"),
+                episode=(metadata or {}).get("episode"),
+                item_type=matched_item_type,
+                item_id=matched_item_id,
+                header="上传异常",
+            )
             self._uploading_files.discard(file_path)
             # 记录失败原因，以便 Web UI 显示和重试
             self._failed_files[file_path] = f"上传异常: {str(e)}"
