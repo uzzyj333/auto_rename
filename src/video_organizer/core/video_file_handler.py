@@ -386,7 +386,9 @@ class VideoFileHandler:
             }
         return None
 
-    def _notify_match_error(self, file_path, title, media_type, season, episode, reason):
+    def _notify_match_error(
+        self, file_path, title, media_type, season, episode, reason, header="未找到 Emos 上传目标"
+    ):
         """识别不到 Emos 上传目标时推送 Telegram 报错，便于用户回复修正"""
         self._notify_upload_error(
             file_path,
@@ -395,7 +397,7 @@ class VideoFileHandler:
             media_type=media_type,
             season=season,
             episode=episode,
-            header="未找到 Emos 上传目标",
+            header=header,
         )
 
     def _notify_upload_error(
@@ -819,12 +821,30 @@ class VideoFileHandler:
                     record_task(file_path, "failed", error_message=reason, end_time=datetime.now())
                     if self._parent_monitor:
                         self._parent_monitor._retry_files.add(file_path)
+                    self._notify_match_error(
+                        file_path,
+                        metadata.get("show_name") or metadata.get("title") or "",
+                        metadata.get("media_type") or "",
+                        metadata.get("season"),
+                        metadata.get("episode"),
+                        reason,
+                        header="TMDB 请求失败",
+                    )
                 else:
                     console_log(f"⚠️  建议：请手动处理该文件或确认文件名是否正确")
                     console_log(f"⚠️  文件将跳过上传，等待手动处理\n")
                     # 记录失败原因，但不标记为已上传（以便后续可以重试）
                     self._failed_files[file_path] = "未找到 TMDB 匹配结果"
                     record_task(file_path, "failed", error_message="未找到 TMDB 匹配结果", end_time=datetime.now())
+                    self._notify_match_error(
+                        file_path,
+                        metadata.get("show_name") or metadata.get("title") or "",
+                        metadata.get("media_type") or "",
+                        metadata.get("season"),
+                        metadata.get("episode"),
+                        "未找到 TMDB 匹配结果，无法确定剧名/电影名，请在 Telegram 回复本条报错修正目标",
+                        header="未识别到条目",
+                    )
                 self._uploading_files.discard(file_path)
                 return False
             media_type = metadata.get(
@@ -1166,6 +1186,9 @@ class VideoFileHandler:
                     f"{len(subtitle_summary.get('uploaded') or [])}/"
                     f"{subtitle_summary.get('found')} 已上传"
                 )
+                # 记录已随视频上传的字幕，避免之后又被当成「单独补传」重复上传
+                for raw in upload_result.get("subtitle_paths") or []:
+                    self._uploaded_files.add(str(raw))
 
             # 如果配置了上传后删除文件，执行删除操作
             #   - 文件来自下载器：先删下载任务，任务删掉后文件仍在（如 aria2）再兜底删除
@@ -1272,6 +1295,8 @@ class VideoFileHandler:
         if self._is_subtitle_file(file_path):
             self.logger.info(f"强制处理: 识别为字幕文件，按字幕逻辑处理: {file_path}")
             console_log(f"\n📄 字幕文件，按字幕逻辑处理: {os.path.basename(file_path)}")
+            # 强制处理允许重传：先清掉「已上传」记录，否则会被当成重复上传跳过
+            self._uploaded_files.discard(file_path)
             return self._process_subtitle_file(file_path)
 
         # 即使文件已上传，强制模式可能希望重试，所以我们尝试从已上传集合中移除它
@@ -1608,21 +1633,46 @@ class VideoFileHandler:
             print(f"   类型: {subtitle_type}")
 
             # 查找匹配的视频文件（跟随监控配置的扩展名，含 .ts / .m2ts 等）
-            video_extensions = tuple(self.supported_extensions) or (
+            # 注意：supported_extensions 里也含 .srt/.ass 等字幕扩展名，必须排除，
+            # 否则字幕会和自己「完全匹配」，永远挂不到视频上。
+            subtitle_extensions = {'.srt', '.ass', '.ssa', '.sub', '.vtt'}
+            video_extensions = tuple(
+                ext
+                for ext in (self.supported_extensions or [])
+                if str(ext).lower() not in subtitle_extensions
+            ) or (
                 '.mp4',
                 '.mkv',
                 '.avi',
                 '.mov',
                 '.wmv',
+                '.flv',
+                '.ts',
+                '.m2ts',
+                '.iso',
+                '.strm',
+                '.webm',
+                '.m4v',
+                '.mpg',
+                '.mpeg',
+                '.rmvb',
             )
             video_path = self.subtitle_handler.find_matching_video(Path(subtitle_path), video_extensions)
 
             if not video_path:
-                console_log(f"   ⚠️  未找到匹配的视频文件，跳过处理")
-                self.logger.warning(f"未找到匹配的视频文件: {subtitle_path}")
-                return False
+                # 视频已上传并删除、或只有外挂字幕时，按字幕自身识别目标后单独上传
+                console_log(f"   ℹ️  未找到匹配的视频文件，尝试单独补传字幕")
+                self.logger.info(f"未找到匹配的视频文件，尝试单独上传字幕: {subtitle_path}")
+                return self._upload_standalone_subtitle(subtitle_path)
 
             console_log(f"   ✓ 找到匹配的视频文件: {os.path.basename(video_path)}")
+
+            # 视频已上传且保留在本地（delete_after_upload=False）时不会再走视频上传链路，
+            # 字幕必须单独补传，否则会一直躺在目录里
+            if str(video_path) in self._uploaded_files:
+                console_log(f"   ℹ️  视频已上传，字幕单独补传")
+                self.logger.info(f"视频已上传，单独上传字幕: {subtitle_path}")
+                return self._upload_standalone_subtitle(subtitle_path)
 
             # 生成新的字幕文件名
             new_subtitle_name = self.subtitle_handler.generate_subtitle_name(
@@ -1657,6 +1707,108 @@ class VideoFileHandler:
             console_log(f"   ❌ 处理字幕文件时出错: {e}")
             self.logger.error(f"处理字幕文件时出错: {subtitle_path}, 错误: {e}")
             return False
+
+    def _upload_standalone_subtitle(self, subtitle_path: str) -> bool:
+        """视频已上传/删除后只剩外挂字幕时，按字幕自身识别目标并单独上传
+
+        走的是和「在线识别上传」同一条字幕链路（只调 Emos 的 subtitle/save），
+        识别不到目标时推送 Telegram 报错，用户可直接回复该消息修正目标后重传。
+        """
+        if subtitle_path in self._uploaded_files:
+            self.logger.debug(f"字幕已上传过，跳过: {subtitle_path}")
+            return True
+
+        # 与「视频上传时顺带上传字幕」共用同一个开关（emos.upload_subtitles）
+        if not getattr(self, "emos_upload_subtitles", True):
+            self.logger.info(
+                f"字幕自动上传已关闭（emos.upload_subtitles=False），跳过: {subtitle_path}"
+            )
+            return False
+
+        # 字幕可能还在写入（aria2 边下边写），先确认写完再上传，避免传上去是半截
+        if not self._is_file_complete(subtitle_path):
+            self.logger.debug(f"字幕文件未写入完成，稍后重试: {subtitle_path}")
+            if self._parent_monitor:
+                self._parent_monitor._pending_files.add(subtitle_path)
+            return False
+
+        try:
+            from .online_upload import OnlineUploadService
+
+            service = OnlineUploadService.instance()
+            service.ensure_configured(self.config)
+        except Exception as e:
+            self.logger.warning(f"字幕单独上传不可用: {subtitle_path}, 错误: {e}")
+            return False
+
+        try:
+            info = service.recognize(subtitle_path)
+        except Exception as e:
+            reason = f"字幕识别失败: {e}"
+            console_log(f"   ❌ {reason}")
+            self.logger.warning(f"{reason} - {subtitle_path}")
+            self._notify_upload_error(
+                subtitle_path, reason, header="字幕未识别到上传目标"
+            )
+            return False
+
+        match = info.get("match") or {}
+        metadata = info.get("metadata") or {}
+        if not match.get("item_id"):
+            reason = str(info.get("error") or "").strip() or "未找到匹配的 Emos 条目"
+            console_log(f"   ❌ 字幕未识别到上传目标: {reason}")
+            self.logger.warning(f"字幕未识别到上传目标: {subtitle_path} - {reason}")
+            self._notify_upload_error(
+                subtitle_path,
+                reason,
+                title=str(metadata.get("title") or ""),
+                media_type=str(metadata.get("media_type") or ""),
+                season=metadata.get("season"),
+                episode=metadata.get("episode"),
+                header="字幕未识别到上传目标",
+            )
+            return False
+
+        try:
+            task = service.create_task(
+                {
+                    "file_path": subtitle_path,
+                    "item_type": match.get("item_type"),
+                    "item_id": match.get("item_id"),
+                    "storage": getattr(self, "emos_file_storage", None),
+                    "title": str(metadata.get("title") or ""),
+                    "media_type": str(metadata.get("media_type") or ""),
+                    "season_number": match.get("season_number"),
+                    "episode_number": match.get("episode_number"),
+                }
+            )
+        except Exception as e:
+            reason = f"创建字幕上传任务失败: {e}"
+            console_log(f"   ❌ {reason}")
+            self.logger.warning(f"{reason} - {subtitle_path}")
+            self._notify_upload_error(
+                subtitle_path,
+                reason,
+                title=str(metadata.get("title") or ""),
+                media_type=str(metadata.get("media_type") or ""),
+                season=metadata.get("season"),
+                episode=metadata.get("episode"),
+                header="字幕未识别到上传目标",
+            )
+            return False
+
+        console_log(
+            f"   ✅ 字幕已提交单独上传: {match.get('label') or match.get('item_id')}"
+            f"（任务 {task.get('id')}）"
+        )
+        self.logger.info(
+            "字幕已提交单独上传: %s -> %s/%s",
+            subtitle_path,
+            match.get("item_type"),
+            match.get("item_id"),
+        )
+        self._uploaded_files.add(subtitle_path)
+        return True
 
     def _release_file_lock_via_downloader(self, file_path: str) -> bool:
         """

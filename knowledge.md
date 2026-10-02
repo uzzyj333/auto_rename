@@ -106,6 +106,8 @@ tests/
 - **Compact filename detection:** `GuessItParser` handles "剧名+集号" compact formats like `入青云01.mp4` or `TonikakuKawaii08.mkv` without relying on LLM.
 - **Manual rule engine:** `ManualRuleEngine` tracks `_last_locked_fields` so only fields locked by the last applied rule are returned, not all rules combined.
 - **File stability check:** Files aren't processed until size stabilizes (checked 3 times at 1s intervals).
+- **Subtitle handling:** `SubtitleHandler.find_matching_video` 只匹配真实视频（排除字幕自身和其它字幕扩展名），并支持 `A_track9_chi` / `A.chs` / `A-eng` 这类「视频主名 + 分隔符」后缀；当同目录没有视频（视频已上传并删除）或视频已上传但仍保留在本地时，`VideoFileHandler._upload_standalone_subtitle` 会按字幕自身识别目标并单独上传（只调 Emos 的 subtitle/save），是否启用受 `emos.upload_subtitles` 控制。
+- **Telegram 报错通知:** TMDB 没搜到条目、TMDB 请求失败、字幕识别不到上传目标、上传失败或被 Emos 拒绝重复上传，都会推送 Telegram 报错（同一文件同类报错 5 分钟只推一次）；直接「回复」该消息写 `标题 S01E01` / `标题 第4季第9集` / `标题 (2024)` 即可修正目标并重传。
 
 ## Gotchas
 - **Imports in tests:** `pythonpath = ["src"]` in `pyproject.toml` means pytest imports `from video_organizer.core...`. But `run_organizer.py` uses `sys.path.append("src")` so it imports `from src.video_organizer...`.

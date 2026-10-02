@@ -11,6 +11,9 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# 字幕扩展名（与 video_file_handler / upload_emos 保持一致）
+SUBTITLE_EXTENSIONS = {'.srt', '.ass', '.ssa', '.sub', '.vtt'}
+
 
 class SubtitleHandler:
     """字幕文件处理器"""
@@ -25,6 +28,8 @@ class SubtitleHandler:
         'chs': 'Chinese.Simplified',
         'cht': 'Chinese.Traditional',
         'zh': 'Chinese',
+        'chi': 'Chinese',
+        'zho': 'Chinese',
         'chinese': 'Chinese',
         '简体': 'Chinese.Simplified',
         '繁体': 'Chinese.Traditional',
@@ -89,8 +94,7 @@ class SubtitleHandler:
         Returns:
             是否为字幕文件
         """
-        subtitle_extensions = {'.srt', '.ass', '.ssa', '.sub', '.vtt'}
-        return file_path.suffix.lower() in subtitle_extensions
+        return file_path.suffix.lower() in SUBTITLE_EXTENSIONS
 
     def parse_subtitle_filename(self, filename: str) -> Dict[str, Optional[str]]:
         """
@@ -169,9 +173,24 @@ class SubtitleHandler:
         # 尝试不同的匹配策略
         candidates = []
 
+        try:
+            subtitle_real = subtitle_path.resolve()
+        except OSError:
+            subtitle_real = subtitle_path
+
         for video_file in directory.iterdir():
             if not video_file.is_file() or video_file.suffix.lower() not in video_extensions:
                 continue
+            # 字幕文件本身（以及其它字幕文件）不能当成视频候选，
+            # 否则 .srt 会和它自己「完全匹配」并返回自己，字幕永远挂不到视频上
+            if video_file.suffix.lower() in SUBTITLE_EXTENSIONS:
+                continue
+            try:
+                if video_file.resolve() == subtitle_real:
+                    continue
+            except OSError:
+                if video_file == subtitle_path:
+                    continue
 
             video_stem = video_file.stem
 
@@ -196,6 +215,14 @@ class SubtitleHandler:
                 candidates.append((video_file, 90))  # 高优先级
                 continue
 
+            # 策略2.5: 视频主名 + 分隔符后缀（A_track9_chi / A.chs / A-eng / A chi 等）
+            if any(
+                cleaned_subtitle_stem.startswith(video_stem + sep)
+                for sep in (".", "_", "-", " ")
+            ):
+                candidates.append((video_file, 95))
+                continue
+
             # 策略3: 视频文件名包含字幕文件名（处理 YTS 等命名格式）
             if video_stem in cleaned_subtitle_stem or cleaned_subtitle_stem in video_stem:
                 # 计算相似度得分
@@ -206,7 +233,13 @@ class SubtitleHandler:
 
             # 策略4: 目录中只有一个视频文件，字幕文件名只是语言标识
             # 这种情况下，字幕文件应该关联到唯一的视频文件
-            video_count = sum(1 for f in directory.iterdir() if f.is_file() and f.suffix.lower() in video_extensions)
+            video_count = sum(
+                1
+                for f in directory.iterdir()
+                if f.is_file()
+                and f.suffix.lower() in video_extensions
+                and f.suffix.lower() not in SUBTITLE_EXTENSIONS
+            )
             if video_count == 1:
                 # 检查字幕文件名是否只是语言标识（如 English.srt, Portuguese.srt）
                 # 或者包含已知的语言代码
@@ -222,7 +255,8 @@ class SubtitleHandler:
 
         # 按优先级排序，返回最佳匹配
         if candidates:
-            candidates.sort(key=lambda x: x[1], reverse=True)
+            # 同分时优先「视频主名更长」的那个，避免 A.ts.ass 被挂到 A.m2ts 上
+            candidates.sort(key=lambda x: (x[1], len(x[0].stem)), reverse=True)
             # 返回所有匹配的视频文件（按优先级排序）
             return candidates[0][0]
 
