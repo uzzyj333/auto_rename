@@ -1164,7 +1164,7 @@ function showBrowseModal(data) {
     });
 
     (data.files || []).forEach(file => {
-        const isVideo = ['.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m2ts','.iso','.strm'].includes(file.extension);
+        const isVideo = ['.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m2ts','.iso','.strm','.webm','.m4v','.mpg','.mpeg','.rmvb','.srt','.ass','.ssa','.vtt','.sub'].includes(file.extension);
         const fullPath = data.path ? `${data.path}\\${file.name}` : file.name;
         html += `<div class="file-item" data-path="${escapeHtml(fullPath)}" data-type="file">
             <svg class="file-icon ${isVideo ? 'video' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

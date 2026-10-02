@@ -79,6 +79,9 @@ class VideoFileHandler:
         self.output_dir = output_dir
         self.supported_extensions = supported_extensions
         self.path_mappings = path_mappings or {}
+        self.logger.info(
+            "支持的文件扩展名: %s", ",".join(str(ext) for ext in supported_extensions or [])
+        )
 
         # 运行时配置（在线修改后由 apply_config 热更新）
         self.config: Dict[str, Any] = dict(config or {})
@@ -239,6 +242,16 @@ class VideoFileHandler:
             monitoring = config.get("monitoring") or {}
             if monitoring.get("path_mappings"):
                 self.path_mappings = monitoring["path_mappings"]
+            extensions = monitoring.get("supported_extensions")
+            if extensions:
+                normalized = [
+                    str(ext).strip().lower() for ext in extensions if str(ext).strip()
+                ]
+                if normalized:
+                    self.supported_extensions = normalized
+                    self.logger.info(
+                        "支持的文件扩展名已热更新: %s", ",".join(normalized)
+                    )
 
             self._apply_processing_config()
             self._apply_emos_config()

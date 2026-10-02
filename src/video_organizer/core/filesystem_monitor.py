@@ -55,10 +55,21 @@ class FileSystemMonitor:
                 ".avi",
                 ".mov",
                 ".wmv",
+                ".flv",
                 ".ts",
                 ".m2ts",
                 ".iso",
                 ".strm",
+                ".webm",
+                ".m4v",
+                ".mpg",
+                ".mpeg",
+                ".rmvb",
+                ".srt",
+                ".ass",
+                ".ssa",
+                ".vtt",
+                ".sub",
             ]
         else:
             self.supported_extensions = supported_extensions
@@ -155,6 +166,23 @@ class FileSystemMonitor:
         )
         if self.event_handler is not None:
             self.event_handler.downloaders = list(self.downloader_monitors)
+
+    def update_supported_extensions(self, extensions) -> None:
+        """在线修改「支持的扩展名」后立即生效（文件处理器 + 各下载器监控）
+
+        以前这个配置只在启动时读取，界面上改完不重启容器不生效。
+        """
+        normalized = tuple(
+            str(ext).strip().lower() for ext in (extensions or []) if str(ext).strip()
+        )
+        if not normalized:
+            return
+        self.supported_extensions = list(normalized)
+        if self.event_handler is not None:
+            self.event_handler.supported_extensions = list(normalized)
+        for monitor in self.downloader_monitors:
+            monitor.supported_extensions = normalized
+        logger.info(f"支持的文件扩展名已热更新: {','.join(normalized)}")
 
     def reload_downloader_monitors(self, configs, force: bool = False) -> list:
         """

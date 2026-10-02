@@ -167,6 +167,63 @@ class TestDownloaderMonitorHotReload(_TempDbMixin, unittest.TestCase):
         self.assertIs(_find_monitor(monitors, "aria2"), monitors[0])
 
 
+class TestSupportedExtensionsHotReload(_TempDbMixin, unittest.TestCase):
+    """在线修改「支持的扩展名」后立即生效（以前改完不重启容器不生效）"""
+
+    def setUp(self):
+        self._setup_temp_db()
+        self.monitor = FileSystemMonitor(
+            watch_path=str(Path(self._db_tmp.name) / "watch"),
+            processed_path=str(Path(self._db_tmp.name) / "out"),
+            tmdb_api_key="",
+            supported_extensions=[".mp4", ".mkv"],
+            downloader_configs=[
+                {"type": "aria2", "id": "aria2", "rpc_url": "http://127.0.0.1:6800/jsonrpc"}
+            ],
+            config={"monitoring": {}, "downloaders": []},
+        )
+
+    def tearDown(self):
+        try:
+            self.monitor.event_handler.stop_upload_queue()
+        except Exception:
+            pass
+        self.monitor.stop()
+        self._teardown_temp_db()
+
+    def test_monitor_updates_handler_and_downloaders(self):
+        self.monitor.update_supported_extensions([".mp4", ".mkv", ".TS", " .srt "])
+
+        expected = [".mp4", ".mkv", ".ts", ".srt"]
+        self.assertEqual(self.monitor.supported_extensions, expected)
+        self.assertEqual(
+            self.monitor.event_handler.supported_extensions, expected
+        )
+        self.assertEqual(
+            self.monitor.downloader_monitors[0].supported_extensions,
+            tuple(expected),
+        )
+
+    def test_empty_extensions_are_ignored(self):
+        self.monitor.update_supported_extensions([])
+        self.monitor.update_supported_extensions(None)
+        self.assertEqual(self.monitor.supported_extensions, [".mp4", ".mkv"])
+
+    def test_handler_apply_config_updates_extensions(self):
+        handler = self.monitor.event_handler
+        handler.apply_config(
+            {
+                "monitoring": {"supported_extensions": [".mkv", ".ISO", ".srt"]},
+                "processing": {"max_upload_workers": 1},
+                "emos": {},
+            }
+        )
+
+        self.assertEqual(handler.supported_extensions, [".mkv", ".iso", ".srt"])
+        self.assertTrue(handler._is_supported_file("剧集.S01E01.iso"))
+        self.assertTrue(handler._is_subtitle_file("剧集.S01E01.srt"))
+
+
 class TestFindMonitor(unittest.TestCase):
     """按实例名称 / 类型定位下载器（API 用）"""
 

@@ -177,7 +177,7 @@ async def scan_directory(request: ScanDirectoryRequest):
         else:
             extensions = config.get("monitoring", {}).get(
                 "supported_extensions",
-                [".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m2ts", ".iso"]
+                [".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m2ts", ".iso", ".strm", ".webm", ".m4v", ".mpg", ".mpeg", ".rmvb", ".srt", ".ass", ".ssa", ".vtt", ".sub"]
             )
         
         # 扫描文件

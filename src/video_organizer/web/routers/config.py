@@ -47,6 +47,16 @@ def _apply_runtime_config(config: Dict[str, Any]) -> None:
             get_state_manager().set_downloader_monitors(monitors)
     except Exception as e:
         logger.warning(f"配置热更新同步到下载器监控失败: {e}")
+    # 「支持的扩展名」在线修改后立即生效（文件处理器 + 各下载器监控）
+    try:
+        parent = getattr(handler, "_parent_monitor", None) if handler is not None else None
+        extensions = (config.get("monitoring") or {}).get("supported_extensions")
+        if parent is not None and extensions and hasattr(
+            parent, "update_supported_extensions"
+        ):
+            parent.update_supported_extensions(extensions)
+    except Exception as e:
+        logger.warning(f"配置热更新同步支持的扩展名失败: {e}")
     try:
         config_path = get_state_manager().get_config_path()
     except Exception:
