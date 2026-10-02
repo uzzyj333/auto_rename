@@ -28,7 +28,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .emos_client import EmosApiError, EmosClient
 from .probe import probe_summary_for_upload, probe_video
-from ..upload.upload_emos import RobustEmosVideoUploader, format_size
+from ..upload.upload_emos import (
+    DEFAULT_UPLOAD_CONCURRENCY,
+    RobustEmosVideoUploader,
+    format_size,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +141,16 @@ class OnlineUploadService:
         # 可选：上传后清理原文件时的下载器回调（见 core/source_cleanup.py）
         self._downloader_cleanup: Optional[Callable[[str], Optional[bool]]] = None
 
+    def set_downloader_cleanup(
+        self, cleanup: Optional[Callable[[str], Optional[bool]]]
+    ) -> None:
+        """注册「上传后删除原文件」时的下载器清理回调（由 VideoFileHandler 提供）
+
+        没有这个回调时，手动选片 / Telegram 回复修正上传成功后只会删掉文件、
+        不会删除下载器任务，qBittorrent 里会留下「文件已不存在」的空种子。
+        """
+        self._downloader_cleanup = cleanup
+
     # ------------------------------------------------------------------
     # 配置
     # ------------------------------------------------------------------
@@ -210,7 +224,8 @@ class OnlineUploadService:
         try:
             from .source_cleanup import cleanup_uploaded_source
 
-            outcome = cleanup_uploaded_source(file_path, downloader_cleanup=self._downloader_cleanup)
+            cleanup = self._downloader_cleanup or self._handler_downloader_cleanup()
+            outcome = cleanup_uploaded_source(file_path, downloader_cleanup=cleanup)
         except Exception as exc:
             logger.warning("上传后处理原文件失败: %s", exc)
             return False, "（原文件删除失败）"
@@ -220,6 +235,22 @@ class OnlineUploadService:
         if deleted:
             return True, "（已删除原文件）"
         return False, (f"（原文件未删除：{reason}）" if reason else "（原文件未删除）")
+
+    def _handler_downloader_cleanup(
+        self,
+    ) -> Optional[Callable[[str], Optional[bool]]]:
+        """兜底：从全局状态里取 VideoFileHandler 的下载器清理回调"""
+        try:
+            from ..web.services.state import get_state_manager
+
+            handler = get_state_manager().get_video_handler()
+        except Exception:
+            return None
+        cleanup = getattr(handler, "_downloader_cleanup_state", None)
+        if callable(cleanup):
+            self._downloader_cleanup = cleanup
+            return cleanup
+        return None
 
     def config_snapshot(self) -> Dict[str, Any]:
         """返回前端需要的配置信息（不含 token 明文）"""
@@ -891,7 +922,9 @@ class OnlineUploadService:
                 auth_token=self._token(),
                 base_url=self._base_url(),
                 chunk_size_mb=int(emos.get("chunk_size_mb") or 50),
-                upload_concurrency=int(emos.get("upload_concurrency") or 4),
+                upload_concurrency=int(
+                    emos.get("upload_concurrency") or DEFAULT_UPLOAD_CONCURRENCY
+                ),
                 telegram_config=self._config.get("telegram") or {},
                 progress_callback=on_progress,
             )
@@ -906,7 +939,15 @@ class OnlineUploadService:
                 )
             finally:
                 uploader.close()
-            if result:
+            if result and result.get("deferred"):
+                # Emos 限制一周内不能重复上传，而目标条目下又找不到该文件：
+                # 不能算成功，短时间内重试也无意义，如实报失败并保留本地文件
+                reason = str(result.get("reason") or "Emos 暂不允许上传该资源")
+                self._update_task(
+                    task_id, status="failed", stage="上传被 Emos 拒绝", error=reason
+                )
+                self._notify_failure(snapshot, reason)
+            elif result:
                 # 上传成功后按配置处理原文件（手动选片 / 自动上传 / Telegram 修正三条链路一致）
                 deleted, delete_note = self._delete_source_if_configured(snapshot["file_path"])
                 self._update_task(

@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +41,7 @@ _API_BASE = "https://api.telegram.org"   # 可通过该常量替换为自建反�
 _MAX_REPLY_MAP = 200          # 最多记住多少条报错信息（供回复修正）
 _MAX_MESSAGE_CHARS = 3500     # Telegram 单条消息上限约 4096，留出余量
 _SEND_TIMEOUT = 15
+_ERROR_NOTIFY_INTERVAL = 300  # 同一文件的同类报错 5 分钟只推一次
 
 _CN_DIGITS = {
     "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
@@ -212,6 +214,7 @@ class TelegramBotService:
         self._stop_event = threading.Event()
         self._offset = 0
         self._replies: Dict[str, Dict[str, Any]] = {}
+        self._error_notified_at: Dict[str, float] = {}
         self._sent_count = 0
         self._last_error = ""
         self._last_update_at = ""
@@ -362,14 +365,34 @@ class TelegramBotService:
             reason = self._last_error or "未配置 bot_token / chat_id"
         return {"success": False, "message": f"发送失败: {reason}"}
 
-    def notify_error(self, context: Dict[str, Any], error: str, header: str = "上传失败") -> bool:
-        """推送一条上传报错信息，并记住它以便用户回复修正"""
+    def notify_error(
+        self, context: Dict[str, Any], error: str, header: str = "上传失败"
+    ) -> bool:
+        """推送一条上传报错信息，并记住它以便用户回复修正
+
+        同一个文件的同类报错 5 分钟内只推一次：文件一直失败（每分钟重试一次）时
+        不会反复刷屏，用户仍可回复此前那条消息来修正目标。
+        """
         with self._lock:
             if not (self._token and self._chat_id and self._enabled):
                 return False
             task_id = str((context or {}).get("task_id") or "")
+        name = (
+            (context or {}).get("file_name")
+            or os.path.basename(str((context or {}).get("file_path") or ""))
+            or "-"
+        )
+        notify_key = f"{str((context or {}).get('file_path') or name)}|{header}"
+        now = time.time()
+        with self._lock:
+            last = self._error_notified_at.get(notify_key, 0.0)
+            if now - last < _ERROR_NOTIFY_INTERVAL:
+                logger.debug("同类报错 5 分钟内已推送过，跳过: %s", notify_key)
+                return False
+            self._error_notified_at[notify_key] = now
+            while len(self._error_notified_at) > _MAX_REPLY_MAP:
+                self._error_notified_at.pop(next(iter(self._error_notified_at)), None)
         lines = [f"❌ {header}" + (f" #{task_id}" if task_id else "")]
-        name = (context or {}).get("file_name") or os.path.basename(str((context or {}).get("file_path") or "")) or "-"
         lines.append(f"文件：{name}")
         target = self._describe_context(context)
         if target:
@@ -380,6 +403,9 @@ class TelegramBotService:
         lines.append("　时光代理人S04E09")
         message_id = self.send_text("\n".join(lines))
         if not message_id:
+            # 发送失败（网络等）不算已通知，下次还能重试
+            with self._lock:
+                self._error_notified_at.pop(notify_key, None)
             return False
         with self._lock:
             self._replies[str(message_id)] = dict(context or {}, _error=str(error or ""), _at=_now_text())

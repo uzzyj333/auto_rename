@@ -259,8 +259,13 @@ class EmosClient:
         return {"data": data}
 
     @staticmethod
-    def _is_already_uploaded(payload: Any) -> bool:
-        """判断响应是否表示「该资源此前已上传过」"""
+    def is_already_uploaded(payload: Any) -> bool:
+        """判断响应是否表示「该资源此前已上传过」
+
+        Emos 对同一资源有一周内不允许重复上传的限制，命中时
+        ``getUploadToken`` 返回 HTTP 422 且 message 形如
+        「此资源您一周内上传过」，这类响应都应按「已存在」处理。
+        """
         if not isinstance(payload, dict):
             return False
         if payload.get("existed") or payload.get("exists"):
@@ -268,7 +273,7 @@ class EmosClient:
         text = " ".join(
             str(payload.get(key) or "") for key in ("message", "msg", "error", "detail")
         )
-        return "之前上传过" in text or "已上传过" in text
+        return "上传过" in text
 
     @staticmethod
     def _as_id(value: Any) -> Any:
@@ -420,7 +425,7 @@ class EmosClient:
             data = self._json("POST", "/api/upload/getUploadToken", json_body=body)
         except EmosApiError as exc:
             payload = self._parse_error_payload(exc)
-            if self._is_already_uploaded(payload):
+            if self.is_already_uploaded(payload):
                 payload = dict(payload)
                 payload["existed"] = True
                 return payload
@@ -428,7 +433,7 @@ class EmosClient:
         if not isinstance(data, dict):
             raise EmosApiError("获取上传凭证失败: 响应格式异常")
         if not data.get("file_id"):
-            if self._is_already_uploaded(data):
+            if self.is_already_uploaded(data):
                 data = dict(data)
                 data["existed"] = True
                 return data

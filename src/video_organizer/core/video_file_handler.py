@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
 # 导入项目内部的上传工具
-from ..upload.upload_emos import RobustEmosVideoUploader
+from ..upload.upload_emos import DEFAULT_UPLOAD_CONCURRENCY, RobustEmosVideoUploader
 
 from .emos_client import EmosClient
 from .probe import probe_summary_for_upload, probe_video
@@ -154,6 +154,10 @@ class VideoFileHandler:
         # 启动上传队列处理线程
         self._start_upload_queue()
 
+        # 注册「上传后删除原文件」的下载器清理回调：手动选片 / Telegram 回复修正
+        # 上传成功后同样要删掉下载器任务，否则 qb 里会留下文件已不存在的空种子
+        self._register_downloader_cleanup()
+
     # ============================================================
     # 配置热更新（在线修改后立即生效，无需重启容器）
     # ============================================================
@@ -194,9 +198,11 @@ class VideoFileHandler:
         except (TypeError, ValueError):
             self.emos_chunk_size_mb = 50
         try:
-            self.emos_upload_concurrency = int(emos.get("upload_concurrency", 4))
+            self.emos_upload_concurrency = int(
+                emos.get("upload_concurrency", DEFAULT_UPLOAD_CONCURRENCY)
+            )
         except (TypeError, ValueError):
-            self.emos_upload_concurrency = 4
+            self.emos_upload_concurrency = DEFAULT_UPLOAD_CONCURRENCY
 
     def _build_emos_client(self) -> None:
         """构建 Emos 官方 API 客户端（用于在线识别）"""
@@ -265,10 +271,26 @@ class VideoFileHandler:
             from .online_upload import OnlineUploadService
 
             OnlineUploadService.instance().configure(config)
+            self._register_downloader_cleanup()
         except Exception:
             pass
 
         self.logger.info("配置已在线热更新（无需重启容器）")
+
+    def _register_downloader_cleanup(self) -> None:
+        """把下载器清理回调注册给在线识别上传服务
+
+        手动选片 / Telegram 回复修正上传成功后也走 ``core.source_cleanup``，
+        需要这个回调才能删掉下载器里的任务。
+        """
+        try:
+            from .online_upload import OnlineUploadService
+
+            OnlineUploadService.instance().set_downloader_cleanup(
+                self._downloader_cleanup_state
+            )
+        except Exception as e:
+            self.logger.warning(f"注册下载器清理回调失败: {e}")
 
     @staticmethod
     def _pick_emos_match(
@@ -1024,6 +1046,22 @@ class VideoFileHandler:
                 )
             finally:
                 uploader.close()
+
+            if upload_result and upload_result.get("deferred"):
+                # Emos 限制一周内不能重复上传，而目标条目下又找不到该文件：
+                # 不算成功，且短时间内重试无意义（每分钟重试会疯狂刷屏），
+                # 因此只记录一次失败、保留本地文件、不加入重试队列
+                reason = str(upload_result.get("reason") or "Emos 暂不允许上传该资源")
+                console_log(f"\n⏸️ [线程#{worker_id}] {reason}")
+                self._uploading_files.discard(file_path)
+                self._failed_files[file_path] = reason
+                record_task(
+                    file_path, "failed", error_message=reason, end_time=datetime.now()
+                )
+                self.logger.warning(
+                    "上传被 Emos 拒绝（不重试）: %s - %s", file_path, reason
+                )
+                return
 
             if not upload_result:
                 reason = "Emos 上传失败"

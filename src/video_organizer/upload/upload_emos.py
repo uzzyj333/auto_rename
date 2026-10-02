@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlsplit
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from ..core.emos_client import EmosApiError, EmosClient, detect_video_mime
 
@@ -36,15 +37,34 @@ logger = logging.getLogger(__name__)
 # Telegram Bot API 根地址（如需自建反代可修改此处）
 _TG_API_BASE = "https://api.telegram.org"
 
+# 同一文件的 Telegram 消息 id 缓存：文件失败后每分钟会重试一次，
+# 复用同一条消息（编辑）而不是每次新建一条，避免一直报错时刷屏
+_TG_MESSAGE_LOCK = threading.Lock()
+_TG_MESSAGE_IDS: Dict[str, int] = {}
+_TG_MESSAGE_IDS_LIMIT = 200
+
+
+def _remember_tg_message(key: str, message_id: int) -> None:
+    with _TG_MESSAGE_LOCK:
+        _TG_MESSAGE_IDS[key] = message_id
+        while len(_TG_MESSAGE_IDS) > _TG_MESSAGE_IDS_LIMIT:
+            _TG_MESSAGE_IDS.pop(next(iter(_TG_MESSAGE_IDS)), None)
+
+
+def _recall_tg_message(key: str) -> Optional[int]:
+    with _TG_MESSAGE_LOCK:
+        return _TG_MESSAGE_IDS.get(key)
+
+
 ProgressCallback = Callable[[float, int, int, str], None]
 
 DEFAULT_CHUNK_MB = 50
 MIN_CHUNK_MB = 10
 MAX_CHUNK_MB = 200
 MAX_PARTS = 1000
-DEFAULT_UPLOAD_CONCURRENCY = 4
+DEFAULT_UPLOAD_CONCURRENCY = 10
 MIN_UPLOAD_CONCURRENCY = 1
-MAX_UPLOAD_CONCURRENCY = 16
+MAX_UPLOAD_CONCURRENCY = 32
 
 
 def _report_upload_progress(
@@ -166,6 +186,14 @@ class RobustEmosVideoUploader:
         self.upload_concurrency = max(
             MIN_UPLOAD_CONCURRENCY, min(MAX_UPLOAD_CONCURRENCY, concurrency)
         )
+        # 连接池按分片并发数放大：requests 默认 pool_maxsize=10，并发数超过它时
+        # 连接会被丢弃重建，表现为「并发调高了速度也上不去」
+        adapter = HTTPAdapter(
+            pool_connections=self.upload_concurrency,
+            pool_maxsize=self.upload_concurrency,
+        )
+        self.storage_session.mount("http://", adapter)
+        self.storage_session.mount("https://", adapter)
         self.timeout = int(timeout or 60)
         self.max_retries = max(1, int(max_retries or 1))
         self.progress_callback = progress_callback
@@ -176,11 +204,21 @@ class RobustEmosVideoUploader:
         self._tg_message_id: Optional[int] = None
         self._tg_last_update = 0.0
         self._tg_interval = 3.0
+        # Telegram 进度消息交给后台线程发送（网络请求不能拖慢分片上传），
+        # 终态消息同步发送，保证最后一条一定是上传结果
+        self._tg_lock = threading.Lock()
+        self._tg_send_lock = threading.Lock()
+        self._tg_pending: Optional[str] = None
+        self._tg_worker: Optional[threading.Thread] = None
+        self._tg_finalized = False
+        self._tg_base_text: Optional[str] = None  # 最近一条进度文本（结果追加在它后面）
+        self._tg_message_key = ""  # 同文件复用同一条 Telegram 消息
         # 进度上下文（用于 Telegram 进度消息中的分片 / 速度 / 剩余时间）
         self._progress_started_at = 0.0
         self._progress_parts_done = 0
         self._progress_total_parts = 0
         self.last_error: str = ""  # 最近一次失败原因（供调用方展示 / 报错通知使用）
+        self._skip_reason: str = ""  # 命中「已上传过」跳过传输时的说明
 
     def close(self) -> None:
         """释放底层会话"""
@@ -227,6 +265,11 @@ class RobustEmosVideoUploader:
         self._progress_started_at = started_at
         self._progress_parts_done = 0
         self._progress_total_parts = 0
+        self._skip_reason = ""
+        self._tg_finalized = False
+        self._tg_base_text = None
+        self._tg_message_key = f"{self.tg_chat_id}:{file_name}"
+        self._tg_message_id = _recall_tg_message(self._tg_message_key)
         self._report(str(path), file_name, 0, 0, file_size, "", "uploading")
 
         try:
@@ -245,15 +288,58 @@ class RobustEmosVideoUploader:
             token_data = token.get("data") if isinstance(token.get("data"), dict) else {}
             token_type = str(token.get("type") or "").lower()
             file_id = str(token.get("file_id") or "")
-            existed = bool(token.get("existed")) or "之前上传过" in str(token.get("message") or "")
+            existed = EmosClient.is_already_uploaded(token)
 
             if not file_id:
                 if existed:
-                    self._report(str(path), file_name, 100, file_size, file_size, "", "completed")
-                    return {"file_id": "", "media_id": "", "skipped": True, "existed": True}
+                    reason = str(
+                        token.get("message") or token.get("msg") or "该资源此前已上传过"
+                    )
+                    if self._episode_has_media(
+                        item_type, item_id, file_name, file_size
+                    ):
+                        # 目标条目下确实已经有这份文件，跳过传输直接算完成
+                        self._skip_reason = reason
+                        logger.info(
+                            "跳过上传（目标条目已存在该文件）: %s - %s",
+                            file_name,
+                            reason,
+                        )
+                        self._report(
+                            str(path),
+                            file_name,
+                            100,
+                            file_size,
+                            file_size,
+                            "",
+                            "completed",
+                        )
+                        return {
+                            "file_id": "",
+                            "media_id": "",
+                            "skipped": True,
+                            "existed": True,
+                        }
+                    # 目标条目下找不到这份文件，说明是此前失败的上传尝试在 Emos 侧
+                    # 留下的记录（Emos 对同一资源有一周内不允许重复上传的限制）。
+                    # 这既不能算上传成功，短时间内重试也没有意义，标记为「暂不重试」。
+                    detail = (
+                        f"Emos 限制：{reason}；但目标条目下没有找到该文件，"
+                        "很可能是此前失败的上传尝试留下的记录，需等限制解除后再试"
+                    )
+                    logger.warning(
+                        "上传被 Emos 拒绝且目标条目无该文件: %s - %s", file_name, detail
+                    )
+                    self._report(
+                        str(path), file_name, 0, 0, file_size, "", "failed", detail
+                    )
+                    return {"deferred": True, "reason": detail}
                 raise EmosApiError("上传凭证缺少 file_id")
 
             if existed:
+                self._skip_reason = str(
+                    token.get("message") or token.get("msg") or "该资源此前已上传过"
+                )
                 logger.info("该资源此前已上传过，跳过文件传输直接入库: %s", file_name)
             elif token_type == "multipart" or (not token_data.get("upload_url") and token_data.get("multipart_size")):
                 self._upload_multipart(path, token, file_size)
@@ -289,6 +375,36 @@ class RobustEmosVideoUploader:
             self._report(str(path), file_name, 0, 0, file_size, "", "failed", str(exc))
             self._tg_finish(file_name, "", error=str(exc))
             return None
+
+    def _episode_has_media(
+        self, item_type: str, item_id: Any, file_name: str, file_size: int
+    ) -> bool:
+        """查询目标条目下是否已经存在这份文件
+
+        用于区分「真的已经上传过」和「Emos 因此前失败的尝试而拒绝重复上传」。
+        查询失败时按「不存在」处理（宁可让用户确认，也不要误报上传成功）。
+        """
+        try:
+            base_info = self.client.get_video_base(item_type, item_id)
+        except Exception as exc:
+            logger.warning("查询目标条目媒体列表失败: %s", exc)
+            return False
+        medias = base_info.get("video_medias")
+        if not isinstance(medias, list):
+            return False
+        for media in medias:
+            if not isinstance(media, dict):
+                continue
+            name = str(media.get("media_name") or "").strip()
+            if name and name == file_name:
+                return True
+            try:
+                size = int(media.get("media_file_size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if size and size == int(file_size):
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # 分片上传
@@ -379,17 +495,20 @@ class RobustEmosVideoUploader:
             with lock:
                 uploaded_bytes += length
                 self._progress_parts_done += 1
-                progress = 10 + 85 * (uploaded_bytes / file_size) if file_size else 95
-                elapsed = max(time.time() - started_at, 0.001)
-                self._report(
-                    str(path),
-                    path.name,
-                    progress,
-                    uploaded_bytes,
-                    file_size,
-                    format_speed(uploaded_bytes / elapsed),
-                    "uploading",
-                )
+                done = uploaded_bytes
+            # 进度上报（含 Telegram / Web 推送）放在锁外，
+            # 避免网络请求占着锁把其它分片线程一起堵住
+            progress = 10 + 85 * (done / file_size) if file_size else 95
+            elapsed = max(time.time() - started_at, 0.001)
+            self._report(
+                str(path),
+                path.name,
+                progress,
+                done,
+                file_size,
+                format_speed(done / elapsed),
+                "uploading",
+            )
             return {"number": part_number, "etag": etag}
 
         ordered = sorted(by_number)
@@ -643,19 +762,54 @@ class RobustEmosVideoUploader:
     def _tg_update(self, file_name, progress, uploaded, total, speed, status, error=None) -> None:
         if not self.tg_bot_token or not self.tg_chat_id:
             return
-        now = time.time()
-        if status == "uploading" and now - self._tg_last_update < self._tg_interval:
-            return
-        if status == "uploading" and progress < 1:
-            return
-        self._tg_last_update = now
-        if status == "completed":
-            text = f"✅ Emos 上传完成\n文件: `{file_name}`\n大小: {format_size(total)}"
-        elif status == "failed":
-            text = f"❌ Emos 上传失败\n文件: `{file_name}`\n原因: {error or '未知错误'}"
-        else:
+        if status == "uploading":
+            if progress < 1:
+                return
+            now = time.time()
+            with self._tg_lock:
+                if self._tg_finalized or now - self._tg_last_update < self._tg_interval:
+                    return
+                self._tg_last_update = now
+            # 进度消息走后台线程发送，不阻塞正在上传的分片线程
             text = self._progress_text(file_name, progress, uploaded, total)
+            self._tg_base_text = text
+            self._tg_enqueue(text)
+            return
+        if status == "completed":
+            if self._skip_reason:
+                text = (
+                    f"♻️ Emos 已存在该资源，跳过上传\n"
+                    f"文件: `{file_name}`\n原因: {self._skip_reason}"
+                )
+            else:
+                text = f"✅ 上传完成\n文件: `{file_name}`\n大小: {format_size(total)}"
+        else:
+            text = f"❌ Emos 上传失败\n文件: `{file_name}`\n原因: {error or '未知错误'}"
         self._tg_finish(None, None, text=text)
+
+    def _tg_enqueue(self, text: str) -> None:
+        """把进度消息交给后台线程发送（只保留最新一条，避免刷屏）"""
+        with self._tg_lock:
+            if self._tg_finalized:
+                return
+            self._tg_pending = text
+            if self._tg_worker is None:
+                self._tg_worker = threading.Thread(
+                    target=self._tg_loop, name="emos-tg", daemon=True
+                )
+                self._tg_worker.start()
+
+    def _tg_loop(self) -> None:
+        """后台线程：串行发送进度消息，取不到待发文本即退出"""
+        while True:
+            with self._tg_lock:
+                text = self._tg_pending
+                self._tg_pending = None
+                if text is None:
+                    self._tg_worker = None
+                    return
+            with self._tg_send_lock:
+                self._tg_send(text)
 
     def _progress_text(
         self, file_name: str, progress: float, uploaded: int, total: int
@@ -699,9 +853,25 @@ class RobustEmosVideoUploader:
             return
         if text is None:
             if error:
-                text = f"❌ Emos 上传失败\n文件: `{file_name}`\n原因: {error}"
+                block = f"❌ Emos 上传失败\n文件: `{file_name}`\n原因: {error}"
             else:
-                text = f"✅ Emos 上传完成\n文件: `{file_name}`" + (f"\n标题: {title}" if title else "")
+                block = f"✅ 上传完成\n文件: `{file_name}`" + (
+                    f"\n标题: {title}" if title else ""
+                )
+        else:
+            block = text
+        # 上传过程中不覆盖进度消息，只在最后追加结果（进度条 / 速度信息保留下来）
+        base = (self._tg_base_text or "").strip()
+        full = f"{base}\n\n{block}" if base else block
+        # 终态消息：丢弃还没发出的进度消息，等正在发送的那条发完再发，保证顺序
+        with self._tg_lock:
+            self._tg_finalized = True
+            self._tg_pending = None
+        with self._tg_send_lock:
+            self._tg_send(full)
+
+    def _tg_send(self, text: str) -> None:
+        """实际发送 Telegram 消息（通知失败不影响上传流程）"""
         try:
             if self._tg_message_id is None:
                 url = f"{_TG_API_BASE}/bot{self.tg_bot_token}/sendMessage"
@@ -711,6 +881,10 @@ class RobustEmosVideoUploader:
                     body = response.json()
                     if body.get("ok"):
                         self._tg_message_id = body["result"]["message_id"]
+                        if self._tg_message_key:
+                            _remember_tg_message(
+                                self._tg_message_key, self._tg_message_id
+                            )
             else:
                 url = f"{_TG_API_BASE}/bot{self.tg_bot_token}/editMessageText"
                 payload = {
