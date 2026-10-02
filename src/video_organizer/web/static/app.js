@@ -1964,6 +1964,20 @@ function escapeOnline(value) {
     return escapeHtml(String(value == null ? '' : value));
 }
 
+function tmdbLinkHtml(tmdbId, videoType) {
+    const id = String(tmdbId == null ? '' : tmdbId).trim();
+    if (!id) return '<span style="color:var(--text-muted)">-</span>';
+    const kind = /movie|电影/i.test(String(videoType || '')) ? 'movie' : 'tv';
+    const url = 'https://www.themoviedb.org/' + kind + '/' + encodeURIComponent(id);
+    return '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + escapeOnline(id) + '</a>';
+}
+
+function yearOfItem(item) {
+    const air = String((item && item.date_air) || '');
+    const match = air.match(/^(\d{4})/);
+    return match ? match[1] : '';
+}
+
 async function initOnlinePage() {
     if (!onlineState.initialized) {
         onlineState.initialized = true;
@@ -2205,16 +2219,38 @@ function buildRecognizedItem(data) {
             item_id: String(t.item_id),
             label: t.label || key,
             kind: t.kind || '',
+            season_number: t.season_number == null ? null : Number(t.season_number),
+            episode_number: t.episode_number == null ? null : Number(t.episode_number),
         });
     };
     push(target);
     for (const video of (data.candidates || [])) {
-        push({ item_type: 'vl', item_id: video.item_id, label: '[作品] ' + (video.title || ''), kind: 'video' });
+        const videoYear = yearOfItem(video);
+        push({ item_type: 'vl', item_id: video.item_id, label: '[作品] ' + (video.title || '') + (videoYear ? ' (' + videoYear + ')' : ''), kind: 'video' });
         for (const season of (video.seasons || [])) {
             push({ item_type: 'vs', item_id: season.item_id, label: '　└ S' + (season.season_number || '?') + ' ' + (season.season_title || ''), kind: 'season' });
             for (const ep of (season.episodes || [])) {
-                push({ item_type: 've', item_id: ep.item_id, label: '　　└ S' + (season.season_number || '?') + 'E' + (ep.episode_number || '?') + ' ' + (ep.episode_title || ''), kind: 'episode' });
+                push({
+                    item_type: ep.item_type || 've',
+                    item_id: ep.item_id,
+                    label: '　　└ S' + (season.season_number || '?') + 'E' + (ep.episode_number || '?') + ' ' + (ep.episode_title || ''),
+                    kind: 'episode',
+                    season_number: season.season_number,
+                    episode_number: ep.episode_number,
+                });
             }
+        }
+    }
+    // 没识别到目标时，优先按文件名里的季/集号选中对应剧集（ve），
+    // 避免默认停在「整部作品（vl）」上导致上传 404
+    let selected = target;
+    if (!selected) {
+        const meta = data.metadata || {};
+        const season = meta.season == null ? null : Number(meta.season);
+        const episode = meta.episode == null ? null : Number(meta.episode);
+        if (episode != null) {
+            selected = options.find(t => t.kind === 'episode' && Number(t.episode_number) === episode &&
+                (season == null || t.season_number == null || Number(t.season_number) === season)) || null;
         }
     }
     return {
@@ -2227,7 +2263,7 @@ function buildRecognizedItem(data) {
         subtitles: data.subtitles || [],
         fileKind: data.file_kind || 'video',
         options: options,
-        target: target,
+        target: selected,
         storage: '',
         error: data.error || '',
     };
@@ -2248,10 +2284,10 @@ function renderOnlineRecognize() {
     items.forEach((item, index) => {
         const meta = item.metadata || {};
         const optionHtml = item.options.length
-            ? item.options.map((t, i) =>
+            ? ((item.target ? '' : '<option value="-1">请选择上传目标…</option>') + item.options.map((t, i) =>
                 '<option value="' + i + '"' +
                 (item.target && item.target.item_type === t.item_type && String(item.target.item_id) === String(t.item_id) ? ' selected' : '') +
-                '>' + escapeOnline(t.label) + '（' + escapeOnline(t.item_type + '/' + t.item_id) + '）</option>').join('')
+                '>' + escapeOnline(t.label) + '（' + escapeOnline(t.item_type + '/' + t.item_id) + '）</option>').join(''))
             : '<option value="-1">未找到匹配，请使用上方搜索</option>';
         const storageHtml = storages.map(s =>
             '<option value="' + escapeOnline(s) + '"' + (s === (item.storage || defaultStorage) ? ' selected' : '') + '>' + escapeOnline(s) + '</option>').join('');
@@ -2262,7 +2298,9 @@ function renderOnlineRecognize() {
                     '<div style="font-weight:600">' + escapeOnline(item.file_name) + '</div>' +
                     '<div style="font-size:12px;color:var(--text-muted)">' + escapeOnline(item.file_path) + '</div>' +
                     '<div style="font-size:12px;color:var(--text-muted);margin-top:4px">识别: ' +
-                        escapeOnline(meta.title || '-') + ' · TMDB: ' + escapeOnline(meta.tmdb_id || '-') +
+                        escapeOnline(meta.title || '-') +
+                        (meta.year ? ' (' + escapeOnline(meta.year) + ')' : '') +
+                        ' · TMDB: ' + tmdbLinkHtml(meta.tmdb_id, meta.media_type) +
                         ' · 类型: ' + escapeOnline(meta.media_type || '-') + escapeOnline(seasonText) + '</div>' +
                     ((item.subtitles && item.subtitles.length) ? '<div style="font-size:12px;color:var(--text-muted);margin-top:4px">📎 将同时上传字幕: ' + escapeOnline(item.subtitles.join('、')) + '</div>' : '') +
                     ((item.fileKind === 'subtitle') ? '<div style="font-size:12px;color:var(--text-muted);margin-top:4px">📎 字幕文件：将作为外挂字幕补传到所选条目（无需再传视频）</div>' : '') +
@@ -2308,11 +2346,13 @@ async function searchOnlineTargets() {
             return;
         }
         let html = '<div class="table-container" style="max-height:260px;overflow:auto"><table>' +
-            '<thead><tr><th>标题</th><th style="width:100px">类型</th><th style="width:140px">item_id</th><th style="width:120px">操作</th></tr></thead><tbody>';
+            '<thead><tr><th>标题</th><th style="width:70px">年份</th><th style="width:90px">类型</th><th style="width:140px">item_id</th><th style="width:110px">TMDB</th><th style="width:120px">操作</th></tr></thead><tbody>';
         results.forEach((item, i) => {
             html += '<tr><td>' + escapeOnline(item.title || '') + '</td>' +
+                '<td>' + escapeOnline(yearOfItem(item) || '-') + '</td>' +
                 '<td>' + escapeOnline(item.video_type || '') + '</td>' +
                 '<td>' + escapeOnline(item.item_type + '/' + item.item_id) + '</td>' +
+                '<td>' + tmdbLinkHtml(item.tmdb_id, item.video_type) + '</td>' +
                 '<td><button class="btn btn-secondary btn-sm" data-online-apply="' + i + '">设为目标</button></td></tr>';
         });
         html += '</tbody></table></div>';
@@ -2334,17 +2374,42 @@ function applyOnlineSearchResult(index) {
     const targets = pending.length ? pending : onlineState.recognized;
     if (!targets.length) { alert('请先识别视频文件'); return; }
     const applyTo = pending.length ? pending[0] : targets[0];
-    const option = {
-        item_type: result.item_type || 'vl',
-        item_id: String(result.item_id),
-        label: result.title || '',
-        kind: 'video',
-    };
+    const option = buildOnlineTargetOption(result, applyTo);
     if (!applyTo.options.some(t => t.item_type === option.item_type && String(t.item_id) === String(option.item_id))) {
         applyTo.options.unshift(option);
     }
     applyTo.target = option;
     renderOnlineRecognize();
+}
+
+// 把搜索到的「整部作品（vl）」按已识别出来的季/集号自动落到具体某一集（ve），
+// 否则电视剧上传到 vl 时 Emos 的 /api/upload/video/base 会返回 404
+function buildOnlineTargetOption(result, recognizedItem) {
+    const meta = (recognizedItem && recognizedItem.metadata) || {};
+    const season = meta.season == null ? null : Number(meta.season);
+    const episode = meta.episode == null ? null : Number(meta.episode);
+    const isMovie = /movie|电影/i.test(String(result.video_type || ''));
+    if (!isMovie && episode != null && Array.isArray(result.seasons)) {
+        for (const item of result.seasons) {
+            if (season != null && item.season_number != null && Number(item.season_number) !== season) continue;
+            for (const ep of (item.episodes || [])) {
+                if (Number(ep.episode_number) === episode && ep.item_id) {
+                    return {
+                        item_type: ep.item_type || 've',
+                        item_id: String(ep.item_id),
+                        label: 'S' + (item.season_number != null ? item.season_number : '?') + 'E' + ep.episode_number + ' ' + (ep.episode_title || result.title || ''),
+                        kind: 'episode',
+                    };
+                }
+            }
+        }
+    }
+    return {
+        item_type: result.item_type || 'vl',
+        item_id: String(result.item_id),
+        label: result.title || '',
+        kind: 'video',
+    };
 }
 
 async function addOnlineTask(index) {

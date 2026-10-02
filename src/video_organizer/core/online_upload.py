@@ -840,6 +840,15 @@ class OnlineUploadService:
         if not item_type or not item_id:
             raise ValueError("缺少上传目标（item_type / item_id）")
 
+        media_type = str(item.get("media_type") or "").strip().lower()
+        season_number = _to_int(item.get("season_number"))
+        episode_number = _to_int(item.get("episode_number"))
+        # 电视剧上传到「整部作品（vl）/ 整季（vs）」时 Emos 的 /api/upload/video/base
+        # 会返回 404，这里按季/集号自动纠正到具体某一集（ve）
+        item_type, item_id, season_number, episode_number = self._resolve_episode_target(
+            item_type, item_id, media_type, season_number, episode_number
+        )
+
         emos = self._emos_config()
         storage = str(item.get("storage") or emos.get("file_storage") or "internal").strip() or "internal"
         stat = path.stat()
@@ -853,8 +862,8 @@ class OnlineUploadService:
             storage=storage,
             title=str(item.get("title") or ""),
             media_type=str(item.get("media_type") or ""),
-            season_number=_to_int(item.get("season_number")),
-            episode_number=_to_int(item.get("episode_number")),
+            season_number=season_number,
+            episode_number=episode_number,
             total_bytes=stat.st_size,
         )
         with self._lock:
@@ -865,6 +874,60 @@ class OnlineUploadService:
             self._tasks[task.id] = task
         self._executor.submit(self._run_task, task.id)
         return task.to_dict()
+
+    def _resolve_episode_target(
+        self,
+        item_type: str,
+        item_id: str,
+        media_type: str,
+        season_number: Optional[int],
+        episode_number: Optional[int],
+    ) -> Tuple[str, str, Optional[int], Optional[int]]:
+        """把「整部作品（vl）/ 整季（vs）」纠正到具体某一集（ve）
+
+        手动选片 / 搜索结果里如果选中了整部作品，电视剧的上传接口会返回 404。
+        这里有季/集号时用 Emos 目录树自动定位到 ve；定位不到就明确报错，
+        而不是让它去撞 404（电影仍然允许直接传 vl）。
+        """
+        if item_type not in {"vl", "vs"}:
+            return item_type, item_id, season_number, episode_number
+        if media_type == "movie":
+            return item_type, item_id, season_number, episode_number
+        if episode_number is None:
+            if media_type == "tv":
+                # 没有集号就没法定位到 ve，与其让它去撞 404，不如直接说清楚
+                raise ValueError(
+                    "电视剧必须选到具体某一集（ve）：当前选择的是整部作品/整季，"
+                    "请在「在线识别上传」中展开季/集后选择对应剧集"
+                )
+            return item_type, item_id, season_number, episode_number
+
+        try:
+            resolved = self.resolve_episode_from_tree(
+                self.get_client(), item_id, season_number, episode_number
+            )
+        except Exception as exc:
+            logger.debug("定位具体剧集失败: %s", exc)
+            resolved = None
+
+        if not resolved or not resolved.get("item_id"):
+            label = (
+                f"S{season_number if season_number is not None else '?'}"
+                f"E{episode_number}"
+            )
+            raise ValueError(
+                f"电视剧必须选到具体某一集（ve）：未在 Emos 目录树中找到 {label}，"
+                "请在「在线识别上传」中展开季/集后选择对应剧集"
+            )
+
+        resolved_season = _to_int(resolved.get("season_number"))
+        resolved_episode = _to_int(resolved.get("episode_number"))
+        return (
+            str(resolved.get("item_type") or "ve"),
+            str(resolved.get("item_id")),
+            resolved_season if resolved_season is not None else season_number,
+            resolved_episode if resolved_episode is not None else episode_number,
+        )
 
     def list_tasks(self) -> List[Dict[str, Any]]:
         """按创建时间倒序列出任务"""
