@@ -33,7 +33,12 @@ from urllib.parse import urljoin, urlsplit
 import requests
 from requests.adapters import HTTPAdapter
 
-from ..core.emos_client import EmosApiError, EmosClient, detect_video_mime
+from ..core.emos_client import (
+    VIDEO_MIME_TYPES,
+    EmosApiError,
+    EmosClient,
+    detect_video_mime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,16 +80,38 @@ TUS_MAX_CHUNK_SIZE = 100 * 1024 * 1024
 # 外挂字幕扩展名（与 Emos 字幕资源类型对应）
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt", ".sub"}
 
+# 字幕主名后面允许出现的分隔符：A.srt / A_track9_chi.ass / A-chi.ass / A chi.ass
+SUBTITLE_NAME_SEPARATORS = (".", "_", "-", " ")
+
+# 目录内可能出现的视频扩展名，用于判断字幕到底属于同目录中的哪个视频
+VIDEO_FILE_SUFFIXES = {ext.lower() for ext in VIDEO_MIME_TYPES}
+
+
+def _subtitle_owner(sub_stem: str, video_stems: Any) -> Optional[str]:
+    """判断字幕主名属于哪个视频主名（取最长匹配），无法归属时返回 None"""
+    owner: Optional[str] = None
+    for candidate in video_stems:
+        if not candidate:
+            continue
+        if sub_stem == candidate or any(
+            sub_stem.startswith(candidate + sep) for sep in SUBTITLE_NAME_SEPARATORS
+        ):
+            if owner is None or len(candidate) > len(owner):
+                owner = candidate
+    return owner
+
 
 def find_subtitle_files(video_path: Any) -> List[Path]:
-    """找出与视频同目录同名的外挂字幕
+    """找出与视频同目录同主名的外挂字幕
 
-    同时兼容两种常见写法：
+    支持多种常见后缀写法：
 
     * ``A.mkv`` -> ``A.srt`` / ``A.chs.srt`` / ``A.zh-Hans.ass``
-    * ``A.mkv`` -> ``A.mkv.srt``（字幕名直接跟着视频全名）
+    * ``A.mkv`` -> ``A.mkv.srt``（字幕直接跟着视频全名）
+    * ``A.mkv`` -> ``A_track9_chi.ass``（下划线/短横线分隔的轨道、语言标签）
 
-    会排除属于同目录其它视频的字幕，例如 ``A.ts.ass`` 不会被当成 ``A.m2ts`` 的字幕。
+    归属判定取同目录里能匹配上的「最长视频主名」，避免 ``A.ts.ass`` 被挂到 ``A.m2ts``，
+    或 ``A_2.ass`` 被挂到 ``A.mkv`` 上。
     """
     path = Path(video_path)
     directory = path.parent
@@ -97,6 +124,15 @@ def find_subtitle_files(video_path: Any) -> List[Path]:
         entries = sorted(directory.iterdir())
     except OSError:
         return []
+
+    video_stems = {stem}
+    for item in entries:
+        try:
+            if item.is_file() and item.suffix.lower() in VIDEO_FILE_SUFFIXES:
+                video_stems.add(item.stem)
+        except OSError:
+            continue
+
     matches: List[Path] = []
     for item in entries:
         try:
@@ -104,17 +140,16 @@ def find_subtitle_files(video_path: Any) -> List[Path]:
                 continue
         except OSError:
             continue
-        sub_stem = item.stem
-        if sub_stem == stem:
-            matches.append(item)
+        if _subtitle_owner(item.stem, video_stems) != stem:
             continue
-        if not sub_stem.startswith(stem + "."):
-            continue
-        # 去掉字幕扩展名后正好是同目录另一个文件的名字时，这份字幕属于那个文件：
-        # 例如 A.ts.ass 属于 A.ts，不应该挂到同目录的 A.m2ts 上。
-        # 而 A.mkv.srt 的 stem 正好是本视频的文件名，属于正常写法，要保留。
-        if sub_stem != path.name and (directory / sub_stem).is_file():
-            continue
+        # 同目录存在与字幕主名同名的文件时（如 A.ts.ass 对应 A.ts），
+        # 说明字幕属于那个文件，不应挂到本视频上
+        if item.stem != path.name:
+            try:
+                if (directory / item.stem).is_file():
+                    continue
+            except OSError:
+                pass
         matches.append(item)
     return matches
 
