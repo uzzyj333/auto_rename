@@ -101,6 +101,7 @@ async def list_downloaders():
         monitors = state.get_downloader_monitors()
         
         downloaders = []
+        seen_ids = set()
         for monitor in monitors:
             fallback_name = monitor.__class__.__name__.replace("Monitor", "").lower()
             monitor_id = getattr(monitor, "id", None) or fallback_name
@@ -121,6 +122,25 @@ async def list_downloaders():
                     info.status = f"error: {e}"
             
             downloaders.append(info)
+            seen_ids.add(str(monitor_id).lower())
+        
+        # 兜底：尚未创建监控器实例（例如仅 Web 模式）时直接按配置列出，
+        # 保证在线新增/修改的下载器也能立即在界面上看到
+        try:
+            for item in (state.get_config().get("downloaders") or []):
+                ident = str(item.get("id") or "").strip()
+                if not ident or ident.lower() in seen_ids:
+                    continue
+                seen_ids.add(ident.lower())
+                downloaders.append(DownloaderInfo(
+                    id=ident,
+                    name=str(item.get("name") or ident),
+                    type=str(item.get("type") or ident),
+                    connected=False,
+                    status="未监控",
+                ))
+        except Exception as e:
+            logger.warning(f"按配置补充下载器列表失败: {e}")
         
         return DownloaderListResponse(
             success=True,

@@ -4,6 +4,7 @@ const state = {
     status: null,
     currentTab: 'queued',
     logWebSocket: null,
+    currentLogFile: null,
     autoRefresh: null,
     initialized: false,
     recentPage: 1,
@@ -71,7 +72,8 @@ function cacheElements() {
     el.configEditor = document.getElementById('config-editor');
     el.reloadConfigBtn = document.getElementById('reloadConfigBtn');
     el.saveConfigBtn = document.getElementById('saveConfigBtn');
-    el.logFileSelect = document.getElementById('logFileSelect');
+    el.logLevelSelect = document.getElementById('logLevelSelect');
+    el.refreshLogBtn = document.getElementById('refreshLogBtn');
     el.logViewer = document.getElementById('logViewer');
     el.autoScrollCheck = document.getElementById('autoScrollCheck');
     el.liveLogCheck = document.getElementById('liveLogCheck');
@@ -143,7 +145,8 @@ function bindEvents() {
     });
     el.reloadConfigBtn.addEventListener('click', reloadConfig);
     el.saveConfigBtn.addEventListener('click', saveConfig);
-    el.logFileSelect.addEventListener('change', loadLogContent);
+    if (el.logLevelSelect) el.logLevelSelect.addEventListener('change', changeLogLevel);
+    if (el.refreshLogBtn) el.refreshLogBtn.addEventListener('click', loadLogContent);
     el.liveLogCheck.addEventListener('change', toggleLiveLog);
     el.browseFileBtn.addEventListener('click', browseFile);
     el.addToFileListBtn.addEventListener('click', addToFileList);
@@ -246,6 +249,7 @@ function switchPage(pageName) {
     });
     const sidebar = document.querySelector('.sidebar');
     if (sidebar) sidebar.classList.remove('show');
+    if (pageName === 'logs') loadLogFiles();
     if (pageName === 'downloaders') loadDownloaderConfigs();
     if (pageName === 'users') loadUsers();
     if (pageName === 'online') initOnlinePage(); else stopOnlinePolling();
@@ -465,6 +469,7 @@ let _dbRuntimeConfig = [];
 async function loadConfig() {
     try {
         state.config = await loadConfigFromApi();
+        syncLogLevelSelect();
         await loadDbConfigs();
         renderConfigEditor();
     setupConfigNav();
@@ -507,6 +512,7 @@ function setupConfigNav() {
             item.classList.add('active');
             _configCurrentSection = item.dataset.section;
             renderConfigEditor();
+            if (_configCurrentSection === '__downloaders') loadDownloaderConfigs();
         });
     });
 }
@@ -545,9 +551,14 @@ function renderIniConfigEditor(section) {
 
     let html = `<div class="config-section"><div class="config-section-title">${getSectionLabel(section)}</div><div class="config-grid">`;
     for (const [k, v] of Object.entries(config[section])) {
+        if (isFieldHidden(section, k)) continue;
         html += renderConfigField(section, k, v);
     }
-    html += `</div></div>`;
+    html += `</div>`;
+    if (section === 'logging') {
+        html += `<div class="config-hint" style="margin-top:12px;font-size:0.8125rem;color:var(--text-muted)">日志文件由系统自动维护，在「日志查看」页面可以直接查看，无需填写其他项。</div>`;
+    }
+    html += `</div>`;
     el.configEditor.innerHTML = html;
 
     document.querySelectorAll('#config-editor .toggle-track').forEach(track => {
@@ -562,24 +573,124 @@ function renderIniConfigEditor(section) {
     });
 }
 
+// ===== 配置项中文标签 =====
+// 各配置节的中文名称
+const SECTION_LABELS = {
+    monitoring: '监控配置', tmdb: 'TMDB 配置', naming: '命名规则',
+    processing: '处理配置', logging: '日志配置', emos: 'Emos 云盘',
+    online_upload: '在线识别上传', telegram: 'Telegram 通知与机器人',
+    guessit: 'GuessIt 解析', llm_fallback: 'LLM 兜底识别',
+    manual_rules: '手动规则', auth: '登录认证', downloaders: '下载器列表',
+    __downloaders: '下载器配置',
+};
+
+// 各配置项的中文含义
+const FIELD_LABELS = {
+    monitoring: {
+        watch_dir: '监控目录', output_dir: '输出目录', poll_interval: '轮询间隔（秒）',
+        supported_extensions: '支持的扩展名', use_polling: '启用轮询模式',
+        polling_interval: '轮询扫描间隔（秒）', path_mappings: '路径映射',
+        enable_directory_monitor: '启用目录监控', directory_watch_dir: '目录监控路径',
+        directory_output_dir: '目录监控输出目录', directory_organize_mode: '目录整理方式',
+        directory_scrape_metadata: '抓取元数据', directory_metadata_format: '元数据文件格式',
+        directory_polling_interval: '目录扫描间隔（秒）',
+    },
+    emos: {
+        auth_token: 'Emos 认证令牌', base_url: 'Emos 服务地址',
+        file_storage: '默认存储类型', file_storages: '可选存储类型',
+        chunk_size_mb: '分片大小（MB）', timeout: '请求超时（秒）',
+    },
+    online_upload: {
+        video_root: '视频根目录', probe_enabled: '上传前用 ffprobe 校验',
+        ffprobe_path: 'ffprobe 路径', path_type: '内部入库 path_type',
+    },
+    naming: {
+        tv_show_format: '电视剧命名模板', movie_format: '电影命名模板',
+        anime_format: '动漫命名模板', simple_format: '简单命名模板',
+    },
+    tmdb: {
+        api_key: 'TMDB API 密钥', language: '语言', region: '地区',
+        retry_count: '重试次数', timeout: '超时（秒）', base_url: 'API 地址',
+    },
+    processing: {
+        rename_only: '仅重命名（不上传）', copy_mode: '复制模式',
+        delete_original: '删除原始文件', delete_after_upload: '上传后删除源文件',
+        min_file_size: '最小文件大小', ignore_patterns: '忽略规则',
+        upload_targets: '上传目标', max_upload_workers: '最大并发上传数',
+    },
+    logging: {
+        log_level: '日志等级',
+    },
+    telegram: {
+        bot_token: '机器人 Token', chat_id: '会话 ID', enabled: '启用通知',
+        reply_enabled: '启用机器人回复修正', allowed_user_ids: '允许的用户 ID',
+        poll_timeout: '长轮询超时（秒）', channel_chat_id: '频道 ID',
+    },
+    llm_fallback: { enabled: '启用 LLM 兜底识别', max_concurrent: '最大并发数' },
+    llm_provider_1: { name: '名称', api_url: '接口地址', api_key: '密钥', model: '模型', enabled: '启用', weight: '权重', timeout: '超时（秒）', max_retries: '最大重试次数' },
+    llm_provider_2: { name: '名称', api_url: '接口地址', api_key: '密钥', model: '模型', enabled: '启用', weight: '权重', timeout: '超时（秒）', max_retries: '最大重试次数' },
+    llm_provider_3: { name: '名称', api_url: '接口地址', api_key: '密钥', model: '模型', enabled: '启用', weight: '权重', timeout: '超时（秒）', max_retries: '最大重试次数' },
+    guessit: { enabled: '启用 GuessIt 增强识别', prefer_guessit: '优先使用 GuessIt 结果' },
+    manual_rules: { enabled: '启用手动规则', normalize_symbols: '归一化规则符号', rules: '规则列表' },
+    auth: { enabled: '启用登录认证', username: '用户名', password: '密码' },
+    downloader: {
+        type: '下载器类型', name: '显示名称', host: '主机地址', port: '端口',
+        rpc_url: 'RPC 地址', secret: 'RPC 密钥', password: '密码', username: '用户名',
+        monitor_mode: '监控模式', path_mappings: '路径映射',
+        websocket_reconnect_delay: '断线重连延迟（秒）', enabled: '启用',
+    },
+};
+
+// 日志配置只保留「日志等级」，其余项由系统自动维护
+const HIDDEN_FIELDS = { logging: ['log_file', 'console_log', 'file_log', 'log_max_bytes', 'log_backup_count'] };
+
+// 需要下拉选择的配置项
+const FIELD_OPTIONS = {
+    'logging.log_level': ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+    'monitoring.directory_organize_mode': ['copy', 'move'],
+    'monitoring.directory_metadata_format': ['nfo', 'json', 'both'],
+    'emos.file_storage': ['internal', 'global', 'default', 'google_drive', 'zn_r2_upload'],
+    'downloader.type': ['aria2', 'qbittorrent'],
+    'downloader.monitor_mode': ['polling', 'websocket', 'webhook'],
+};
+
+function normalizeFieldSection(section) {
+    return section.startsWith('downloader.') ? 'downloader' : section;
+}
+
+function getFieldLabel(section, key) {
+    const group = FIELD_LABELS[normalizeFieldSection(section)] || {};
+    return group[key] || key;
+}
+
+function getFieldOptions(section, key) {
+    return FIELD_OPTIONS[`${section}.${key}`] || FIELD_OPTIONS[`${normalizeFieldSection(section)}.${key}`] || null;
+}
+
+function isFieldHidden(section, key) {
+    const hidden = HIDDEN_FIELDS[section] || [];
+    return hidden.includes(key);
+}
+
 function getSectionLabel(section) {
-    const labels = {
-        'monitoring': '监控配置', 'tmdb': 'TMDB 配置', 'naming': '命名规则',
-        'processing': '处理配置', 'logging': '日志配置',
-        'emos': 'Emos 云盘', 'online_upload': '在线识别上传',
-        'telegram': 'Telegram', 'guessit': 'GuessIt 解析',
-        'downloaders': '下载器列表',
-    };
-    return labels[section] || section;
+    if (SECTION_LABELS[section]) return SECTION_LABELS[section];
+    if (section.startsWith('downloader.')) return '下载器 · ' + section.slice('downloader.'.length);
+    return section;
 }
 
 function renderConfigField(section, key, value) {
     const inputId = `cfg-${section}-${key}`;
     const inputName = `${section}.${key}`;
+    const label = getFieldLabel(section, key);
+    const options = getFieldOptions(section, key);
     const isSecret = ['password','token','secret','api_key','apikey'].some(s => key.toLowerCase().includes(s));
 
     let inputHtml;
-    if (typeof value === 'boolean') {
+    if (options) {
+        const current = String(value);
+        inputHtml = `<select id="${inputId}" name="${inputName}">` + options.map(opt =>
+            `<option value="${escapeHtml(opt)}" ${opt === current ? 'selected' : ''}>${escapeHtml(opt)}</option>`).join('') + `</select>`;
+    } else if (typeof value === 'boolean') {
         inputHtml = `<div class="toggle-wrap">
             <div class="toggle-track ${value ? 'on' : ''}" data-for="${inputId}">
                 <div class="toggle-thumb"></div>
@@ -598,7 +709,7 @@ function renderConfigField(section, key, value) {
     }
 
     return `<div class="config-field">
-        <div class="config-field-label">${escapeHtml(key)} <code>${section}.${key}</code></div>
+        <div class="config-field-label" title="${escapeHtml(inputName)}"><span>${escapeHtml(label)}</span> <code>${escapeHtml(section)}.${escapeHtml(key)}</code></div>
         ${inputHtml}
     </div>`;
 }
@@ -609,6 +720,7 @@ function renderDbConfigEditor(section) {
         case '__release_groups': return renderReleaseGroups();
         case '__llm_providers': return renderLlmProviders();
         case '__runtime': return renderRuntimeConfig();
+        case '__downloaders': return renderDownloaderManager();
     }
 }
 
@@ -951,18 +1063,37 @@ async function saveConfig() {
 async function loadLogFiles() {
     try {
         const result = await loadLogFilesFromApi();
-        el.logFileSelect.innerHTML = '<option value="">选择日志文件</option>' +
-            (result.files || []).map(f => `<option value="${f}">${f}</option>`).join('');
-        if (result.current) {
-            el.logFileSelect.value = result.current;
-            loadLogContent();
+        const files = result.files || [];
+        // 自动选择最新日志文件，无需手动选择
+        state.currentLogFile = result.current || files[0] || null;
+        syncLogLevelSelect();
+        if (state.currentLogFile) {
+            await loadLogContent();
+        } else {
+            el.logViewer.innerHTML = '<div class="log-line" style="color:var(--text-muted)">暂无日志文件，稍后点击「刷新」重试</div>';
         }
     } catch (e) { if (!e.message.includes('登录已过期')) console.error('加载日志文件列表失败:', e); }
 }
 
+function syncLogLevelSelect() {
+    if (!el.logLevelSelect) return;
+    const level = (state.config && state.config.logging && state.config.logging.log_level) || 'INFO';
+    el.logLevelSelect.value = String(level).toUpperCase();
+}
+
+async function changeLogLevel() {
+    if (!el.logLevelSelect) return;
+    const level = el.logLevelSelect.value;
+    try {
+        await saveConfigToApi('logging', { log_level: level });
+        await loadConfig();
+        showToast(`日志等级已切换为 ${level}（立即生效）`, 'success');
+    } catch (e) { showToast(`设置日志等级失败: ${e.message}`, 'error'); }
+}
+
 async function loadLogContent() {
-    const filename = el.logFileSelect.value;
-    if (!filename) return;
+    const filename = state.currentLogFile;
+    if (!filename) { await loadLogFiles(); return; }
     try {
         const text = await loadLogContentFromApi(filename);
         el.logViewer.innerHTML = text.split('\n').map(line =>
@@ -973,8 +1104,8 @@ async function loadLogContent() {
 }
 
 function toggleLiveLog() {
-    const filename = el.logFileSelect.value;
-    if (!filename) return;
+    const filename = state.currentLogFile;
+    if (!filename) { el.liveLogCheck.checked = false; showToast('暂无日志文件', 'warning'); return; }
     if (el.liveLogCheck.checked) startLiveLog(filename);
     else stopLiveLog();
 }
@@ -1312,6 +1443,7 @@ async function loadDownloaderConfigs() {
                 return { section: k, id, type: section.type || deriveDownloaderType(id), ...section };
             });
         renderDownloaderConfigs(downloaders);
+        if (_configCurrentSection === '__downloaders') renderDownloaderManager();
     } catch (e) {
         if (!e.message.includes('登录已过期')) console.error('加载下载器配置失败:', e);
     }
@@ -1319,12 +1451,15 @@ async function loadDownloaderConfigs() {
 
 const RPC_PATHS = { aria2:'/jsonrpc', qbittorrent:'/api/v2', transmission:'/transmission/rpc', rtorrent:'/RPC2', deluge:'/json' };
 
-function renderDownloaderConfigs(downloaders) {
-    if (!downloaders.length) {
-        el.downloaderConfigList.innerHTML = `<tr><td colspan="7"><div class="empty-state"><p>暂无配置</p></div></td></tr>`;
-        return;
+let _downloaderConfigs = [];
+
+const DOWNLOADER_TABLE_HEAD = '<thead><tr><th>名称</th><th>类型</th><th>主机</th><th>端口</th><th>用户名</th><th>RPC 地址</th><th style="width:150px">操作</th></tr></thead>';
+
+function downloaderRowsHtml(downloaders) {
+    if (!downloaders || !downloaders.length) {
+        return '<tr><td colspan="7"><div class="empty-state"><p>暂无配置，点击「添加下载器」新增</p></div></td></tr>';
     }
-    el.downloaderConfigList.innerHTML = downloaders.map(d => {
+    return downloaders.map(d => {
         const name = d.name || d.id || d.section.replace('downloader.', '');
         const type = d.type || deriveDownloaderType(d.id);
         const host = d.host || '-';
@@ -1344,6 +1479,27 @@ function renderDownloaderConfigs(downloaders) {
             </div></td>
         </tr>`;
     }).join('');
+}
+
+function renderDownloaderConfigs(downloaders) {
+    _downloaderConfigs = downloaders || [];
+    const rows = downloaderRowsHtml(_downloaderConfigs);
+    if (el.downloaderConfigList) el.downloaderConfigList.innerHTML = rows;
+    const cfgList = document.getElementById('cfg-downloader-list');
+    if (cfgList) cfgList.innerHTML = rows;
+    const badge = document.getElementById('dlCount');
+    if (badge) badge.textContent = String(_downloaderConfigs.length);
+}
+
+// 在「配置管理 → 下载器配置」中在线增删改下载器
+function renderDownloaderManager() {
+    el.configEditor.innerHTML = `<div class="config-section"><div class="config-section-title">下载器配置</div>
+        <div style="margin-bottom:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <button class="add-btn" onclick="showAddDownloaderModal()">+ 添加下载器</button>
+            <span style="font-size:0.8125rem;color:var(--text-muted)">支持多个 aria2 实例（标识如 aria2、aria2_2），保存后立即生效，无需重启容器。</span>
+        </div>
+        <div class="config-table-wrap"><table class="config-table">${DOWNLOADER_TABLE_HEAD}<tbody id="cfg-downloader-list">${downloaderRowsHtml(_downloaderConfigs)}</tbody></table></div>
+    </div>`;
 }
 
 function editDownloaderConfig(data) {
