@@ -31,6 +31,14 @@ def _apply_runtime_config(config: Dict[str, Any]) -> None:
     except Exception as e:
         logger.warning(f"配置热更新同步到视频处理器失败: {e}")
 
+    # 日志等级在线生效（无需重启容器）：日志只需配置等级，控制台/文件输出始终开启
+    try:
+        from ...utils.logging_utils import setup_logging
+
+        setup_logging(config.get("logging") or {})
+    except Exception as e:
+        logger.warning(f"配置热更新同步到日志系统失败: {e}")
+
     # 下载器配置（含多个 aria2 实例）在线修改后立即生效，无需重启容器
     try:
         parent = getattr(handler, "_parent_monitor", None) if handler is not None else None
@@ -542,12 +550,9 @@ async def get_config_schema():
             }
         },
         "logging": {
-            "description": "日志配置",
+            "description": "日志配置（只需选择日志等级，日志文件由系统自动维护）",
             "fields": {
-                "level": "日志级别（DEBUG, INFO, WARNING, ERROR）",
-                "file": "日志文件路径",
-                "max_bytes": "单个日志文件最大大小",
-                "backup_count": "日志文件备份数量",
+                "log_level": "日志等级（DEBUG / INFO / WARNING / ERROR）",
             }
         },
         "emos": {
@@ -592,9 +597,16 @@ async def get_config_schema():
         "processing": {
             "description": "处理配置",
             "fields": {
-                "auto_upload": "是否自动上传",
-                "delete_after_upload": "上传后是否删除源文件",
-                "max_upload_workers": "最大上传工作线程数",
+                "upload_targets": "上传目标（固定为 emos）",
+                "delete_after_upload": "上传完成后是否删除源文件",
+                "max_upload_workers": "最大并发上传线程数（在线修改立即生效）",
+            }
+        },
+        "guessit": {
+            "description": "GuessIt 增强识别配置",
+            "fields": {
+                "enabled": "是否启用 GuessIt 增强识别",
+                "prefer_guessit": "是否优先使用 GuessIt 结果",
             }
         },
     }

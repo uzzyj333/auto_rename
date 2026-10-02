@@ -96,9 +96,9 @@ DEFAULT_CONFIG = {
     },
     "logging": {
         "log_level": "INFO",
-        "log_file": "",
+        "log_file": "video-organizer.log",
         "console_log": True,
-        "file_log": False,
+        "file_log": True,
     },
     "telegram": {
         "bot_token": "",  # Telegram Bot Token（@BotFather 获取）
@@ -300,13 +300,14 @@ def _config_to_dict(config: configparser.ConfigParser) -> Dict[str, Any]:
         if rules_list:
             logger.info(f"从配置文件加载了 {len(rules_list)} 条手动规则")
     
-    # 特殊处理命名规则
+    # 特殊处理命名规则：保留 naming 节（供在线配置界面展示），同时派生 naming_rules
     if "naming" in config_dict:
+        naming = config_dict["naming"]
         config_dict["naming_rules"] = {
-            "tv_show": config_dict["naming"].pop("tv_show_format"),
-            "movie": config_dict["naming"].pop("movie_format"),
-            "anime": config_dict["naming"].pop("anime_format"),
-            "simple": config_dict["naming"].pop("simple_format"),
+            "tv_show": naming.get("tv_show_format", ""),
+            "movie": naming.get("movie_format", ""),
+            "anime": naming.get("anime_format", ""),
+            "simple": naming.get("simple_format", ""),
         }
     
     # 特殊处理下载器配置（支持同一类型多个实例，如 downloader.aria2_1 / downloader.aria2_2）
@@ -409,12 +410,16 @@ def update_config(
     for section, options in config_dict.items():
         if not isinstance(options, dict):
             continue
-        # 特殊处理naming_rules
+        # 特殊处理naming_rules：以 naming 节为准（在线配置界面直接编辑 *_format）
         if section == "naming_rules":
             if "naming" not in config:
                 config["naming"] = {}
+            naming_section = config_dict.get("naming") or {}
             for key, value in options.items():
-                config["naming"][f"{key}_format"] = value
+                fmt_key = f"{key}_format"
+                if fmt_key in naming_section:
+                    value = naming_section[fmt_key]
+                config["naming"][fmt_key] = value
         else:
             config[section] = {}
             for key, value in options.items():

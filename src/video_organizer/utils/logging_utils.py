@@ -59,12 +59,12 @@ def setup_logging(config: Optional[Dict[str, Any]] = None) -> None:
     Args:
         config: 日志配置，包含log_level、log_file、console_log、file_log等
     """
-    # 默认配置
+    # 默认配置：日志只需配置等级，控制台与文件输出始终开启
     default_config = {
         "log_level": "INFO",
-        "log_file": "",
+        "log_file": "video-organizer.log",
         "console_log": True,
-        "file_log": False,
+        "file_log": True,
     }
 
     if config:
@@ -83,31 +83,28 @@ def setup_logging(config: Optional[Dict[str, Any]] = None) -> None:
     # 创建格式化器
     formatter = logging.Formatter(LOG_FORMAT, DATE_FORMAT)
 
-    # 添加控制台处理器
-    if default_config["console_log"]:
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(log_level)
-        console_handler.setFormatter(formatter)
-        root_logger.addHandler(console_handler)
+    # 控制台处理器（始终开启，日志只需配置等级）
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
 
-    # 添加文件处理器
-    if default_config["file_log"]:
-        # 统一使用固定日志目录内的文件名，避免主机/容器路径映射带来的问题
-        log_name = os.path.basename(str(default_config["log_file"] or "")) or "video-organizer.log"
-        log_file = str(get_log_dir() / log_name)
+    # 文件处理器（始终开启）：固定写入统一日志目录，日志查看页面可直接读取
+    log_name = os.path.basename(str(default_config["log_file"] or "")) or "video-organizer.log"
+    log_file = str(get_log_dir() / log_name)
 
-        try:
-            max_bytes = int(default_config.get("log_max_bytes", 10 * 1024 * 1024))
-            backup_count = int(default_config.get("log_backup_count", 5))
-            file_handler = logging.handlers.RotatingFileHandler(
-                log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
-            )
-            file_handler.setLevel(log_level)
-            file_handler.setFormatter(formatter)
-            root_logger.addHandler(file_handler)
-            root_logger.info(f"日志文件已设置: {log_file} (maxBytes={max_bytes}, backupCount={backup_count})")
-        except Exception as e:
-            print(f"设置日志文件失败: {e}")
+    try:
+        max_bytes = int(default_config.get("log_max_bytes", 10 * 1024 * 1024))
+        backup_count = int(default_config.get("log_backup_count", 5))
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+        )
+        file_handler.setLevel(log_level)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+        root_logger.info(f"日志文件已设置: {log_file} (maxBytes={max_bytes}, backupCount={backup_count})")
+    except Exception as e:
+        print(f"设置日志文件失败: {e}")
 
     # 抑制第三方库的日志
     logging.getLogger("httpx").setLevel(logging.WARNING)
