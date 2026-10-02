@@ -440,16 +440,30 @@ class OnlineUploadService:
                     "tmdb",
                     tmdb_type=tmdb_type,
                     season_number=season if tmdb_type == "tv" else None,
+                    episode_number=episode if tmdb_type == "tv" else None,
                 )
-                match = self._pick_match(payload, media_type)
+                match = self._pick_match(payload, media_type, season, episode)
+                if not match and tmdb_type == "tv":
+                    # getVideoId 没给到具体集时，用该剧的目录树兜底定位
+                    match = self.resolve_episode_from_tree(
+                        client, payload.get("item_id"), season, episode
+                    )
             if not match and title:
                 candidates = self.search_targets(
                     video_type="movie" if media_type == "movie" else ("tv" if media_type else None),
                     title=title,
                     todb_id=None,
                 )
-                # 没有 TMDB ID 时，用目录树候选自动定位季/集
+                # 没有 TMDB ID（或接口未返回具体集）时，用目录树候选自动定位季/集
                 match = self._pick_from_candidates(candidates, season, episode, media_type)
+            if not match and (media_type == "tv" or (media_type != "movie" and episode is not None)):
+                if episode is None:
+                    errors.append("未能从文件名解析出季/集号，无法定位到具体某一集")
+                else:
+                    errors.append(
+                        f"Emos 中没有「{title or tmdb_id}」S{season if season is not None else '?'}"
+                        f"E{episode} 这一集，请先在 Emos 建集，或在「在线识别上传」里手动选择目标"
+                    )
         except EmosApiError as exc:
             errors.append(str(exc))
         except Exception as exc:
@@ -479,13 +493,37 @@ class OnlineUploadService:
         }
 
     @staticmethod
-    def _pick_match(payload: Dict[str, Any], media_type: str) -> Optional[Dict[str, Any]]:
-        """从 getVideoId 返回结果中挑选最合适的上传目标"""
+    def _pick_match(
+        payload: Dict[str, Any],
+        media_type: str,
+        season: Optional[int] = None,
+        episode: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """从 getVideoId 返回结果中挑选最合适的上传目标
+
+        电视剧必须定位到具体某一集（ve）：季/集号对不上或接口未返回 episode_info 时返回 None，
+        由调用方改用目录树兜底或给出明确提示，绝不退回整部剧（vl）/整季（vs），
+        否则上传接口 /api/upload/video/base 会返回 404。
+        """
         if not isinstance(payload, dict):
             return None
 
+        # 只要不是电影且能确定集号，就按电视剧处理，必须定位到具体某一集
+        is_tv = payload.get("video_type") == "tv" or (
+            media_type != "movie" and episode is not None
+        )
+
         episode_info = payload.get("episode_info") or {}
         if isinstance(episode_info, dict) and episode_info.get("item_id"):
+            if is_tv:
+                got_episode = _to_int(episode_info.get("episode_number"))
+                got_season = _to_int(episode_info.get("season_number"))
+                if episode is None or got_episode is None or got_episode != episode:
+                    return None
+                if season is not None and got_season is not None and got_season != season:
+                    return None
+                if str(episode_info.get("item_type") or "ve") != "ve":
+                    return None
             return {
                 "item_type": episode_info.get("item_type") or "ve",
                 "item_id": str(episode_info.get("item_id")),
@@ -503,6 +541,10 @@ class OnlineUploadService:
                     "label": payload.get("title") or payload.get("video_list_name") or "",
                     "kind": "movie",
                 }
+
+        # 电视剧找不到具体某一集时不再退回整季/整剧，避免上传到错误目标
+        if is_tv:
+            return None
 
         season_info = payload.get("season_info") or {}
         if isinstance(season_info, dict) and season_info.get("item_id"):
@@ -522,6 +564,30 @@ class OnlineUploadService:
                 "kind": "video",
             }
         return None
+
+    @staticmethod
+    def resolve_episode_from_tree(
+        client: EmosClient,
+        vl_id: Any,
+        season: Optional[int],
+        episode: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        """getVideoId 未返回 episode_info 时，用视频目录树兜底定位具体某一集（ve）"""
+        if not vl_id or episode is None:
+            return None
+        try:
+            tree = client.get_video_tree(video_id=vl_id)
+        except Exception as exc:
+            logger.debug("Emos 目录树兜底查询失败: %s", exc)
+            return None
+        narrowed = [
+            item
+            for item in (tree or [])
+            if isinstance(item, dict) and str(item.get("item_id")) == str(vl_id)
+        ]
+        return OnlineUploadService._pick_from_candidates(
+            narrowed or tree, season, episode, "tv"
+        )
 
     @staticmethod
     def _pick_from_candidates(

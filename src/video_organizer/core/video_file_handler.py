@@ -267,13 +267,42 @@ class VideoFileHandler:
         self.logger.info("配置已在线热更新（无需重启容器）")
 
     @staticmethod
-    def _pick_emos_match(payload: Dict[str, Any], media_type: str) -> Optional[Dict[str, Any]]:
-        """从 Emos getVideoId 返回结果中挑选最合适的上传目标"""
+    def _pick_emos_match(
+        payload: Dict[str, Any],
+        media_type: str,
+        season: Optional[int] = None,
+        episode: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """从 Emos getVideoId 返回结果中挑选最合适的上传目标
+
+        电视剧必须定位到具体某一集（ve）：季/集号对不上或接口未返回 episode_info 时返回 None，
+        绝不退回整部剧（vl）/整季（vs），否则上传接口会返回 404。
+        """
         if not isinstance(payload, dict):
             return None
 
+        # 只要不是电影且能确定集号，就按电视剧处理，必须定位到具体某一集
+        is_tv = payload.get("video_type") == "tv" or (
+            media_type != "movie" and episode is not None
+        )
+
         episode_info = payload.get("episode_info") or {}
         if isinstance(episode_info, dict) and episode_info.get("item_id"):
+            if is_tv:
+                try:
+                    got_episode = int(episode_info.get("episode_number"))
+                except (TypeError, ValueError):
+                    got_episode = None
+                try:
+                    got_season = int(episode_info.get("season_number"))
+                except (TypeError, ValueError):
+                    got_season = None
+                if episode is None or got_episode is None or got_episode != episode:
+                    return None
+                if season is not None and got_season is not None and got_season != season:
+                    return None
+                if str(episode_info.get("item_type") or "ve") != "ve":
+                    return None
             return {
                 "item_type": episode_info.get("item_type") or "ve",
                 "item_id": str(episode_info.get("item_id")),
@@ -291,6 +320,10 @@ class VideoFileHandler:
                     "label": payload.get("title") or payload.get("video_list_name") or "",
                     "kind": "movie",
                 }
+
+        # 电视剧找不到具体某一集时不再退回整季/整剧，避免上传到错误目标
+        if is_tv:
+            return None
 
         season_info = payload.get("season_info") or {}
         if isinstance(season_info, dict) and season_info.get("item_id"):
@@ -310,6 +343,28 @@ class VideoFileHandler:
                 "kind": "video",
             }
         return None
+
+    def _notify_match_error(self, file_path, title, media_type, season, episode, reason):
+        """识别不到 Emos 上传目标时推送 Telegram 报错，便于用户回复修正"""
+        try:
+            from .telegram_bot import TelegramBotService
+
+            TelegramBotService.instance().notify_error(
+                {
+                    "file_path": str(file_path),
+                    "file_name": os.path.basename(str(file_path)),
+                    "title": title,
+                    "media_type": media_type,
+                    "season_number": season,
+                    "episode_number": episode,
+                    "storage": getattr(self, "emos_file_storage", None),
+                },
+                reason,
+                header="未找到 Emos 上传目标",
+            )
+        except Exception as exc:
+            self.logger.debug("推送 Telegram 报错信息失败: %s", exc)
+
     def add_downloader(self, downloader):
         """
         添加下载器实例
@@ -785,6 +840,7 @@ class VideoFileHandler:
             # 初始化匹配结果
             matched_item_id = None
             matched_item_type = None
+            match_error = ""
 
             # 第二步：通过官方 API 在线识别（TMDB ID -> Emos item_type/item_id）
             if tmdb_id and media_type and title:
@@ -807,9 +863,17 @@ class VideoFileHandler:
                             "tmdb",
                             tmdb_type="movie" if media_type == "movie" else "tv",
                             season_number=season_num if media_type == "tv" else None,
+                            episode_number=episode_num if media_type == "tv" else None,
                         )
                         print(f"[线程#{worker_id}] Emos 识别返回: {result2}")
-                        match = self._pick_emos_match(result2, media_type)
+                        match = self._pick_emos_match(result2, media_type, season_num, episode_num)
+                        if not match and media_type == "tv":
+                            # getVideoId 没给到具体某一集时，用该剧目录树兜底定位
+                            from .online_upload import OnlineUploadService
+
+                            match = OnlineUploadService.resolve_episode_from_tree(
+                                emos_client, result2.get("item_id"), season_num, episode_num
+                            )
                         if match:
                             matched_item_id = match["item_id"]
                             matched_item_type = match["item_type"]
@@ -817,8 +881,28 @@ class VideoFileHandler:
                                 f"✓ [线程#{worker_id}] 在线识别成功: "
                                 f"{matched_item_type}/{matched_item_id} {match.get('label') or ''}"
                             )
+                        elif media_type == "tv":
+                            if episode_num is None:
+                                match_error = (
+                                    f"未能从文件名解析出「{title}」的季/集号，无法定位到具体某一集，"
+                                    "请在 Telegram 回复本条报错修正目标"
+                                )
+                            else:
+                                match_error = (
+                                    f"Emos 中没有「{title}」"
+                                    f"S{season_num if season_num is not None else '?'}E{episode_num} 这一集，"
+                                    "请先在 Emos 建集，或在 Telegram 回复本条报错修正目标"
+                                )
+                            console_log(f"✗ [线程#{worker_id}] {match_error}")
+                            self._notify_match_error(
+                                file_path, title, media_type, season_num, episode_num, match_error
+                            )
                     except Exception as e:
-                        console_log(f"✗ [线程#{worker_id}] Emos 在线识别失败: {e}")
+                        match_error = f"Emos 在线识别失败: {e}"
+                        console_log(f"✗ [线程#{worker_id}] {match_error}")
+                        self._notify_match_error(
+                            file_path, title, media_type, season_num, episode_num, match_error
+                        )
 
             # 步骤4：决定是否需要上传
             if matched_item_id:
@@ -835,7 +919,7 @@ class VideoFileHandler:
                 )
             else:
                 # 未识别到 Emos 条目：可在「在线识别上传」页面手动选择目标后上传
-                reason = "未找到匹配的 Emos 条目（item_id），可在「在线识别上传」中手动选择目标"
+                reason = match_error or "未找到匹配的 Emos 条目（item_id），可在「在线识别上传」中手动选择目标"
                 self._failed_files[file_path] = reason
                 record_task(file_path, "failed", error_message=reason, end_time=datetime.now())
                 log_success(

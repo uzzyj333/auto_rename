@@ -19,6 +19,7 @@ import logging
 import os
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -67,13 +68,24 @@ class EmosApiError(RuntimeError):
 
 
 def normalize_base_url(base_url: str) -> str:
-    """规范化 Emos 服务地址"""
+    """规范化 Emos 服务地址
+
+    允许用户填写站点根地址（如 https://emos.best）；如果误填了结尾的 /api
+    （官方 Postman 里的 {{url}} 习惯带 /api），这里会自动去掉，
+    避免拼成 /api/api/... 导致 404。
+    """
     base = str(base_url or "https://emos.best").strip().rstrip("/")
     if not base:
         base = "https://emos.best"
     if not base.startswith(("http://", "https://")):
         base = "https://" + base
-    return base
+    parts = urlsplit(base)
+    path = parts.path.rstrip("/")
+    if path.lower().endswith("/api"):
+        path = path[: -len("/api")].rstrip("/")
+    if path != parts.path.rstrip("/"):
+        base = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+    return base.rstrip("/") or base
 
 
 def detect_video_mime(file_name: str, resource_type: str = "video") -> str:
