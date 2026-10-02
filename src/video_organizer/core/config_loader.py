@@ -63,6 +63,7 @@ DEFAULT_CONFIG = {
         "file_storage": "internal",  # internal / global / default / google_drive / zn_r2_upload
         "file_storages": "internal,default,google_drive,zn_r2_upload",  # 在线上传页面可选的存储列表
         "chunk_size_mb": 50,
+        "upload_concurrency": 4,  # 分片并发上传数（1-16）
         "timeout": 60,
     },
     "online_upload": {

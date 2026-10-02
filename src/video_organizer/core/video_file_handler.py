@@ -193,6 +193,10 @@ class VideoFileHandler:
             self.emos_chunk_size_mb = int(emos.get("chunk_size_mb", 50))
         except (TypeError, ValueError):
             self.emos_chunk_size_mb = 50
+        try:
+            self.emos_upload_concurrency = int(emos.get("upload_concurrency", 4))
+        except (TypeError, ValueError):
+            self.emos_upload_concurrency = 4
 
     def _build_emos_client(self) -> None:
         """构建 Emos 官方 API 客户端（用于在线识别）"""
@@ -1007,6 +1011,7 @@ class VideoFileHandler:
                 auth_token=self.emos_auth_token,
                 base_url=self.emos_base_url,
                 chunk_size_mb=int(self.emos_chunk_size_mb),
+                upload_concurrency=int(self.emos_upload_concurrency),
                 telegram_config=self.telegram_config,
             )
             try:

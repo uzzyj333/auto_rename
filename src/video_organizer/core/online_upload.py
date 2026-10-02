@@ -891,6 +891,7 @@ class OnlineUploadService:
                 auth_token=self._token(),
                 base_url=self._base_url(),
                 chunk_size_mb=int(emos.get("chunk_size_mb") or 50),
+                upload_concurrency=int(emos.get("upload_concurrency") or 4),
                 telegram_config=self._config.get("telegram") or {},
                 progress_callback=on_progress,
             )

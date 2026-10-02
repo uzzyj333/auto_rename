@@ -20,7 +20,9 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlsplit
@@ -40,6 +42,9 @@ DEFAULT_CHUNK_MB = 50
 MIN_CHUNK_MB = 10
 MAX_CHUNK_MB = 200
 MAX_PARTS = 1000
+DEFAULT_UPLOAD_CONCURRENCY = 4
+MIN_UPLOAD_CONCURRENCY = 1
+MAX_UPLOAD_CONCURRENCY = 16
 
 
 def _report_upload_progress(
@@ -96,6 +101,31 @@ def format_speed(bytes_per_second: float) -> str:
     return f"{format_size(speed)}/s"
 
 
+def format_time(seconds: float) -> str:
+    """格式化时间（用于「已用时间 / 剩余时间」显示）"""
+    try:
+        value = max(float(seconds), 0.0)
+    except (TypeError, ValueError):
+        return "-"
+    if value < 60:
+        return f"{value:.1f}秒"
+    if value < 3600:
+        return f"{int(value // 60)}分{value % 60:.1f}秒"
+    hours = int(value // 3600)
+    minutes = int((value % 3600) // 60)
+    return f"{hours}时{minutes}分{value % 60:.1f}秒"
+
+
+def progress_bar(progress: float, length: int = 20) -> str:
+    """生成进度条（█ 已完成 / ░ 未完成）"""
+    try:
+        ratio = max(0.0, min(1.0, float(progress) / 100.0))
+    except (TypeError, ValueError):
+        ratio = 0.0
+    filled = int(round(length * ratio))
+    return "█" * filled + "░" * (length - filled)
+
+
 class RobustEmosVideoUploader:
     """Emos 视频上传器"""
 
@@ -104,6 +134,7 @@ class RobustEmosVideoUploader:
         auth_token: str,
         base_url: str = "https://emos.best",
         chunk_size_mb: int = DEFAULT_CHUNK_MB,
+        upload_concurrency: int = DEFAULT_UPLOAD_CONCURRENCY,
         telegram_config: Optional[Dict[str, Any]] = None,
         timeout: int = 60,
         max_retries: int = 3,
@@ -128,6 +159,13 @@ class RobustEmosVideoUploader:
         except (TypeError, ValueError):
             chunk = DEFAULT_CHUNK_MB
         self.chunk_size_mb = max(MIN_CHUNK_MB, min(MAX_CHUNK_MB, chunk))
+        try:
+            concurrency = int(upload_concurrency)
+        except (TypeError, ValueError):
+            concurrency = DEFAULT_UPLOAD_CONCURRENCY
+        self.upload_concurrency = max(
+            MIN_UPLOAD_CONCURRENCY, min(MAX_UPLOAD_CONCURRENCY, concurrency)
+        )
         self.timeout = int(timeout or 60)
         self.max_retries = max(1, int(max_retries or 1))
         self.progress_callback = progress_callback
@@ -138,6 +176,10 @@ class RobustEmosVideoUploader:
         self._tg_message_id: Optional[int] = None
         self._tg_last_update = 0.0
         self._tg_interval = 3.0
+        # 进度上下文（用于 Telegram 进度消息中的分片 / 速度 / 剩余时间）
+        self._progress_started_at = 0.0
+        self._progress_parts_done = 0
+        self._progress_total_parts = 0
         self.last_error: str = ""  # 最近一次失败原因（供调用方展示 / 报错通知使用）
 
     def close(self) -> None:
@@ -182,6 +224,9 @@ class RobustEmosVideoUploader:
         file_size = path.stat().st_size
         file_name = path.name
         started_at = time.time()
+        self._progress_started_at = started_at
+        self._progress_parts_done = 0
+        self._progress_total_parts = 0
         self._report(str(path), file_name, 0, 0, file_size, "", "uploading")
 
         try:
@@ -299,29 +344,41 @@ class RobustEmosVideoUploader:
         if not by_number:
             raise EmosApiError("获取分片上传凭证失败: 未返回任何分片")
 
+        total_parts = len(by_number)
+        workers = max(1, min(self.upload_concurrency, total_parts))
+        logger.info("分片上传并发数: %d", workers)
+
         parts: List[Dict[str, Any]] = []
         uploaded_bytes = 0
         started_at = time.time()
+        lock = threading.Lock()
+        self._progress_started_at = started_at
+        self._progress_total_parts = total_parts
+        self._progress_parts_done = 0
 
-        with open(path, "rb") as handle:
-            for part_number in sorted(by_number):
-                item = by_number[part_number]
-                offset = (part_number - 1) * part_size
-                length = min(part_size, file_size - offset)
-                if length <= 0:
-                    continue
-                upload_url = item.get("upload_url") or item.get("url")
-                if not upload_url:
-                    raise EmosApiError(f"分片 {part_number} 缺少上传地址")
+        def upload_one(
+            part_number: int, item: Dict[str, Any]
+        ) -> Optional[Dict[str, Any]]:
+            """上传单个分片（每个分片独立打开文件，避免多线程共用句柄）"""
+            nonlocal uploaded_bytes
+            offset = (part_number - 1) * part_size
+            length = min(part_size, file_size - offset)
+            if length <= 0:
+                return None
+            upload_url = item.get("upload_url") or item.get("url")
+            if not upload_url:
+                raise EmosApiError(f"分片 {part_number} 缺少上传地址")
 
+            with open(path, "rb") as handle:
                 handle.seek(offset)
                 payload = handle.read(length)
-                etag = self._put_part(
-                    upload_url, payload, length, part_number, number, file_type
-                )
-                parts.append({"number": part_number, "etag": etag})
+            etag = self._put_part(
+                upload_url, payload, length, part_number, number, file_type
+            )
 
+            with lock:
                 uploaded_bytes += length
+                self._progress_parts_done += 1
                 progress = 10 + 85 * (uploaded_bytes / file_size) if file_size else 95
                 elapsed = max(time.time() - started_at, 0.001)
                 self._report(
@@ -333,6 +390,31 @@ class RobustEmosVideoUploader:
                     format_speed(uploaded_bytes / elapsed),
                     "uploading",
                 )
+            return {"number": part_number, "etag": etag}
+
+        ordered = sorted(by_number)
+        if workers == 1:
+            for part_number in ordered:
+                result = upload_one(part_number, by_number[part_number])
+                if result:
+                    parts.append(result)
+        else:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="emos-part"
+            ) as pool:
+                futures = [
+                    pool.submit(upload_one, part_number, by_number[part_number])
+                    for part_number in ordered
+                ]
+                try:
+                    for future in as_completed(futures):
+                        result = future.result()
+                        if result:
+                            parts.append(result)
+                except Exception:
+                    for future in futures:
+                        future.cancel()
+                    raise
 
         if not parts:
             raise EmosApiError("没有可用的分片数据")
@@ -425,6 +507,9 @@ class RobustEmosVideoUploader:
 
         offset = 0
         started_at = time.time()
+        self._progress_started_at = started_at
+        self._progress_total_parts = 0
+        self._progress_parts_done = 0
         for _ in range(5):
             status, headers = self._put_google_range(upload_url, path, offset, file_size, started_at)
             if 200 <= status < 300:
@@ -569,11 +654,45 @@ class RobustEmosVideoUploader:
         elif status == "failed":
             text = f"❌ Emos 上传失败\n文件: `{file_name}`\n原因: {error or '未知错误'}"
         else:
-            text = (
-                f"📤 Emos 上传中\n文件: `{file_name}`\n"
-                f"进度: {progress:.1f}% ({format_size(uploaded)}/{format_size(total)})\n速度: {speed or '-'}"
-            )
+            text = self._progress_text(file_name, progress, uploaded, total)
         self._tg_finish(None, None, text=text)
+
+    def _progress_text(
+        self, file_name: str, progress: float, uploaded: int, total: int
+    ) -> str:
+        """构建 Telegram 上传进度文本（进度条 + 分片 + 速度 + 剩余时间）"""
+        uploaded = max(0, int(uploaded))
+        total = max(0, int(total))
+        elapsed = (
+            max(time.time() - self._progress_started_at, 0.001)
+            if self._progress_started_at
+            else 0.0
+        )
+        average_speed = uploaded / elapsed if elapsed > 0 else 0.0
+        remaining = max(total - uploaded, 0)
+        remaining_time = remaining / average_speed if average_speed > 0 else 0.0
+
+        lines = [
+            "📤 *上传进度*",
+            "",
+            f"文件: `{file_name}`",
+            f"进度: {progress:.1f}%",
+            f"[{progress_bar(progress)}]",
+            "",
+        ]
+        if self._progress_total_parts > 0:
+            lines.append(
+                f"分片: {self._progress_parts_done}/{self._progress_total_parts}"
+            )
+        lines.extend(
+            [
+                f"已上传: {format_size(uploaded)}",
+                f"平均速度: {format_speed(average_speed)}",
+                f"已用时间: {format_time(elapsed)}",
+                f"剩余时间: {format_time(remaining_time)}",
+            ]
+        )
+        return "\n".join(lines)
 
     def _tg_finish(self, file_name, title, text: Optional[str] = None, error: Optional[str] = None) -> None:
         if not self.tg_bot_token or not self.tg_chat_id:
