@@ -18,6 +18,7 @@ from .renamer import VideoRenamer
 from .tmdb_client import TMDBClient
 from .subtitle_handler import SubtitleHandler
 from .downloader_monitor import decode_file_path
+from .config_loader import normalize_extensions, normalize_path_mappings
 from ..utils.logging_utils import get_logger, log_success, log_failure, log_exception
 from ..database.operations import record_task
 from ..database.session import init_db as init_task_db
@@ -241,12 +242,12 @@ class VideoFileHandler:
             self.emos_config = config.get("emos") or {}
             monitoring = config.get("monitoring") or {}
             if monitoring.get("path_mappings"):
-                self.path_mappings = monitoring["path_mappings"]
+                # Web 端表单保存的是字符串，必须归一化成字典，否则后续
+                # ``self.path_mappings.items()`` 会抛 'str' object has no attribute 'items'
+                self.path_mappings = normalize_path_mappings(monitoring["path_mappings"])
             extensions = monitoring.get("supported_extensions")
             if extensions:
-                normalized = [
-                    str(ext).strip().lower() for ext in extensions if str(ext).strip()
-                ]
+                normalized = normalize_extensions(extensions)
                 if normalized:
                     self.supported_extensions = normalized
                     self.logger.info(
@@ -1266,6 +1267,13 @@ class VideoFileHandler:
 
         print(f"检测到文件: {file_path}")
 
+        # 字幕文件绝不能当成视频上传（会把 .ass/.srt 传给 Emos 的 video/save），
+        # 手动处理 / --process 一律走字幕处理逻辑：找同名视频后重命名归档
+        if self._is_subtitle_file(file_path):
+            self.logger.info(f"强制处理: 识别为字幕文件，按字幕逻辑处理: {file_path}")
+            console_log(f"\n📄 字幕文件，按字幕逻辑处理: {os.path.basename(file_path)}")
+            return self._process_subtitle_file(file_path)
+
         # 即使文件已上传，强制模式可能希望重试，所以我们尝试从已上传集合中移除它
         if file_path in self._uploaded_files:
             self._uploaded_files.discard(file_path)
@@ -1348,7 +1356,8 @@ class VideoFileHandler:
         Returns:
             下载器使用的文件路径
         """
-        if not self.path_mappings:
+        path_mappings = normalize_path_mappings(self.path_mappings)
+        if not path_mappings:
             print("DEBUG: path_mappings 为空，跳过反向映射")
             return file_path
 
@@ -1358,7 +1367,7 @@ class VideoFileHandler:
         print(f"DEBUG: 尝试反向映射路径: {file_path}")
         print(f"DEBUG: 当前映射配置: {self.path_mappings}")
 
-        for downloader_path, local_path in self.path_mappings.items():
+        for downloader_path, local_path in path_mappings.items():
             # 规范化本地映射路径
             local_path = local_path.replace("\\", "/")
 
@@ -1403,6 +1412,12 @@ class VideoFileHandler:
         None  = 该文件与下载器无关，直接删除文件
         """
         if not self._is_downloader_tracked(file_path):
+            # 没建立映射（在线手动上传、监控器重启后上传）也要尽力删掉下载器里的
+            # 完成任务，否则会出现「资源已上传并删除，下载器任务却还留着」
+            try:
+                self._cleanup_download_task(file_path)
+            except Exception as e:
+                self.logger.debug(f"尽力删除下载器任务失败: {file_path}, 错误: {e}")
             return None
         return self._cleanup_download_task(file_path)
 
