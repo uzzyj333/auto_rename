@@ -23,10 +23,11 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import requests
 
-from ..core.emos_client import EmosApiError, EmosClient
+from ..core.emos_client import EmosApiError, EmosClient, detect_video_mime
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,11 @@ class RobustEmosVideoUploader:
         )
         self.session = self.client.session
         self.base_url = self.client.base_url
+        # 直传对象存储 / Google Drive 时必须使用「干净」的会话：
+        # Emos 的 Authorization / origin / referer 等头一旦带到预签名 URL 上，
+        # 对象存储会认为同时提供了两种鉴权方式（Authorization 头 + 签名查询参数），
+        # 从而直接返回 HTTP 400，表现为「分片 1/N 上传失败: HTTP 400」。
+        self.storage_session = requests.Session()
         try:
             chunk = int(chunk_size_mb)
         except (TypeError, ValueError):
@@ -133,6 +139,14 @@ class RobustEmosVideoUploader:
         self._tg_last_update = 0.0
         self._tg_interval = 3.0
         self.last_error: str = ""  # 最近一次失败原因（供调用方展示 / 报错通知使用）
+
+    def close(self) -> None:
+        """释放底层会话"""
+        try:
+            self.storage_session.close()
+        except Exception:
+            pass
+        self.client.close()
 
     # ------------------------------------------------------------------
     # 对外接口
@@ -259,6 +273,19 @@ class RobustEmosVideoUploader:
             number = max(1, math.ceil(file_size / part_size))
 
         presigns = self.client.multipart_presign(file_id, number)
+        file_type = detect_video_mime(path.name, "video")
+        if presigns and isinstance(presigns[0], dict):
+            first = presigns[0]
+            host = urlsplit(
+                str(first.get("upload_url") or first.get("url") or "")
+            ).netloc
+            if host:
+                logger.info(
+                    "分片上传目标: %s（共 %d 片，每片 %s）",
+                    host,
+                    number,
+                    format_size(part_size),
+                )
         by_number: Dict[int, Dict[str, Any]] = {}
         for index, item in enumerate(presigns):
             if not isinstance(item, dict):
@@ -289,7 +316,9 @@ class RobustEmosVideoUploader:
 
                 handle.seek(offset)
                 payload = handle.read(length)
-                etag = self._put_part(upload_url, payload, length, part_number, number)
+                etag = self._put_part(
+                    upload_url, payload, length, part_number, number, file_type
+                )
                 parts.append({"number": part_number, "etag": etag})
 
                 uploaded_bytes += length
@@ -311,16 +340,28 @@ class RobustEmosVideoUploader:
         parts.sort(key=lambda part: part["number"])
         self.client.multipart_complete(file_id, parts)
 
-    def _put_part(self, upload_url: str, payload: bytes, length: int, part_number: int, total_parts: int) -> str:
-        """上传单个分片，返回 ETag"""
+    def _put_part(
+        self,
+        upload_url: str,
+        payload: bytes,
+        length: int,
+        part_number: int,
+        total_parts: int,
+        content_type: str,
+    ) -> str:
+        """上传单个分片，返回 ETag
+
+        预签名 URL 只能使用干净会话（``storage_session``）：带上 Emos 的
+        ``Authorization`` 头会被对象存储判定为「同时使用两种鉴权方式」而返回 400。
+        """
         headers = {
             "Content-Length": str(length),
-            "Content-Type": "application/octet-stream",
+            "Content-Type": content_type,
         }
         last_error: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = self.session.put(
+                response = self.storage_session.put(
                     upload_url,
                     data=payload,
                     headers=headers,
@@ -341,6 +382,7 @@ class RobustEmosVideoUploader:
                     or response.headers.get("etag")
                     or ""
                 ).strip().strip('"')
+                body = "" if 200 <= status < 300 else self._response_snippet(response)
             finally:
                 try:
                     response.close()
@@ -352,13 +394,25 @@ class RobustEmosVideoUploader:
                     raise EmosApiError(f"分片 {part_number}/{total_parts} 响应缺少 ETag")
                 return etag
 
-            last_error = EmosApiError(f"分片 {part_number}/{total_parts} 上传失败: HTTP {status}")
+            detail = f" - {body}" if body else ""
+            last_error = EmosApiError(
+                f"分片 {part_number}/{total_parts} 上传失败: HTTP {status}{detail}"
+            )
             if status in {408, 425, 429, 500, 502, 503, 504} and attempt < self.max_retries:
                 time.sleep(min(attempt, 5))
                 continue
             raise last_error
 
         raise EmosApiError(f"分片 {part_number}/{total_parts} 上传失败: {last_error}")
+
+    @staticmethod
+    def _response_snippet(response: requests.Response, limit: int = 300) -> str:
+        """截取响应体用于报错（对象存储返回的 XML/JSON 错误信息）"""
+        try:
+            raw = response.content[:limit]
+        except Exception:
+            return ""
+        return raw.decode("utf-8", "replace").strip()
 
     # ------------------------------------------------------------------
     # Google Drive 直传（支持断点续传）
@@ -381,7 +435,9 @@ class RobustEmosVideoUploader:
                     raise EmosApiError("Google Drive 上传中断，且未返回有效断点")
                 offset = next_offset
                 continue
-            raise EmosApiError(f"Google Drive 上传失败: HTTP {status}")
+            body = str(headers.get("Body") or "")
+            detail = f" - {body}" if body else ""
+            raise EmosApiError(f"Google Drive 上传失败: HTTP {status}{detail}")
 
         raise EmosApiError("Google Drive 上传多次中断，已放弃")
 
@@ -418,7 +474,7 @@ class RobustEmosVideoUploader:
                 ),
             )
             try:
-                response = self.session.put(
+                response = self.storage_session.put(
                     upload_url,
                     data=reader,
                     headers=headers,
@@ -427,11 +483,18 @@ class RobustEmosVideoUploader:
             except requests.exceptions.RequestException as exc:
                 raise EmosApiError(f"Google Drive 上传失败: {exc}") from exc
             try:
+                status = response.status_code
+                body = (
+                    ""
+                    if 200 <= status < 300 or status == 308
+                    else self._response_snippet(response)
+                )
                 payload = {
                     "Location": response.headers.get("Location", ""),
                     "Range": response.headers.get("Range", ""),
+                    "Body": body,
                 }
-                return response.status_code, payload
+                return status, payload
             finally:
                 try:
                     response.close()

@@ -1009,13 +1009,16 @@ class VideoFileHandler:
                 chunk_size_mb=int(self.emos_chunk_size_mb),
                 telegram_config=self.telegram_config,
             )
-            upload_result = uploader.upload_video(
-                file_path,
-                matched_item_type,
-                str(matched_item_id),
-                self.emos_file_storage,
-                metadata=file_metadata,
-            )
+            try:
+                upload_result = uploader.upload_video(
+                    file_path,
+                    matched_item_type,
+                    str(matched_item_id),
+                    self.emos_file_storage,
+                    metadata=file_metadata,
+                )
+            finally:
+                uploader.close()
 
             if not upload_result:
                 reason = "Emos 上传失败"

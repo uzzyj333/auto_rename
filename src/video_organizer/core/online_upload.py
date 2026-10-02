@@ -894,14 +894,17 @@ class OnlineUploadService:
                 telegram_config=self._config.get("telegram") or {},
                 progress_callback=on_progress,
             )
-            self._update_task(task_id, stage="获取上传凭证")
-            result = uploader.upload_video(
-                snapshot["file_path"],
-                snapshot["item_type"],
-                snapshot["item_id"],
-                snapshot["storage"],
-                metadata=metadata or None,
-            )
+            try:
+                self._update_task(task_id, stage="获取上传凭证")
+                result = uploader.upload_video(
+                    snapshot["file_path"],
+                    snapshot["item_type"],
+                    snapshot["item_id"],
+                    snapshot["storage"],
+                    metadata=metadata or None,
+                )
+            finally:
+                uploader.close()
             if result:
                 # 上传成功后按配置处理原文件（手动选片 / 自动上传 / Telegram 修正三条链路一致）
                 deleted, delete_note = self._delete_source_if_configured(snapshot["file_path"])
