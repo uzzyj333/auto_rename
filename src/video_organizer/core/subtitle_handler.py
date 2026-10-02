@@ -149,7 +149,7 @@ class SubtitleHandler:
 
         return result
 
-    def find_matching_video(self, subtitle_path: Path, video_extensions: Tuple[str, ...] = ('.mp4', '.mkv', '.avi', '.mov', '.wmv')) -> Optional[Path]:
+    def find_matching_video(self, subtitle_path: Path, video_extensions: Tuple[str, ...] = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.ts', '.m2ts', '.iso', '.strm')) -> Optional[Path]:
         """
         查找与字幕文件匹配的视频文件
 
@@ -286,7 +286,7 @@ class SubtitleHandler:
 
         return new_name
 
-    def process_subtitle_file(self, subtitle_path: Path, output_dir: Path, video_extensions: Tuple[str, ...] = ('.mp4', '.mkv', '.avi', '.mov', '.wmv')) -> Optional[Path]:
+    def process_subtitle_file(self, subtitle_path: Path, output_dir: Path, video_extensions: Tuple[str, ...] = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.ts', '.m2ts', '.iso', '.strm')) -> Optional[Path]:
         """
         处理字幕文件：查找匹配的视频文件并重命名
 

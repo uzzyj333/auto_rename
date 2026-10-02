@@ -55,6 +55,9 @@ class FileSystemMonitor:
                 ".avi",
                 ".mov",
                 ".wmv",
+                ".ts",
+                ".m2ts",
+                ".iso",
                 ".strm",
             ]
         else:

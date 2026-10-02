@@ -1489,8 +1489,14 @@ class VideoFileHandler:
             print(f"   语言: {language}")
             print(f"   类型: {subtitle_type}")
 
-            # 查找匹配的视频文件
-            video_extensions = ('.mp4', '.mkv', '.avi', '.mov', '.wmv')
+            # 查找匹配的视频文件（跟随监控配置的扩展名，含 .ts / .m2ts 等）
+            video_extensions = tuple(self.supported_extensions) or (
+                '.mp4',
+                '.mkv',
+                '.avi',
+                '.mov',
+                '.wmv',
+            )
             video_path = self.subtitle_handler.find_matching_video(Path(subtitle_path), video_extensions)
 
             if not video_path:

@@ -44,7 +44,17 @@ DEFAULT_CONFIG = {
         "watch_dir": "",
         "output_dir": "",
         "poll_interval": 10,
-        "supported_extensions": [".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv"],
+        "supported_extensions": [
+            ".mp4",
+            ".mkv",
+            ".avi",
+            ".mov",
+            ".wmv",
+            ".flv",
+            ".ts",
+            ".m2ts",
+            ".iso",
+        ],
         "use_polling": False,
         "polling_interval": 5,
         "path_mappings": {},  # 用于将下载器返回的路径映射到主机实际路径，例如："/downloads": "F:/Downloads"

@@ -1379,6 +1379,9 @@ class VideoRenamer:
             ".mov",
             ".wmv",
             ".flv",
+            ".ts",
+            ".m2ts",
+            ".iso",
             ".srt",
             ".sub",
             ".idx",
@@ -1660,7 +1663,7 @@ class VideoRenamer:
                 metadata["release_group"] = potential_group
 
         # 提取末尾的发布组格式（如 -MagicStar 或 _HHWEB_mp4.strm）
-        release_group_trailing_pattern = r"(?:[\-_])([A-Za-z]+)(?:\.(?:mkv|mp4|avi|flv|mov|wmv|strm)$|_(?:mkv|mp4|avi|flv|mov|wmv)\.strm$)"
+        release_group_trailing_pattern = r"(?:[\-_])([A-Za-z]+)(?:\.(?:mkv|mp4|avi|flv|mov|wmv|ts|m2ts|iso|strm)$|_(?:mkv|mp4|avi|flv|mov|wmv)\.strm$)"
         release_group_trailing_match = re.search(
             release_group_trailing_pattern, base_name
         )

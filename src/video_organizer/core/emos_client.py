@@ -44,6 +44,8 @@ VIDEO_MIME_TYPES = {
     ".mpg": "video/mpeg",
     ".mpeg": "video/mpeg",
     ".rmvb": "application/vnd.rn-realmedia-vbr",
+    # 蓝光 / DVD 原盘镜像：Emos 侧按普通视频资源存储，MIME 用镜像的真实类型
+    ".iso": "application/x-iso9660-image",
 }
 
 SUBTITLE_MIME_TYPES = {
