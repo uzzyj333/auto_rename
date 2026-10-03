@@ -638,9 +638,18 @@ class TelegramBotService:
             self.send_text(f"查询 Emos 失败：{exc}", reply_to=reply_to, chat_id=chat_id)
             return
 
-        match = service.pick_target(
-            candidates, expr.season, expr.episode, media_type, year=expr.year, title=expr.title
-        )
+        match = self._locate_target(service, candidates, expr, media_type)
+        if not match and video_type:
+            # Emos 带 type 过滤时可能返回「有结果但不含季/集」的候选，让明明存在
+            # 的条目被判成未找到；search_targets 只在“完全搜不到”时兜底，这里补上
+            # 「有结果但定位不到」的兜底：去掉类型再搜一次。
+            try:
+                retry_candidates = service.search_targets(title=expr.title)
+            except Exception:
+                retry_candidates = []
+            if retry_candidates:
+                candidates = retry_candidates
+                match = self._locate_target(service, candidates, expr, media_type)
         if not match:
             hint = self._candidate_hint(candidates)
             message = f"未在 Emos 中找到匹配条目：{expr.describe()}"
@@ -687,6 +696,29 @@ class TelegramBotService:
             chat_id=chat_id,
         )
         logger.info("Telegram 修正目标成功: %s -> %s", expr.describe(), match.get("label"))
+
+    @staticmethod
+    def _locate_target(
+        service: Any,
+        candidates: List[Dict[str, Any]],
+        expr: TargetExpression,
+        media_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        """在候选里定位目标；候选没有嵌套季/集时拉完整目录树再定位"""
+        match = service.pick_target(
+            candidates, expr.season, expr.episode, media_type, year=expr.year, title=expr.title
+        )
+        if match:
+            return match
+        if expr.episode is None:
+            return None
+        try:
+            return service.resolve_episode_from_candidates(
+                candidates, expr.season, expr.episode, media_type, title=expr.title
+            )
+        except Exception as exc:
+            logger.debug("按候选定位剧集失败: %s", exc)
+            return None
 
     @staticmethod
     def _candidate_hint(candidates: List[Dict[str, Any]], limit: int = 5) -> str:

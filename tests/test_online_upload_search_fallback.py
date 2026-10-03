@@ -15,6 +15,10 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.video_organizer.core.online_upload import OnlineUploadService
+from src.video_organizer.core.telegram_bot import (
+    TelegramBotService,
+    parse_target_expression,
+)
 
 
 class _FakeClient:
@@ -129,6 +133,182 @@ class TestPickTargetTitlePreference(unittest.TestCase):
         second = _tv("202974", "Another Show", "ve-second")
         match = self.service.pick_target([first, second], 1, 19, "tv", title="Jade Cause Of Death")
         self.assertEqual(match["item_id"], "ve-first")
+
+
+class _FlatThenFullTreeClient:
+    """搜索结果只有作品级信息，按 video_id 查才带完整季/集"""
+
+    def __init__(self, flat_results, full_tree):
+        self.flat_results = flat_results
+        self.full_tree = full_tree
+
+    def get_video_tree(self, video_type=None, title=None, todb_id=None, tmdb_id=None, video_id=None):
+        if video_id is not None:
+            return list(self.full_tree)
+        return list(self.flat_results)
+
+
+class TestResolveEpisodeFromCandidates(unittest.TestCase):
+    """搜索候选没有嵌套季/集时，按候选 id 拉完整目录树定位具体某一集"""
+
+    def setUp(self):
+        self.service = OnlineUploadService()
+        self.service.configure({"emos": {"auth_token": "t", "base_url": "https://emos.best"}})
+        self.flat = [
+            {
+                "title": "死有对证",
+                "video_type": "tv",
+                "item_type": "vl",
+                "item_id": "202974",
+                "seasons": [],
+            }
+        ]
+        self.full_tree = [
+            {
+                "item_id": "202974",
+                "title": "死有对证",
+                "video_type": "tv",
+                "item_type": "vl",
+                "seasons": [
+                    {
+                        "season_number": 1,
+                        "season_title": "第 1 季",
+                        "item_type": "vs",
+                        "item_id": "vs-202974-1",
+                        "episodes": [
+                            {
+                                "episode_number": 19,
+                                "episode_title": "第 19 集",
+                                "item_type": "ve",
+                                "item_id": "ve-202974-1-19",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+
+    def test_pick_target_fails_without_nested_episodes(self):
+        # 候选只有作品级信息时，pick_target 定位不到具体某一集
+        self.assertIsNone(self.service.pick_target(self.flat, 1, 19, "tv", title="死有对证"))
+
+    def test_resolve_falls_back_to_full_tree(self):
+        client = _FlatThenFullTreeClient(self.flat, self.full_tree)
+        with patch.object(OnlineUploadService, "get_client", lambda self: client):
+            match = self.service.resolve_episode_from_candidates(
+                self.flat, 1, 19, "tv", title="死有对证"
+            )
+        self.assertIsNotNone(match)
+        self.assertEqual(match["item_id"], "ve-202974-1-19")
+        self.assertEqual(match["kind"], "episode")
+        self.assertEqual(match["episode_number"], 19)
+
+    def test_resolve_returns_none_without_episode(self):
+        client = _FlatThenFullTreeClient(self.flat, self.full_tree)
+        with patch.object(OnlineUploadService, "get_client", lambda self: client):
+            self.assertIsNone(
+                self.service.resolve_episode_from_candidates(self.flat, 1, None, "tv", title="死有对证")
+            )
+
+
+class _LocateServiceStub:
+    def __init__(self):
+        self.pick_calls = 0
+        self.resolve_calls = 0
+
+    def pick_target(self, *args, **kwargs):
+        self.pick_calls += 1
+        return None
+
+    def resolve_episode_from_candidates(self, candidates, season, episode, media_type="", title=None):
+        self.resolve_calls += 1
+        return {
+            "item_type": "ve",
+            "item_id": "ve-1",
+            "label": "S1E19",
+            "kind": "episode",
+            "season_number": 1,
+            "episode_number": 19,
+        }
+
+
+class TestTelegramLocateTarget(unittest.TestCase):
+    """TG 回复修正：pick_target 失败后用完整目录树兜底定位剧集"""
+
+    def test_falls_back_to_full_tree(self):
+        service = _LocateServiceStub()
+        expr = parse_target_expression("死有对证S01E19")
+        match = TelegramBotService._locate_target(service, [{"item_id": "202974"}], expr, "tv")
+        self.assertEqual(match["item_id"], "ve-1")
+        self.assertEqual(service.pick_calls, 1)
+        self.assertEqual(service.resolve_calls, 1)
+
+    def test_no_episode_does_not_resolve(self):
+        service = _LocateServiceStub()
+        expr = parse_target_expression("死有对证 (2024)")
+        self.assertIsNone(TelegramBotService._locate_target(service, [{"item_id": "1"}], expr, "movie"))
+        self.assertEqual(service.resolve_calls, 0)
+
+
+class _CorrectionServiceStub:
+    """模拟：带类型搜索只给作品级候选，去掉类型才给能定位到剧集的候选"""
+
+    def __init__(self):
+        self.search_calls = []
+        self.created = []
+
+    def search_targets(self, video_type=None, title=None):
+        self.search_calls.append(video_type)
+        if video_type:
+            return [{"item_id": "202974", "title": "死有对证", "seasons": []}]
+        return [{"item_id": "202974", "title": "死有对证", "seasons": [], "full": True}]
+
+    def pick_target(self, candidates, season, episode, media_type, year=None, title=None):
+        return None
+
+    def resolve_episode_from_candidates(self, candidates, season, episode, media_type="", title=None):
+        for candidate in candidates or []:
+            if candidate.get("full"):
+                return {
+                    "item_type": "ve",
+                    "item_id": "ve-19",
+                    "label": "S1E19",
+                    "kind": "episode",
+                    "season_number": 1,
+                    "episode_number": 19,
+                }
+        return None
+
+    def create_task(self, item):
+        self.created.append(item)
+        return {"id": "task-1"}
+
+    def delete_after_upload_enabled(self):
+        return False
+
+
+class TestTelegramCorrectionRetryWithoutType(unittest.TestCase):
+    def test_retries_without_type_then_creates_task(self):
+        service = TelegramBotService()
+        service._token = "t"
+        service._chat_id = "1"
+        service._enabled = True
+        service._reply_enabled = True
+        sent = []
+        service.send_text = lambda text, reply_to=None, chat_id=None: sent.append(text) or 42
+        stub = _CorrectionServiceStub()
+        context = {"file_path": "E:/downloads/a.mkv", "title": "死有对证", "media_type": "tv"}
+        with patch(
+            "src.video_organizer.core.online_upload.OnlineUploadService.instance",
+            return_value=stub,
+        ):
+            service._handle_correction(context, "死有对证S01E19", "1", 99)
+
+        self.assertEqual(stub.search_calls, ["tv", None])
+        self.assertEqual(len(stub.created), 1)
+        self.assertEqual(stub.created[0]["item_id"], "ve-19")
+        self.assertEqual(stub.created[0]["media_type"], "tv")
+        self.assertTrue(any("已按修正目标重新上传" in text for text in sent))
 
 
 if __name__ == "__main__":

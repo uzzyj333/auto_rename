@@ -538,6 +538,11 @@ class OnlineUploadService:
                 match = self._pick_from_candidates(
                     candidates, season, episode, media_type, title=title
                 )
+                if not match and episode is not None:
+                    # 搜索结果可能只有作品级信息、没有嵌套季/集，拉完整目录树再定位
+                    match = self.resolve_episode_from_candidates(
+                        candidates, season, episode, media_type, title=title
+                    )
             if not match and (media_type == "tv" or (media_type != "movie" and episode is not None)):
                 if episode is None:
                     errors.append("未能从文件名解析出季/集号，无法定位到具体某一集")
@@ -763,6 +768,52 @@ class OnlineUploadService:
         return self._pick_from_candidates(
             candidates, season, episode, media_type, year=year, title=title
         )
+
+    def resolve_episode_from_candidates(
+        self,
+        candidates: List[Dict[str, Any]],
+        season: Optional[int],
+        episode: Optional[int],
+        media_type: str = "",
+        title: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """按搜索结果候选的剧集 id 拉完整目录树，定位具体某一集
+
+        搜索接口（尤其带 type 过滤时）返回的候选可能只有作品级信息、没有嵌套的
+        季/集，导致明明存在的剧集被判成「未找到」。这里拿标题最相关的候选去查
+        ``video_id`` 的完整目录树，再定位到具体某一集（ve）。
+        """
+        if episode is None:
+            return None
+        ordered = list(candidates or [])
+        if title:
+            matched = [
+                video
+                for video in ordered
+                if isinstance(video, dict) and _title_matches(video.get("title"), title)
+            ]
+            if matched:
+                rest = [
+                    video
+                    for video in ordered
+                    if not (isinstance(video, dict) and _title_matches(video.get("title"), title))
+                ]
+                ordered = matched + rest
+        client = self.get_client()
+        attempts = 0
+        for video in ordered:
+            if not isinstance(video, dict):
+                continue
+            vl_id = video.get("item_id")
+            if not vl_id:
+                continue
+            attempts += 1
+            if attempts > 5:
+                break
+            resolved = self.resolve_episode_from_tree(client, vl_id, season, episode)
+            if resolved:
+                return resolved
+        return None
 
     def search_targets(
         self,
