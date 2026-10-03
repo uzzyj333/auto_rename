@@ -135,6 +135,13 @@ _RE_CN_SEASON = re.compile(rf"第\s*(?P<s>{_CN_NUM})\s*[季部]")
 _RE_CN_EPISODE = re.compile(rf"第\s*(?P<e>{_CN_NUM})\s*[集话話期]")
 _RE_S_ONLY = re.compile(r"[Ss](?P<s>\d{1,3})(?![\dEe])")
 _RE_YEAR = re.compile(r"(?:[\(\[]|\s|^)(?P<y>(?:19|20)\d{2})(?:[\)\]]|\s|$)")
+# 用户经常直接粘贴文件名（大王饶命.S03E03.mkv），标题里要清掉视频/字幕后缀
+_RE_MEDIA_EXT = re.compile(
+    r"\.(?:mkv|mp4|avi|mov|wmv|flv|ts|m2ts|iso|strm|webm|m4v|mpg|mpeg|rmvb|srt|ass|ssa|vtt|sub)$",
+    re.IGNORECASE,
+)
+# 标题两侧常见分隔符（含 ASCII 点，「大王饶命.S03E03」解析后不能留下「大王饶命.」）
+_TITLE_EDGE_CHARS = " .-_·|,，。、:：;；!！?？/\\"
 
 
 def parse_target_expression(raw: str) -> TargetExpression:
@@ -148,6 +155,7 @@ def parse_target_expression(raw: str) -> TargetExpression:
         return expr
     text = re.sub(r"^[/＠@]\w+\s*", "", text)          # 去掉开头的指令
     text = re.sub(r"^(?:正确的?应该是|其实?是|应该?是|正确的?|修正|改为|应该)\s*[:：]?\s*", "", text).strip()
+    text = _RE_MEDIA_EXT.sub("", text).strip()          # 去掉粘贴文件名带的后缀
 
     def cut(match: re.Match) -> None:
         nonlocal text
@@ -176,6 +184,7 @@ def parse_target_expression(raw: str) -> TargetExpression:
             cut(match)
 
     title = re.sub(r"[\s\-_·|,，。:：\[\]【】\(\)（）]+", " ", text).strip()
+    title = title.strip(_TITLE_EDGE_CHARS)
     expr.title = title
     return expr
 
