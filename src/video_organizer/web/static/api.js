@@ -252,13 +252,6 @@ async function deleteLlmProviderViaApi(id) {
     return await apiRequest(`/config/db/llm-providers/${id}`, { method: 'DELETE' });
 }
 
-async function loadRuntimeConfigFromApi() {
-    return await apiRequest('/config/db/runtime');
-}
-async function updateRuntimeConfigViaApi(key, data) {
-    return await apiRequest(`/config/db/runtime/${encodeURIComponent(key)}`, { method: 'PUT', body: JSON.stringify(data) });
-}
-
 // ===== 用户管理 API =====
 
 async function loadUsersFromApi() {
@@ -294,6 +287,12 @@ async function probeOnlineApi(path) {
 async function recognizeOnlineApi(path) {
     return await apiRequest('/online-upload/recognize', { method: 'POST', body: JSON.stringify({ path }) });
 }
+async function recognizeOnlineBatchApi(paths, maxWorkers) {
+    return await apiRequest('/online-upload/recognize-batch', {
+        method: 'POST',
+        body: JSON.stringify({ paths, max_workers: maxWorkers || 6 })
+    });
+}
 async function searchOnlineTargetsApi(q, videoType) {
     const params = new URLSearchParams();
     if (q) params.set('q', q);
@@ -325,4 +324,19 @@ async function loadTelegramStatusApi() {
 }
 async function sendTelegramTestApi() {
     return await apiRequest('/config/telegram/test', { method: 'POST' });
+}
+
+// ===== 目标映射表 API =====
+
+async function loadTargetMappingsFromApi() {
+    return await apiRequest('/config/db/target-mappings');
+}
+async function createTargetMappingViaApi(data) {
+    return await apiRequest('/config/db/target-mappings', { method: 'POST', body: JSON.stringify(data) });
+}
+async function updateTargetMappingViaApi(id, data) {
+    return await apiRequest(`/config/db/target-mappings/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+}
+async function deleteTargetMappingViaApi(id) {
+    return await apiRequest(`/config/db/target-mappings/${id}`, { method: 'DELETE' });
 }

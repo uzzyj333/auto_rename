@@ -219,6 +219,14 @@ class DownloaderMonitor(ABC):
         pass
 
 
+    def get_incomplete_paths(self) -> set:
+        """返回该下载器中「仍在下载」的文件路径集合（默认无）
+
+        供手动识别本地文件时排除半成品；路径统一为本地映射后的绝对路径。
+        """
+        return set()
+
+
 class Aria2Monitor(DownloaderMonitor):
     """
     Monitor for aria2 downloader.
@@ -760,6 +768,53 @@ class Aria2Monitor(DownloaderMonitor):
             return os.path.normpath(mapped_path)
         
         return file_path
+
+    def get_incomplete_paths(self) -> set:
+        """收集 aria2 中仍在下载（active / waiting）的文件路径"""
+        paths = set()
+        headers = {"Content-Type": "application/json"}
+        base_params = [f"token:{self.secret}"] if self.secret else []
+        keys = ["gid", "status", "files", "completedLength", "totalLength"]
+        requests_spec = [
+            ("aria2.tellActive", [keys]),
+            ("aria2.tellWaiting", [0, 1000, keys]),
+        ]
+        for method, extra in requests_spec:
+            try:
+                payload = {
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "id": "1",
+                    "params": base_params + extra,
+                }
+                response = requests.post(
+                    self.rpc_url, headers=headers, json=payload, timeout=15
+                )
+                response.raise_for_status()
+                result = response.json().get("result") or []
+            except Exception as exc:
+                logger.debug("获取 aria2 未完成任务失败 (%s): %s", method, exc)
+                continue
+            for download in result:
+                try:
+                    completed = int(download.get("completedLength") or 0)
+                    total = int(download.get("totalLength") or 0)
+                except (TypeError, ValueError):
+                    completed, total = 0, 0
+                if total and completed >= total:
+                    continue
+                for file_info in download.get("files") or []:
+                    raw = file_info.get("path") if isinstance(file_info, dict) else None
+                    if not raw:
+                        continue
+                    try:
+                        decoded = decode_file_path(raw)
+                    except Exception:
+                        decoded = raw
+                    mapped = self._apply_path_mapping(decoded)
+                    if mapped:
+                        paths.add(mapped)
+        return paths
 
     def _get_completed_downloads(self):
         """
@@ -1342,6 +1397,63 @@ class QBittorrentMonitor(DownloaderMonitor):
         except Exception as e:
             logger.error(f"Failed to login to qBittorrent: {e}")
             return False
+
+    def get_incomplete_paths(self) -> set:
+        """收集 qBittorrent 中进度未满 100% 的种子文件路径"""
+        paths = set()
+        try:
+            torrents = self._get_completed_torrents()
+        except Exception as exc:
+            logger.debug("获取 qBittorrent 种子列表失败: %s", exc)
+            return paths
+        checked = 0
+        for torrent in torrents or []:
+            if not isinstance(torrent, dict):
+                continue
+            try:
+                progress = float(torrent.get("progress") or 0)
+            except (TypeError, ValueError):
+                progress = 0.0
+            if progress >= 1.0:
+                continue
+            checked += 1
+            if checked > 20:
+                logger.debug("未完成种子过多，仅检测前 20 个")
+                break
+            save_path = torrent.get("save_path") or ""
+            content_path = torrent.get("content_path") or ""
+            torrent_hash = torrent.get("hash")
+            files = []
+            if torrent_hash:
+                try:
+                    files = self._get_torrent_files(torrent_hash)
+                except Exception as exc:
+                    logger.debug("获取种子文件列表失败 %s: %s", torrent_hash, exc)
+                    files = []
+            if not files:
+                if content_path:
+                    mapped = self._apply_path_mapping(content_path)
+                    if mapped:
+                        paths.add(mapped)
+                continue
+            for file_info in files:
+                if not isinstance(file_info, dict):
+                    continue
+                name = file_info.get("name") or ""
+                if not name:
+                    continue
+                file_progress = file_info.get("progress")
+                if file_progress is not None:
+                    try:
+                        if float(file_progress) >= 1.0:
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                full = os.path.join(save_path, name) if save_path else name
+                mapped = self._apply_path_mapping(full)
+                if mapped:
+                    paths.add(mapped)
+        return paths
 
     def _get_completed_torrents(self):
         """

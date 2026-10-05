@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .emos_client import EmosApiError, EmosClient
+from .incomplete_downloads import collect_incomplete_paths, is_incomplete
 from .probe import probe_summary_for_upload, probe_video
 from ..upload.upload_emos import (
     DEFAULT_UPLOAD_CONCURRENCY,
@@ -426,6 +427,9 @@ class OnlineUploadService:
         if not directory.is_dir():
             raise NotADirectoryError(f"不是目录: {directory}")
         files: List[Dict[str, Any]] = []
+        # 排除下载器里还没下完的文件，避免识别到半成品
+        incomplete = collect_incomplete_paths()
+        skipped_incomplete = 0
         iterator = directory.rglob("*") if recursive else directory.glob("*")
         for item in iterator:
             try:
@@ -433,6 +437,9 @@ class OnlineUploadService:
                 if not item.is_file() or (
                     suffix not in VIDEO_EXTENSIONS and suffix not in SUBTITLE_EXTENSIONS
                 ):
+                    continue
+                if incomplete and is_incomplete(item, incomplete):
+                    skipped_incomplete += 1
                     continue
                 stat = item.stat()
             except OSError:
@@ -451,7 +458,13 @@ class OnlineUploadService:
             if len(files) >= MAX_SCAN_FILES:
                 break
         files.sort(key=lambda entry: entry["modified_at"], reverse=True)
-        return {"success": True, "path": str(directory), "count": len(files), "files": files}
+        return {
+            "success": True,
+            "path": str(directory),
+            "count": len(files),
+            "skipped_incomplete": skipped_incomplete,
+            "files": files,
+        }
 
     # ------------------------------------------------------------------
     # 探测 + 识别
@@ -510,51 +523,71 @@ class OnlineUploadService:
 
         match: Optional[Dict[str, Any]] = None
         candidates: List[Dict[str, Any]] = []
+        mapping_matched = False
 
+        # 目标映射表优先：手动指定过的目标直接命中，跳过 TMDB/Emos 搜索
         try:
-            client = self.get_client()
-            if tmdb_id:
-                tmdb_type = "movie" if media_type == "movie" else "tv"
-                payload = client.get_video_id(
-                    tmdb_id,
-                    "tmdb",
-                    tmdb_type=tmdb_type,
-                    season_number=season if tmdb_type == "tv" else None,
-                    episode_number=episode if tmdb_type == "tv" else None,
-                )
-                match = self._pick_match(payload, media_type, season, episode)
-                if not match and tmdb_type == "tv":
-                    # getVideoId 没给到具体集时，用该剧的目录树兜底定位
-                    match = self.resolve_episode_from_tree(
-                        client, payload.get("item_id"), season, episode
+            from .mapping_store import TargetMappingStore
+
+            mapped = TargetMappingStore.resolve(
+                title=title,
+                season=season,
+                episode=episode,
+                media_type=media_type,
+                file_name=path.name,
+            )
+        except Exception as exc:
+            logger.debug("查询目标映射表失败: %s", exc)
+            mapped = None
+
+        if mapped:
+            match = mapped
+            mapping_matched = True
+        else:
+            try:
+                client = self.get_client()
+                if tmdb_id:
+                    tmdb_type = "movie" if media_type == "movie" else "tv"
+                    payload = client.get_video_id(
+                        tmdb_id,
+                        "tmdb",
+                        tmdb_type=tmdb_type,
+                        season_number=season if tmdb_type == "tv" else None,
+                        episode_number=episode if tmdb_type == "tv" else None,
                     )
-            if not match and title:
-                candidates = self.search_targets(
-                    video_type="movie" if media_type == "movie" else ("tv" if media_type else None),
-                    title=title,
-                    todb_id=None,
-                )
-                # 没有 TMDB ID（或接口未返回具体集）时，用目录树候选自动定位季/集
-                match = self._pick_from_candidates(
-                    candidates, season, episode, media_type, title=title
-                )
-                if not match and episode is not None:
-                    # 搜索结果可能只有作品级信息、没有嵌套季/集，拉完整目录树再定位
-                    match = self.resolve_episode_from_candidates(
+                    match = self._pick_match(payload, media_type, season, episode)
+                    if not match and tmdb_type == "tv":
+                        # getVideoId 没给到具体集时，用该剧的目录树兜底定位
+                        match = self.resolve_episode_from_tree(
+                            client, payload.get("item_id"), season, episode
+                        )
+                if not match and title:
+                    candidates = self.search_targets(
+                        video_type="movie" if media_type == "movie" else ("tv" if media_type else None),
+                        title=title,
+                        todb_id=None,
+                    )
+                    # 没有 TMDB ID（或接口未返回具体集）时，用目录树候选自动定位季/集
+                    match = self._pick_from_candidates(
                         candidates, season, episode, media_type, title=title
                     )
-            if not match and (media_type == "tv" or (media_type != "movie" and episode is not None)):
-                if episode is None:
-                    errors.append("未能从文件名解析出季/集号，无法定位到具体某一集")
-                else:
-                    errors.append(
-                        f"Emos 中没有「{title or tmdb_id}」S{season if season is not None else '?'}"
-                        f"E{episode} 这一集，请先在 Emos 建集，或在「在线识别上传」里手动选择目标"
-                    )
-        except EmosApiError as exc:
-            errors.append(str(exc))
-        except Exception as exc:
-            errors.append(f"查询 Emos 失败: {exc}")
+                    if not match and episode is not None:
+                        # 搜索结果可能只有作品级信息、没有嵌套季/集，拉完整目录树再定位
+                        match = self.resolve_episode_from_candidates(
+                            candidates, season, episode, media_type, title=title
+                        )
+                if not match and (media_type == "tv" or (media_type != "movie" and episode is not None)):
+                    if episode is None:
+                        errors.append("未能从文件名解析出季/集号，无法定位到具体某一集")
+                    else:
+                        errors.append(
+                            f"Emos 中没有「{title or tmdb_id}」S{season if season is not None else '?'}"
+                            f"E{episode} 这一集，请先在 Emos 建集，或在「在线识别上传」里手动选择目标"
+                        )
+            except EmosApiError as exc:
+                errors.append(str(exc))
+            except Exception as exc:
+                errors.append(f"查询 Emos 失败: {exc}")
 
         if not media_type and metadata:
             media_type = "tv" if metadata.get("show_name") else "movie"
@@ -576,10 +609,52 @@ class OnlineUploadService:
             },
             "match": match,
             "candidates": candidates,
+            "mapping_matched": mapping_matched,
             "file_kind": "subtitle" if is_subtitle else "video",
             "subtitles": [] if is_subtitle else [item.name for item in find_subtitle_files(path)],
             "error": "；".join(errors),
         }
+
+    def recognize_many(self, paths: List[str], max_workers: int = 6) -> Dict[str, Any]:
+        """批量识别（并发），显著加快整季/整部剧的识别速度"""
+        unique: List[str] = []
+        seen = set()
+        for raw in paths or []:
+            text = str(raw or "").strip()
+            if text and text not in seen:
+                seen.add(text)
+                unique.append(text)
+        if not unique:
+            return {"success": True, "count": 0, "results": []}
+        results: List[Optional[Dict[str, Any]]] = [None] * len(unique)
+        workers = max(1, min(int(max_workers or 6), 12, len(unique)))
+
+        def worker(index: int, raw_path: str) -> None:
+            try:
+                results[index] = self.recognize(raw_path)
+            except Exception as exc:
+                logger.warning("批量识别失败: %s - %s", raw_path, exc)
+                results[index] = {
+                    "success": False,
+                    "file_path": raw_path,
+                    "file_name": os.path.basename(raw_path),
+                    "file_size": 0,
+                    "metadata": {},
+                    "match": None,
+                    "candidates": [],
+                    "mapping_matched": False,
+                    "file_kind": "subtitle"
+                    if raw_path.lower().endswith(tuple(SUBTITLE_EXTENSIONS))
+                    else "video",
+                    "subtitles": [],
+                    "error": str(exc),
+                }
+
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="online-recognize") as pool:
+            futures = [pool.submit(worker, i, p) for i, p in enumerate(unique)]
+            for future in futures:
+                future.result()
+        return {"success": True, "count": len(results), "results": results}
 
     @staticmethod
     def _pick_match(
@@ -901,10 +976,15 @@ class OnlineUploadService:
     def create_tasks(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
         """批量创建上传任务"""
         created: List[Dict[str, Any]] = []
+        duplicates: List[Dict[str, Any]] = []
         errors: List[str] = []
         for item in items or []:
             try:
-                created.append(self.create_task(item))
+                task = self.create_task(item)
+                if task.get("duplicate"):
+                    duplicates.append(task)
+                else:
+                    created.append(task)
             except Exception as exc:
                 errors.append(f"{item.get('file_path', '')}: {exc}")
                 self._notify_failure(
@@ -922,13 +1002,40 @@ class OnlineUploadService:
                     str(exc),
                     header="上传任务创建失败",
                 )
-        return {"success": not errors, "tasks": created, "errors": errors}
+        return {
+            "success": not errors,
+            "tasks": created,
+            "duplicates": duplicates,
+            "errors": errors,
+        }
+
+    def _find_duplicate_task(self, file_path: str) -> Optional[OnlineUploadTask]:
+        """查找同一文件的进行中 / 已完成任务，避免重复上传"""
+        with self._lock:
+            for task in self._tasks.values():
+                if task.file_path != file_path:
+                    continue
+                if task.status in {"queued", "uploading", "completed"}:
+                    return task
+        return None
 
     def create_task(self, item: Dict[str, Any]) -> Dict[str, Any]:
         """创建单个上传任务并开始后台上传"""
         path = self.resolve(str(item.get("file_path") or ""))
         if not path.is_file():
             raise FileNotFoundError(f"文件不存在: {path}")
+
+        duplicate = self._find_duplicate_task(str(path))
+        if duplicate is not None:
+            payload = duplicate.to_dict()
+            payload["duplicate"] = True
+            payload["duplicate_reason"] = (
+                "该文件已有上传任务正在进行"
+                if duplicate.status in {"queued", "uploading"}
+                else "该文件已上传完成，如需重传请先删除对应任务记录"
+            )
+            return payload
+
         item_type = str(item.get("item_type") or "").strip()
         item_id = str(item.get("item_id") or "").strip()
         if not item_type or not item_id:
@@ -1082,6 +1189,15 @@ class OnlineUploadService:
         except Exception as exc:
             logger.debug("推送 Telegram 报错信息失败: %s", exc)
 
+    def _clear_error(self, file_path: Any) -> None:
+        """上传成功后停止该文件的 Telegram 定时报错提醒"""
+        try:
+            from .telegram_bot import TelegramBotService
+
+            TelegramBotService.instance().clear_error(str(file_path or ""))
+        except Exception as exc:
+            logger.debug("清除 Telegram 报错提醒失败: %s", exc)
+
     def _run_task(self, task_id: str) -> None:
         """后台执行上传"""
         with self._lock:
@@ -1154,6 +1270,7 @@ class OnlineUploadService:
                 )
                 self._notify_failure(snapshot, reason)
             elif result:
+                self._clear_error(snapshot.get("file_path"))
                 if is_subtitle:
                     deleted, delete_note = self._delete_source_if_configured(snapshot["file_path"])
                     self._update_task(

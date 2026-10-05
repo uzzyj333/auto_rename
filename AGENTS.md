@@ -24,7 +24,9 @@
   - `tmdb_client.py` — TMDB API 客户端
   - `guessit_parser.py` — GuessIt 集成 + 中文文件名预处理
   - `emos_client.py` / `probe.py` / `online_upload.py` — Emos 官方 API 客户端、ffprobe 校验、在线识别上传服务
-  - `telegram_bot.py` — Telegram 机器人：上传报错通知 + 回复修正上传目标（长轮询 getUpdates）
+  - `telegram_bot.py` — Telegram 机器人：上传报错通知（未解决每 5 分钟提醒）+ 回复修正上传目标 + `/upload` 选择本地文件上传（长轮询 getUpdates，含 inline 按钮）
+  - `mapping_store.py` — 目标映射表（文字映射 / 剧集集数映射），命中后跳过 TMDB/Emos 搜索直接上传
+  - `incomplete_downloads.py` — 汇总 qb/aria2 未完成下载，手动识别本地文件时排除半成品
 - **Web 后端** (`web/`):
   - `app.py` — FastAPI 应用创建，`create_app()`
   - `auth.py` — HMAC-SHA256 令牌认证（非标准 JWT），服务重启所有 token 失效
@@ -78,7 +80,8 @@ python -c "import sys; sys.path.insert(0,'src'); from pathlib import Path; p=Pat
 - `GET /api/auth/first-run-credentials` — 首次运行随机密码
 - `/api/auth/`、`/static/`、`/api/health` 无需认证
 - WebSocket: `/api/tasks/ws/progress`, `/api/tasks/ws/dashboard`, `/api/logs/ws/{filename}`
-- 在线识别上传: `GET /api/online-upload/config|roots|search|tasks`、`POST /api/online-upload/browse|scan|probe|recognize|tasks|save-internal`、`POST /api/online-upload/tasks/{id}/retry`、`DELETE /api/online-upload/tasks/{id}|tasks/clear`
-- Telegram 机器人: `GET /api/config/telegram/status`、`POST /api/config/telegram/test`（绑定 / 测试消息）
+- 在线识别上传: `GET /api/online-upload/config|roots|search|tasks`、`POST /api/online-upload/browse|scan|probe|recognize|recognize-batch|tasks|save-internal`、`POST /api/online-upload/tasks/{id}/retry`、`DELETE /api/online-upload/tasks/{id}|tasks/clear`（`recognize-batch` 并发识别；创建任务按文件去重，重复提交返回 `duplicates`）
+- 目标映射表: `GET|POST /api/config/db/target-mappings`、`PUT|DELETE /api/config/db/target-mappings/{id}`（`match_type` 为 `title`（文字映射）或 `episode`（剧集集数映射）；TG 修正过的目标自动写入）
+- Telegram 机器人: `GET /api/config/telegram/status`、`POST /api/config/telegram/test`（绑定 / 测试消息；TG 内发送 `/upload` 选择服务器本地文件上传）
 - 下载器: `GET /api/downloaders` 返回每个实例的 `id`（配置节标识）与 `type`，`/api/downloaders/{id}/{status|tasks|remove|pause|resume|processed}` 按实例标识访问
 - 配置在线修改后会自动热更新到视频处理器、在线识别上传服务、Telegram 机器人与下载器监控（新增/删除 aria2 实例、调整上传并发数均立即生效），无需重启容器

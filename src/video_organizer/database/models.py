@@ -70,10 +70,29 @@ class AuthUser(Base):
     updated_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
 
 
-class RuntimeConfig(Base):
-    __tablename__ = "config_runtime"
+class TargetMapping(Base):
+    """上传目标映射表
 
-    key: Mapped[str] = mapped_column(String(128), primary_key=True)
-    value: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    description: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    - ``match_type = "title"``：文字映射，标题/文件名包含 ``keyword`` 即命中；
+    - ``match_type = "episode"``：剧集映射，标题匹配且季/集号一致才命中。
+
+    命中后直接使用 ``item_type`` / ``item_id`` 上传，跳过 TMDB + Emos 搜索，
+    实现「手动指定过一次，以后类似文件直接上传」。
+    """
+
+    __tablename__ = "config_target_mapping"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    match_type: Mapped[str] = mapped_column(String(16), nullable=False, default="title")
+    keyword: Mapped[str] = mapped_column(String(256), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(16), default="")
+    season_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    episode_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    item_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    item_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    label: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    storage: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    source: Mapped[str] = mapped_column(String(16), default="web")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
     updated_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)

@@ -373,15 +373,15 @@
                                 <span class="cnav-label">字幕组映射</span>
                                 <span class="cnav-badge" id="rgCount">0</span>
                             </a>
+                            <a class="cnav-item" data-section="__target_mappings">
+                                <span class="cnav-led"></span>
+                                <span class="cnav-label">目标映射表</span>
+                                <span class="cnav-badge" id="tmCount">0</span>
+                            </a>
                             <a class="cnav-item" data-section="__llm_providers">
                                 <span class="cnav-led"></span>
                                 <span class="cnav-label">LLM 提供商</span>
                                 <span class="cnav-badge" id="lpCount">0</span>
-                            </a>
-                            <a class="cnav-item" data-section="__runtime">
-                                <span class="cnav-led"></span>
-                                <span class="cnav-label">运行时配置</span>
-                                <span class="cnav-badge" id="rtCount">0</span>
                             </a>
                         </div>
                     </nav>
@@ -539,6 +539,7 @@
                     <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px">
                         <input type="text" class="form-input" id="onlineSearchInput" placeholder="全局搜索 Emos 条目（剧名 / 电影名）：设为目标会应用到第一个未匹配文件" style="flex:1">
                         <button class="btn btn-secondary" id="onlineSearchBtn">搜索</button>
+                        <button class="btn btn-primary" id="onlineAddAllBtn">一键全部加入上传队列</button>
                     </div>
                     <div id="onlineSearchResults"></div>
                     <div id="onlineRecognizeResult" style="margin-top:12px"></div>
@@ -575,6 +576,7 @@
                     <div style="margin-top:10px;font-size:13px;line-height:1.8;color:var(--text-muted)">
                         <div>上传失败时会推送一条报错信息；直接<b>回复</b>那条消息并发送正确目标，即可重新上传。例如：</div>
                         <div style="font-family:monospace;margin-top:4px">时光代理人S04E09 &nbsp;/&nbsp; 时光代理人 第4季第9集 &nbsp;/&nbsp; 时光代理人 4x09 &nbsp;/&nbsp; 时光代理人 (2024)</div>
+                        <div style="margin-top:6px">修正过一次的目标会被记入「目标映射表」，之后同名剧集自动套用，无需逐集指定；发送 <code>/upload</code> 可直接在 Telegram 里选择服务器本地文件上传。</div>
                         <div style="margin-top:6px">绑定：在「配置管理 → Telegram」填写 bot_token，然后给机器人发送 <code>/bind</code>；也可直接填写 chat_id。</div>
                     </div>
                 </div>

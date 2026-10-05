@@ -38,6 +38,11 @@ class RecognizeRequest(BaseModel):
     path: str
 
 
+class RecognizeBatchRequest(BaseModel):
+    paths: List[str]
+    max_workers: int = 6
+
+
 class TaskCreateRequest(BaseModel):
     file_path: str
     item_type: str
@@ -132,6 +137,15 @@ async def recognize(request: RecognizeRequest):
     """在线识别视频对应的 Emos 条目"""
     try:
         return _service().recognize(request.path)
+    except Exception as exc:
+        raise _fail(exc)
+
+
+@router.post("/recognize-batch")
+def recognize_batch(request: RecognizeBatchRequest):
+    """批量在线识别（并发），加快整季/整部剧的识别速度"""
+    try:
+        return _service().recognize_many(request.paths, max_workers=request.max_workers)
     except Exception as exc:
         raise _fail(exc)
 

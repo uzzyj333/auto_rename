@@ -437,6 +437,15 @@ class VideoFileHandler:
         except Exception as exc:
             self.logger.debug("推送 Telegram 报错信息失败: %s", exc)
 
+    def _clear_upload_error(self, file_path) -> None:
+        """上传成功后停止该文件的 Telegram 定时报错提醒"""
+        try:
+            from .telegram_bot import TelegramBotService
+
+            TelegramBotService.instance().clear_error(str(file_path))
+        except Exception as exc:
+            self.logger.debug("清除 Telegram 报错提醒失败: %s", exc)
+
 
     def add_downloader(self, downloader):
         """
@@ -933,8 +942,36 @@ class VideoFileHandler:
             matched_item_type = None
             match_error = ""
 
+            # 目标映射表优先：手动指定过的目标直接命中，跳过 TMDB/Emos 搜索
+            try:
+                from .mapping_store import TargetMappingStore
+
+                def _as_int(value):
+                    try:
+                        return int(value) if value not in (None, "") else None
+                    except (TypeError, ValueError):
+                        return None
+
+                mapped = TargetMappingStore.resolve(
+                    title=title,
+                    season=_as_int(season),
+                    episode=_as_int(episode),
+                    media_type=media_type,
+                    file_name=os.path.basename(file_path),
+                )
+            except Exception as exc:
+                self.logger.debug(f"查询目标映射表失败: {exc}")
+                mapped = None
+            if mapped:
+                matched_item_id = mapped.get("item_id")
+                matched_item_type = mapped.get("item_type")
+                console_log(
+                    f"✓ [线程#{worker_id}] 命中目标映射表: "
+                    f"{matched_item_type}/{matched_item_id} {mapped.get('label') or ''}"
+                )
+
             # 第二步：通过官方 API 在线识别（TMDB ID -> Emos item_type/item_id）
-            if tmdb_id and media_type and title:
+            if not matched_item_id and tmdb_id and media_type and title:
                 try:
                     season_num = int(season) if season else None
                 except (ValueError, TypeError):
@@ -1176,6 +1213,7 @@ class VideoFileHandler:
 
             console_log(f"\n🎉 [线程#{worker_id}] Emos 上传成功!")
             self._uploaded_files.add(file_path)
+            self._clear_upload_error(file_path)
             record_task(file_path, "completed", end_time=datetime.now())
             self._uploading_files.discard(file_path)
 

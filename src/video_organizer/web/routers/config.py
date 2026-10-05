@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from ..services.state import get_state_manager
 from ...database.session import get_session_local
-from ...database.models import ManualRule, ReleaseGroupMapping, LlmProvider, RuntimeConfig
+from ...database.models import ManualRule, ReleaseGroupMapping, LlmProvider
 
 logger = logging.getLogger(__name__)
 
@@ -121,11 +121,6 @@ class LlmProviderCreateRequest(BaseModel):
     weight: int = 1
     timeout: int = 30
     max_retries: int = 2
-
-
-class RuntimeConfigUpdateRequest(BaseModel):
-    value: str
-    description: Optional[str] = None
 
 
 # ===== DB Config CRUD Endpoints (must be before /{section} catch-all) =====
@@ -352,39 +347,98 @@ async def delete_llm_provider(provider_id: int):
         raise HTTPException(status_code=500, detail=f"删除 LLM 提供商失败: {e}")
 
 
-# 运行时配置
-@router.get("/db/runtime")
-async def get_runtime_config():
-    try:
-        with get_session_local()() as db:
-            items = db.query(RuntimeConfig).order_by(RuntimeConfig.key).all()
-            return {"success": True, "configs": [
-                {"key": c.key, "value": c.value, "description": c.description,
-                 "updated_at": c.updated_at.isoformat() if c.updated_at else None}
-                for c in items
-            ]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"获取运行时配置失败: {e}")
+class TargetMappingRequest(BaseModel):
+    match_type: str = "title"
+    keyword: str
+    media_type: Optional[str] = ""
+    season_number: Optional[int] = None
+    episode_number: Optional[int] = None
+    item_type: str
+    item_id: Any
+    label: Optional[str] = ""
+    storage: Optional[str] = ""
+    enabled: bool = True
 
 
-@router.put("/db/runtime/{config_key}")
-async def update_runtime_config(config_key: str, request: RuntimeConfigUpdateRequest):
+# 目标映射表（文字映射 / 剧集集数映射）
+@router.get("/db/target-mappings")
+async def get_target_mappings():
     try:
-        with get_session_local()() as db:
-            item = db.query(RuntimeConfig).filter(RuntimeConfig.key == config_key).first()
-            if not item:
-                item = RuntimeConfig(key=config_key, value=request.value,
-                                     description=request.description or "")
-                db.add(item)
-            else:
-                item.value = request.value
-                if request.description is not None:
-                    item.description = request.description
-                item.updated_at = datetime.now()
-            db.commit()
-            return {"success": True}
+        from ...core.mapping_store import TargetMappingStore
+
+        return {"success": True, "mappings": TargetMappingStore.list_all()}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"更新运行时配置失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取目标映射表失败: {e}")
+
+
+@router.post("/db/target-mappings", status_code=201)
+async def create_target_mapping(request: TargetMappingRequest):
+    try:
+        from ...core.mapping_store import TargetMappingStore
+
+        mapping_id = TargetMappingStore.create(
+            keyword=request.keyword,
+            item_type=request.item_type,
+            item_id=request.item_id,
+            match_type=request.match_type,
+            media_type=request.media_type or "",
+            season_number=request.season_number,
+            episode_number=request.episode_number,
+            label=request.label or "",
+            storage=request.storage or "",
+            source="web",
+            enabled=request.enabled,
+        )
+        if mapping_id is None:
+            raise HTTPException(status_code=500, detail="新增目标映射失败")
+        return {"success": True, "id": mapping_id}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"新增目标映射失败: {e}")
+
+
+@router.put("/db/target-mappings/{mapping_id}")
+async def update_target_mapping(mapping_id: int, request: TargetMappingRequest):
+    try:
+        from ...core.mapping_store import TargetMappingStore
+
+        ok = TargetMappingStore.update(
+            mapping_id,
+            match_type=request.match_type,
+            keyword=request.keyword,
+            media_type=request.media_type or "",
+            season_number=request.season_number,
+            episode_number=request.episode_number,
+            item_type=request.item_type,
+            item_id=request.item_id,
+            label=request.label or "",
+            storage=request.storage or "",
+            enabled=request.enabled,
+        )
+        if not ok:
+            raise HTTPException(status_code=404, detail="映射不存在")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"更新目标映射失败: {e}")
+
+
+@router.delete("/db/target-mappings/{mapping_id}")
+async def delete_target_mapping(mapping_id: int):
+    try:
+        from ...core.mapping_store import TargetMappingStore
+
+        if not TargetMappingStore.delete(mapping_id):
+            raise HTTPException(status_code=404, detail="映射不存在")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除目标映射失败: {e}")
 
 
 # ===== INI Config Endpoints =====

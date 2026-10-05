@@ -464,7 +464,8 @@ let _configCurrentSection = 'monitoring';
 let _dbManualRules = [];
 let _dbReleaseGroups = [];
 let _dbLlmProviders = [];
-let _dbRuntimeConfig = [];
+let _dbTargetMappings = [];
+let _tmSelectedTarget = null;
 
 async function loadConfig() {
     try {
@@ -480,16 +481,16 @@ async function loadConfig() {
 
 async function loadDbConfigs() {
     try {
-        const [mr, rg, lp, rt] = await Promise.all([
+        const [mr, rg, lp, tm] = await Promise.all([
             loadManualRulesFromApi(),
             loadReleaseGroupsFromApi(),
             loadLlmProvidersFromApi(),
-            loadRuntimeConfigFromApi(),
+            loadTargetMappingsFromApi(),
         ]);
         _dbManualRules = mr.rules || [];
         _dbReleaseGroups = rg.groups || [];
         _dbLlmProviders = lp.providers || [];
-        _dbRuntimeConfig = rt.configs || [];
+        _dbTargetMappings = tm.mappings || [];
         updateConfigBadges();
     } catch (e) { console.error('加载数据库配置失败:', e); }
 }
@@ -498,11 +499,11 @@ function updateConfigBadges() {
     const mr = document.getElementById('mrCount');
     const rg = document.getElementById('rgCount');
     const lp = document.getElementById('lpCount');
-    const rt = document.getElementById('rtCount');
     if (mr) mr.textContent = _dbManualRules.length;
     if (rg) rg.textContent = _dbReleaseGroups.length;
     if (lp) lp.textContent = _dbLlmProviders.length;
-    if (rt) rt.textContent = _dbRuntimeConfig.length;
+    const tmCount = document.getElementById('tmCount');
+    if (tmCount) tmCount.textContent = _dbTargetMappings.length;
 }
 
 function setupConfigNav() {
@@ -721,7 +722,7 @@ function renderDbConfigEditor(section) {
         case '__manual_rules': return renderManualRules();
         case '__release_groups': return renderReleaseGroups();
         case '__llm_providers': return renderLlmProviders();
-        case '__runtime': return renderRuntimeConfig();
+        case '__target_mappings': return renderTargetMappings();
         case '__downloaders': return renderDownloaderManager();
     }
 }
@@ -966,43 +967,6 @@ async function deleteLlmProvider(id) {
 }
 
 window.deleteLlmProvider = deleteLlmProvider;
-
-// ===== 运行时配置 =====
-
-function renderRuntimeConfig() {
-    const configs = _dbRuntimeConfig;
-    let html = `<div class="config-section"><div class="config-section-title">运行时配置</div>`;
-    if (configs.length === 0) {
-        html += `<div class="config-empty"><span class="empty-icon">⌀</span><span>暂无配置项</span></div>`;
-    } else {
-        html += `<div class="config-table-wrap"><table class="config-table">
-            <thead><tr><th>配置键</th><th>值</th><th>说明</th><th style="width:90px">操作</th></tr></thead><tbody>`;
-        configs.forEach(c => {
-            html += `<tr>
-                <td style="font-family:monospace;font-size:0.75rem;color:var(--text-muted)">${escapeHtml(c.key)}</td>
-                <td><input class="rt-value" data-key="${escapeHtml(c.key)}" value="${escapeHtml(c.value || '')}" style="font-family:monospace"></td>
-                <td style="font-size:0.75rem;color:var(--text-muted)">${escapeHtml(c.description || '')}</td>
-                <td><div class="btn-cell"><button class="save-btn" onclick="saveRuntimeConfig('${escapeHtml(c.key)}')">保存</button></div></td>
-            </tr>`;
-        });
-        html += `</tbody></table></div>`;
-    }
-    html += `</div>`;
-    el.configEditor.innerHTML = html;
-}
-
-async function saveRuntimeConfig(key) {
-    const input = document.querySelector(`.rt-value[data-key="${CSS.escape(key)}"]`);
-    if (!input) return;
-    try {
-        await updateRuntimeConfigViaApi(key, { value: input.value });
-        showToast('配置已保存', 'success');
-        await loadDbConfigs();
-        renderRuntimeConfig();
-    } catch (e) { showToast(`保存失败: ${e.message}`, 'error'); }
-}
-
-window.saveRuntimeConfig = saveRuntimeConfig;
 
 // ===== 保存 / 重新加载 INI 配置 =====
 
@@ -2032,6 +1996,7 @@ function bindOnlineEvents() {
     bind('onlineBrowseBtn', () => browseOnline(onlineState.path));
     bind('onlineScanBtn', () => scanOnline());
     bind('onlineRecognizeBtn', () => recognizeSelected());
+    bind('onlineAddAllBtn', () => addAllOnlineTasks());
     bind('onlineRefreshTasksBtn', () => loadOnlineTasks());
     bind('onlineClearTasksBtn', async () => {
         try { await clearOnlineTasksApi(); await loadOnlineTasks(); }
@@ -2149,6 +2114,9 @@ async function scanOnline() {
         renderOnlineVideos();
         const panel = document.getElementById('onlineVideoPanel');
         if (panel) panel.style.display = '';
+        if (data.skipped_incomplete) {
+            showToast('已跳过 ' + data.skipped_incomplete + ' 个未下载完成的文件', 'warning');
+        }
         if (!onlineState.videos.length) alert('该目录下没有扫描到视频文件');
     } catch (e) {
         alert('扫描失败: ' + e.message);
@@ -2220,16 +2188,22 @@ async function recognizeSelected() {
     if (!paths.length) { alert('请先勾选要识别的视频'); return; }
     const btn = document.getElementById('onlineRecognizeBtn');
     if (btn) { btn.disabled = true; btn.textContent = '识别中...'; }
-    const results = [];
-    for (const p of paths) {
-        try {
-            results.push(await recognizeOnlineApi(p));
-        } catch (e) {
-            results.push({
-                file_path: p,
-                file_name: p.replace(/^.*[\\/]/, ''),
-                metadata: {}, candidates: [], match: null, error: e.message,
-            });
+    let results = [];
+    try {
+        // 并发识别，整季/整部剧一次性识别完，比逐个串行快很多
+        const data = await recognizeOnlineBatchApi(paths, 8);
+        results = data.results || [];
+    } catch (e) {
+        for (const p of paths) {
+            try {
+                results.push(await recognizeOnlineApi(p));
+            } catch (err) {
+                results.push({
+                    file_path: p,
+                    file_name: p.replace(/^.*[\\/]/, ''),
+                    metadata: {}, candidates: [], match: null, error: err.message,
+                });
+            }
         }
     }
     onlineState.recognized = results.map(buildRecognizedItem);
@@ -2237,6 +2211,7 @@ async function recognizeSelected() {
     onlineState.groupKeywords = {};
     renderOnlineRecognize();
     if (btn) { btn.disabled = false; btn.textContent = '识别选中文件'; }
+    showToast('已识别 ' + results.length + ' 个文件', 'success');
 }
 
 function buildRecognizedItem(data) {
@@ -2329,6 +2304,7 @@ function renderOnlineRecognize() {
                 '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
                     '<input type="text" class="form-input" data-online-group-input="' + gi + '" value="' + escapeOnline((onlineState.groupKeywords || {})[gi] || group.key) + '" placeholder="搜索 Emos 条目（可改成别名）" style="min-width:200px">' +
                     '<button class="btn btn-secondary btn-sm" data-online-group-search="' + gi + '">搜索并匹配本组</button>' +
+                    '<button class="btn btn-primary btn-sm" data-online-group-add="' + gi + '">本组全部加入队列</button>' +
                     '<button class="btn btn-secondary btn-sm" data-online-group-clear="' + gi + '">清除本组目标</button>' +
                 '</div>' +
             '</div>' +
@@ -2363,7 +2339,9 @@ function renderOnlineRecognize() {
                 '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
                     '<select class="form-input" data-online-target="' + index + '" style="min-width:260px">' + optionHtml + '</select>' +
                     '<select class="form-input" data-online-storage="' + index + '" style="min-width:130px">' + storageHtml + '</select>' +
-                    '<button class="btn btn-primary btn-sm" data-online-add="' + index + '">加入上传队列</button>' +
+                    (item.submitted
+                        ? '<button class="btn btn-secondary btn-sm" disabled>✅ 已提交</button>'
+                        : '<button class="btn btn-primary btn-sm" data-online-add="' + index + '">加入上传队列</button>') +
                 '</div>' +
             '</div>' +
         '</div>';
@@ -2393,6 +2371,9 @@ function renderOnlineRecognize() {
     }));
     box.querySelectorAll('[data-online-group-clear]').forEach(node => node.addEventListener('click', () => {
         clearOnlineGroupTargets(parseInt(node.getAttribute('data-online-group-clear'), 10));
+    }));
+    box.querySelectorAll('[data-online-group-add]').forEach(node => node.addEventListener('click', () => {
+        submitOnlineGroup(parseInt(node.getAttribute('data-online-group-add'), 10));
     }));
     // 重新渲染后把本组上次的搜索结果也画回来，方便连续调整
     (onlineState.groupList || []).forEach((group, gi) => {
@@ -2560,25 +2541,73 @@ async function addOnlineTask(index) {
     const item = onlineState.recognized[index];
     if (!item) return;
     if (!item.target) { alert('请先为该文件选择一个上传目标'); return; }
-    const meta = item.metadata || {};
+    if (item.submitted) { showToast('该文件已提交，请勿重复提交', 'warning'); return; }
+    const btn = document.querySelector('[data-online-add="' + index + '"]');
+    if (btn) btn.disabled = true;
     try {
-        const result = await createOnlineTasksApi([{
-            file_path: item.file_path,
-            item_type: item.target.item_type,
-            item_id: String(item.target.item_id),
-            storage: item.storage || null,
+        await submitOnlineTasks([item]);
+    } finally {
+        if (btn && document.body.contains(btn)) btn.disabled = false;
+    }
+}
+
+// 一键把多个已选好目标的文件加入上传队列；后端会按文件去重，重复点击不会重复上传
+async function submitOnlineTasks(items) {
+    const targets = (items || []).filter(it => it && it.target && !it.submitted);
+    if (!targets.length) { showToast('没有可提交的文件（请先选择上传目标）', 'warning'); return; }
+    const payload = targets.map(it => {
+        const meta = it.metadata || {};
+        return {
+            file_path: it.file_path,
+            item_type: it.target.item_type,
+            item_id: String(it.target.item_id),
+            storage: it.storage || null,
             title: meta.title || '',
             media_type: meta.media_type || '',
             season_number: meta.season == null ? null : meta.season,
             episode_number: meta.episode == null ? null : meta.episode,
-        }]);
+        };
+    });
+    try {
+        const result = await createOnlineTasksApi(payload);
+        const created = (result.tasks || []).length;
+        const duplicates = (result.duplicates || []).length;
         if (result.errors && result.errors.length) {
-            alert('创建任务失败: ' + result.errors.join('；'));
+            alert('部分任务创建失败: ' + result.errors.join('；'));
         }
+        targets.forEach(it => { it.submitted = true; });
+        renderOnlineRecognize();
         await loadOnlineTasks();
+        if (created) {
+            showToast('提交上传成功：' + created + ' 个' + (duplicates ? '，跳过重复 ' + duplicates + ' 个' : ''), 'success');
+        } else if (duplicates) {
+            showToast('这些文件已在队列或已上传，已跳过 ' + duplicates + ' 个', 'warning');
+        }
     } catch (e) {
-        alert('创建任务失败: ' + e.message);
+        alert('提交上传失败: ' + e.message);
     }
+}
+
+// 一键全部加入上传队列（所有已匹配目标的文件）
+async function addAllOnlineTasks() {
+    const items = onlineState.recognized.filter(it => it.target && !it.submitted);
+    if (!items.length) { showToast('没有已匹配目标的文件，请先选择上传目标', 'warning'); return; }
+    const btn = document.getElementById('onlineAddAllBtn');
+    if (btn) { btn.disabled = true; btn.textContent = '提交中...'; }
+    try {
+        await submitOnlineTasks(items);
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '一键全部加入上传队列'; }
+    }
+}
+
+// 本组全部加入上传队列
+async function submitOnlineGroup(groupIndex) {
+    const group = (onlineState.groupList || [])[groupIndex];
+    if (!group) return;
+    const items = group.items.map(entry => entry.item).filter(it => it.target && !it.submitted);
+    if (!items.length) { showToast('本组没有可提交的文件（请先选择上传目标）', 'warning'); return; }
+    await submitOnlineTasks(items);
 }
 
 async function loadOnlineTasks() {
@@ -2661,4 +2690,166 @@ function renderOnlineTasks() {
         try { await deleteOnlineTaskApi(node.getAttribute('data-online-delete')); await loadOnlineTasks(); }
         catch (e) { alert('删除失败: ' + e.message); }
     }));
+}
+
+// ===== 目标映射表（文字映射 / 剧集集数映射） =====
+
+function tmTypeLabel(type) {
+    return type === 'episode' ? '剧集集数' : '文字';
+}
+
+function renderTargetMappings() {
+    const mappings = _dbTargetMappings;
+    let html = '<div class="config-section"><div class="config-section-title">目标映射表</div>';
+    html += '<div class="config-hint" style="margin-bottom:12px;font-size:0.8125rem;color:var(--text-muted)">' +
+        '命中映射的文件会直接上传到记录的目标，跳过 TMDB / Emos 搜索。在 Telegram 手动回复修正过的目标会自动记入此表。' +
+        '「文字映射」按关键词匹配标题或文件名；「剧集集数映射」需同时匹配剧名与季/集号。</div>';
+    if (!mappings.length) {
+        html += '<div class="config-empty"><span class="empty-icon">⌀</span><span>暂无映射</span></div>';
+    } else {
+        html += '<div class="config-table-wrap"><table class="config-table">' +
+            '<thead><tr><th style="width:90px">类型</th><th>关键词 / 剧名</th><th style="width:60px">季</th><th style="width:60px">集</th><th>上传目标</th><th style="width:70px">来源</th><th style="width:56px">启用</th><th style="width:80px">操作</th></tr></thead><tbody>';
+        mappings.forEach(m => {
+            html += '<tr>' +
+                '<td>' + escapeHtml(tmTypeLabel(m.match_type)) + '</td>' +
+                '<td>' + escapeHtml(m.keyword || '') + '</td>' +
+                '<td>' + (m.season_number == null ? '-' : escapeHtml(String(m.season_number))) + '</td>' +
+                '<td>' + (m.episode_number == null ? '-' : escapeHtml(String(m.episode_number))) + '</td>' +
+                '<td>' + escapeHtml((m.label ? m.label + ' ' : '') + '(' + (m.item_type || '') + '/' + (m.item_id || '') + ')') + '</td>' +
+                '<td>' + escapeHtml(m.source || '') + '</td>' +
+                '<td><input type="checkbox" class="tm-enabled" data-id="' + m.id + '"' + (m.enabled ? ' checked' : '') + ' style="width:auto"></td>' +
+                '<td><button class="del-btn" onclick="deleteTargetMapping(' + m.id + ')">删除</button></td>' +
+                '</tr>';
+        });
+        html += '</tbody></table></div>';
+    }
+    html += '<div class="add-row-bar" style="flex-wrap:wrap;gap:8px">' +
+        '<select id="newTmType" style="width:130px"><option value="title">文字映射</option><option value="episode">剧集集数映射</option></select>' +
+        '<input type="text" id="newTmKeyword" placeholder="关键词 / 剧名" style="flex:1;min-width:160px">' +
+        '<input type="number" id="newTmSeason" placeholder="季" style="width:70px">' +
+        '<input type="number" id="newTmEpisode" placeholder="集" style="width:70px">' +
+        '<input type="text" id="newTmItem" placeholder="目标 item_type/item_id（可用搜索选择）" style="flex:1;min-width:200px">' +
+        '<button class="btn btn-secondary btn-sm" onclick="searchTmTarget()">搜索目标</button>' +
+        '<button class="add-btn" onclick="addTargetMapping()">+ 添加</button>' +
+        '</div><div id="tmSearchResults" style="margin-top:8px"></div></div>';
+    el.configEditor.innerHTML = html;
+    document.querySelectorAll('#config-editor .tm-enabled').forEach(node => {
+        node.addEventListener('change', () => toggleTargetMapping(parseInt(node.getAttribute('data-id'), 10), node.checked));
+    });
+}
+
+async function searchTmTarget() {
+    const keyword = (document.getElementById('newTmKeyword')?.value || '').trim();
+    const box = document.getElementById('tmSearchResults');
+    if (!keyword) { showToast('请先填写关键词 / 剧名', 'warning'); return; }
+    if (box) box.innerHTML = '<div style="font-size:12px;color:var(--text-muted)">搜索中…</div>';
+    try {
+        const data = await searchOnlineTargetsApi(keyword);
+        const results = data.results || [];
+        if (!results.length) {
+            if (box) box.innerHTML = '<div class="config-empty"><span>未搜索到 Emos 条目</span></div>';
+            return;
+        }
+        window._tmSearchResults = results;
+        let html = '<div class="table-container" style="max-height:240px;overflow:auto"><table>' +
+            '<thead><tr><th>标题</th><th style="width:70px">年份</th><th style="width:90px">类型</th><th style="width:150px">item_id</th><th style="width:110px">操作</th></tr></thead><tbody>';
+        results.forEach((item, i) => {
+            html += '<tr><td>' + escapeOnline(item.title || '') + '</td>' +
+                '<td>' + escapeOnline(yearOfItem(item) || '-') + '</td>' +
+                '<td>' + escapeOnline(item.video_type || '') + '</td>' +
+                '<td>' + escapeOnline(item.item_type + '/' + item.item_id) + '</td>' +
+                '<td><button class="btn btn-secondary btn-sm" data-tm-pick="' + i + '">选为目标</button></td></tr>';
+        });
+        html += '</tbody></table></div>';
+        if (box) {
+            box.innerHTML = html;
+            box.querySelectorAll('[data-tm-pick]').forEach(node => node.addEventListener('click', () => {
+                pickTmTarget(parseInt(node.getAttribute('data-tm-pick'), 10));
+            }));
+        }
+    } catch (e) {
+        if (box) box.innerHTML = '<div style="color:#e5534b">搜索失败: ' + escapeOnline(e.message) + '</div>';
+    }
+}
+
+function pickTmTarget(index) {
+    const results = window._tmSearchResults || [];
+    const item = results[index];
+    if (!item) return;
+    _tmSelectedTarget = { item_type: item.item_type || 'vl', item_id: String(item.item_id), label: item.title || '' };
+    const input = document.getElementById('newTmItem');
+    if (input) input.value = _tmSelectedTarget.item_type + '/' + _tmSelectedTarget.item_id + ' ' + _tmSelectedTarget.label;
+    showToast('已选择目标：' + _tmSelectedTarget.label, 'success');
+}
+
+function parseTmItemInput() {
+    if (_tmSelectedTarget) return _tmSelectedTarget;
+    const raw = (document.getElementById('newTmItem')?.value || '').trim();
+    const match = raw.match(/([A-Za-z]{2})\s*\/\s*([0-9]+)/);
+    if (!match) return null;
+    return { item_type: match[1], item_id: match[2], label: '' };
+}
+
+async function addTargetMapping() {
+    const matchType = document.getElementById('newTmType').value;
+    const keyword = (document.getElementById('newTmKeyword').value || '').trim();
+    const seasonRaw = document.getElementById('newTmSeason').value;
+    const episodeRaw = document.getElementById('newTmEpisode').value;
+    const target = parseTmItemInput();
+    if (!keyword) { showToast('请填写关键词 / 剧名', 'warning'); return; }
+    if (!target) { showToast('请选择或填写上传目标', 'warning'); return; }
+    if (matchType === 'episode' && !episodeRaw) { showToast('剧集集数映射必须填写集数', 'warning'); return; }
+    try {
+        await createTargetMappingViaApi({
+            match_type: matchType,
+            keyword: keyword,
+            season_number: seasonRaw === '' ? null : Number(seasonRaw),
+            episode_number: episodeRaw === '' ? null : Number(episodeRaw),
+            item_type: target.item_type,
+            item_id: target.item_id,
+            label: target.label || '',
+            enabled: true,
+        });
+        _tmSelectedTarget = null;
+        showToast('映射已添加', 'success');
+        await loadDbConfigs();
+        renderTargetMappings();
+    } catch (e) {
+        showToast('添加失败: ' + e.message, 'error');
+    }
+}
+
+async function toggleTargetMapping(id, enabled) {
+    const mapping = _dbTargetMappings.find(m => m.id === id);
+    if (!mapping) return;
+    try {
+        await updateTargetMappingViaApi(id, {
+            match_type: mapping.match_type,
+            keyword: mapping.keyword,
+            media_type: mapping.media_type || '',
+            season_number: mapping.season_number,
+            episode_number: mapping.episode_number,
+            item_type: mapping.item_type,
+            item_id: mapping.item_id,
+            label: mapping.label || '',
+            enabled: enabled,
+        });
+        mapping.enabled = enabled;
+        showToast(enabled ? '已启用' : '已停用', 'success');
+    } catch (e) {
+        showToast('更新失败: ' + e.message, 'error');
+        renderTargetMappings();
+    }
+}
+
+async function deleteTargetMapping(id) {
+    if (!confirm('确定删除这条映射？')) return;
+    try {
+        await deleteTargetMappingViaApi(id);
+        showToast('已删除', 'success');
+        await loadDbConfigs();
+        renderTargetMappings();
+    } catch (e) {
+        showToast('删除失败: ' + e.message, 'error');
+    }
 }

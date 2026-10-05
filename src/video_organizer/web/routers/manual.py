@@ -191,7 +191,15 @@ async def scan_directory(request: ScanDirectoryRequest):
                 video_files.extend(directory.glob(f"*{ext}"))
         
         # 转换为字符串列表
-        file_list = [str(f) for f in video_files if f.is_file()]
+        # 排除下载器里还没下完的文件，避免识别到半成品
+        from ...core.incomplete_downloads import collect_incomplete_paths, is_incomplete
+
+        incomplete = collect_incomplete_paths()
+        file_list = [
+            str(f)
+            for f in video_files
+            if f.is_file() and not (incomplete and is_incomplete(f, incomplete))
+        ]
         
         return ScanDirectoryResponse(
             success=True,

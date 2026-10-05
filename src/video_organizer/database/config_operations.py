@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from ..web.auth import hash_password
 from .models import (
-    ManualRule, ReleaseGroupMapping, LlmProvider, AuthUser, RuntimeConfig,
+    ManualRule, ReleaseGroupMapping, LlmProvider, AuthUser,
 )
 from .session import get_session_local
 
@@ -121,19 +121,6 @@ def seed_from_ini(config: Dict[str, Any]) -> bool:
                 print("=" * 60, flush=True)
                 seeded = True
 
-            # 5. Runtime Config
-            if db.query(RuntimeConfig).count() == 0:
-                proc = config.get("processing", {})
-                items = {
-                    "upload_targets": str(proc.get("upload_targets", "")),
-                    "delete_after_upload": str(proc.get("delete_after_upload", "false")),
-                    "max_upload_workers": str(proc.get("max_upload_workers", "3")),
-                }
-                for k, v in items.items():
-                    db.add(RuntimeConfig(key=k, value=v, description="", updated_at=now))
-                logger.info("已从 INI 导入运行时配置到数据库")
-                seeded = True
-
             if seeded:
                 db.commit()
         return seeded
@@ -191,13 +178,3 @@ def get_auth_users() -> Dict[str, str]:
             return {u.username: u.password_hash for u in users}
     except Exception:
         return {}
-
-
-def get_runtime_config(key: str, default: str = "") -> str:
-    """获取运行时配置项"""
-    try:
-        with get_session_local()() as db:
-            item = db.query(RuntimeConfig).filter(RuntimeConfig.key == key).first()
-            return item.value if item else default
-    except Exception:
-        return default
