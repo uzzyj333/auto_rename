@@ -77,6 +77,37 @@ def _now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _format_size(num_bytes: Any) -> str:
+    """把字节数格式化成可读大小（如 1.2 GB）"""
+    try:
+        size = float(num_bytes)
+    except (TypeError, ValueError):
+        return ""
+    if size <= 0:
+        return ""
+    units = ["B", "KB", "MB", "GB", "TB"]
+    index = 0
+    while size >= 1024 and index < len(units) - 1:
+        size /= 1024.0
+        index += 1
+    if index == 0:
+        return f"{int(size)} {units[index]}"
+    return f"{size:.1f} {units[index]}"
+
+
+def _shorten_text(text: str, limit: int) -> str:
+    """按钮文字过长时保留头尾、中间省略，避免被 Telegram 截断"""
+    text = str(text or "")
+    if limit <= 0 or len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    keep = limit - 1
+    head = keep // 2 + keep % 2
+    tail = keep - head
+    return f"{text[:head]}…{text[-tail:]}"
+
+
 def _candidate_contains_item(video: Dict[str, Any], item_id: str) -> bool:
     """判断作品候选自身或其季/集里是否包含指定条目 id"""
     if not isinstance(video, dict) or not item_id:
@@ -854,7 +885,14 @@ class TelegramBotService:
 
         # 子目录 + 文件合并成一个可翻页列表（目录在前）
         entries: List[Dict[str, Any]] = [{"kind": "dir", "path": d} for d in dirs]
-        entries += [{"kind": "file", "path": f} for f in files]
+        total_size = 0
+        for item in files:
+            try:
+                size = item.stat().st_size
+            except OSError:
+                size = 0
+            total_size += size
+            entries.append({"kind": "file", "path": item, "size": size})
         total = len(entries)
         total_pages = max(1, (total + _BROWSE_PAGE_SIZE - 1) // _BROWSE_PAGE_SIZE)
         try:
@@ -895,8 +933,16 @@ class TelegramBotService:
                     ]
                 )
             else:
+                size_text = _format_size(entry.get("size"))
+                suffix = f"（{size_text}）" if size_text else ""
+                name = _shorten_text(target.name, max(8, 58 - len(suffix)))
                 rows.append(
-                    [{"text": f"🎬 {target.name}", "callback_data": f"up:file:{token}"}]
+                    [
+                        {
+                            "text": f"🎬 {name}{suffix}",
+                            "callback_data": f"up:file:{token}",
+                        }
+                    ]
                 )
         if total_pages > 1:
             nav: List[Dict[str, str]] = []
@@ -919,6 +965,9 @@ class TelegramBotService:
         if not page_entries:
             rows.append([{"text": "（此目录没有可上传文件）", "callback_data": "up:noop"}])
         text = f"目录：{base}\n子目录 {len(dirs)} 个 · 视频/字幕 {len(files)} 个"
+        size_text = _format_size(total_size)
+        if size_text:
+            text += f"（共 {size_text}）"
         if total_pages > 1:
             text += f"（第 {page + 1}/{total_pages} 页）"
         self._send_keyboard(chat_id, text, rows, edit_message_id)
@@ -1122,8 +1171,16 @@ class TelegramBotService:
             self.send_text(f"该文件夹下没有可上传的视频/字幕：{base}", chat_id=chat_id)
             return
 
+        total_size = 0
+        for item in files:
+            try:
+                total_size += item.stat().st_size
+            except OSError:
+                continue
+        size_text = _format_size(total_size)
+        summary = f"共 {len(files)} 个文件" + (f"（{size_text}）" if size_text else "")
         self.send_text(
-            f"📂 开始上传文件夹：{base.name}\n共 {len(files)} 个文件，正在逐个识别上传…",
+            f"📂 开始上传文件夹：{base.name}\n{summary}，正在逐个识别上传…",
             chat_id=chat_id,
         )
 

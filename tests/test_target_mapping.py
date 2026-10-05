@@ -429,6 +429,19 @@ class TestMappingAliasAndStatus(_TempDbMixin, unittest.TestCase):
         )
         self.assertEqual(TelegramBotService._coerce_config_value("x", " y "), "y")
 
+    def test_format_size_and_shorten_text(self):
+        from src.video_organizer.core.telegram_bot import _format_size, _shorten_text
+
+        self.assertEqual(_format_size(512), "512 B")
+        self.assertEqual(_format_size(1536), "1.5 KB")
+        self.assertEqual(_format_size(0), "")
+        self.assertEqual(_format_size(None), "")
+
+        self.assertEqual(_shorten_text("abc", 5), "abc")
+        shortened = _shorten_text("abcdefghij", 5)
+        self.assertLessEqual(len(shortened), 5)
+        self.assertTrue(shortened.endswith("j"))
+
 
 if __name__ == "__main__":
     unittest.main()
