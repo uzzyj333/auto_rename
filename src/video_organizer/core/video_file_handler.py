@@ -780,6 +780,28 @@ class VideoFileHandler:
             # 同步直接处理
             return self._process_file_internal(file_path)
 
+    def _resolve_target_mapping(self, title, season, episode, media_type, file_name=""):
+        """查询目标映射表；命中返回 item_type/item_id 等，否则 None"""
+        try:
+            from .mapping_store import TargetMappingStore
+
+            def _as_int(value):
+                try:
+                    return int(value) if value not in (None, "") else None
+                except (TypeError, ValueError):
+                    return None
+
+            return TargetMappingStore.resolve(
+                title=str(title or ""),
+                season=_as_int(season),
+                episode=_as_int(episode),
+                media_type=str(media_type or ""),
+                file_name=str(file_name or ""),
+            )
+        except Exception as exc:
+            self.logger.debug(f"查询目标映射表失败: {exc}")
+            return None
+
     def _process_file_internal(self, file_path, worker_id=0):
         """
         内部文件处理逻辑（包含元数据获取、API调用、上传）
@@ -815,8 +837,20 @@ class VideoFileHandler:
             # 提取所需信息
             tmdb_id = str(metadata.get("tmdb_id", ""))
 
+            # 目标映射表优先：手动指定过的目标直接命中，跳过 TMDB / Emos 搜索。
+            # 必须放在「TMDB 未识别」分支之前，否则 TMDB 识别不出剧名时映射永远没机会命中。
+            mapped_target = self._resolve_target_mapping(
+                metadata.get("title")
+                or metadata.get("show_name")
+                or metadata.get("original_filename", ""),
+                metadata.get("season"),
+                metadata.get("episode"),
+                metadata.get("media_type") or "",
+                os.path.basename(file_path),
+            )
+
             # 检查是否成功获取到 TMDB ID
-            if not tmdb_id or tmdb_id == "":
+            if (not tmdb_id) and not mapped_target:
                 console_log(f"\n❌ [线程#{worker_id}] 未找到 TMDB 匹配结果")
                 tmdb_request_failed = bool(
                     self.renamer.tmdb_client
@@ -943,25 +977,9 @@ class VideoFileHandler:
             match_error = ""
 
             # 目标映射表优先：手动指定过的目标直接命中，跳过 TMDB/Emos 搜索
-            try:
-                from .mapping_store import TargetMappingStore
-
-                def _as_int(value):
-                    try:
-                        return int(value) if value not in (None, "") else None
-                    except (TypeError, ValueError):
-                        return None
-
-                mapped = TargetMappingStore.resolve(
-                    title=title,
-                    season=_as_int(season),
-                    episode=_as_int(episode),
-                    media_type=media_type,
-                    file_name=os.path.basename(file_path),
-                )
-            except Exception as exc:
-                self.logger.debug(f"查询目标映射表失败: {exc}")
-                mapped = None
+            mapped = mapped_target or self._resolve_target_mapping(
+                title, season, episode, media_type, os.path.basename(file_path)
+            )
             if mapped:
                 matched_item_id = mapped.get("item_id")
                 matched_item_type = mapped.get("item_type")
@@ -969,6 +987,34 @@ class VideoFileHandler:
                     f"✓ [线程#{worker_id}] 命中目标映射表: "
                     f"{matched_item_type}/{matched_item_id} {mapped.get('label') or ''}"
                 )
+                # 作品级(vl)/整季(vs)映射需要定位到具体某一集(ve)，
+                # 否则电视剧上传接口会 404（与在线识别上传的处理保持一致）。
+                if matched_item_type in {"vl", "vs"} and media_type != "movie":
+                    try:
+                        season_num = int(season) if season not in (None, "") else None
+                    except (ValueError, TypeError):
+                        season_num = None
+                    try:
+                        episode_num = int(episode) if episode not in (None, "") else None
+                    except (ValueError, TypeError):
+                        episode_num = None
+                    if episode_num is not None:
+                        from .online_upload import OnlineUploadService
+
+                        resolved = OnlineUploadService.resolve_episode_from_tree(
+                            self.get_emos_client(),
+                            matched_item_id,
+                            season_num,
+                            episode_num,
+                        )
+                        if resolved and resolved.get("item_id"):
+                            matched_item_id = resolved.get("item_id")
+                            matched_item_type = resolved.get("item_type") or "ve"
+                            console_log(
+                                f"✓ [线程#{worker_id}] 映射定位到具体剧集: "
+                                f"{matched_item_type}/{matched_item_id} "
+                                f"{resolved.get('label') or ''}"
+                            )
 
             # 第二步：通过官方 API 在线识别（TMDB ID -> Emos item_type/item_id）
             if not matched_item_id and tmdb_id and media_type and title:

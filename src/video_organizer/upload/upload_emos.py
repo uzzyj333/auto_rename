@@ -516,8 +516,11 @@ class RobustEmosVideoUploader:
             if not isinstance(media, dict):
                 continue
             name = str(media.get("media_name") or "").strip()
-            if name and name == file_name:
-                return True
+            if name:
+                # 有文件名时只认文件名完全一致，避免仅凭大小把别的文件误判成「已上传」
+                if name == file_name:
+                    return True
+                continue
             try:
                 size = int(media.get("media_file_size") or 0)
             except (TypeError, ValueError):

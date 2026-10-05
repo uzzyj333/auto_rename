@@ -44,6 +44,7 @@ _SEND_TIMEOUT = 15
 _ERROR_NOTIFY_INTERVAL = 300  # 同一文件的同类报错 5 分钟只推一次
 _REMINDER_INTERVAL = 30       # 报错提醒检查间隔（秒）
 _MAX_BROWSE_TOKENS = 500      # 最多记住多少个「浏览/上传」路径令牌
+_BROWSE_PAGE_SIZE = 20        # 目录浏览每页显示的条目数
 
 # Telegram 里可选择上传的文件类型（视频 + 外挂字幕）
 _UPLOAD_FILE_EXTENSIONS = {
@@ -60,7 +61,8 @@ _CN_DIGITS = {
 _HELP_TEXT = (
     "可用指令：\n"
     "/bind  绑定当前会话（把 chat_id 写回配置）\n"
-    "/upload  选择本地上传文件并上传\n"
+    "/upload  浏览并选择本地文件 / 整个文件夹上传\n"
+    "/config  查看/修改「处理配置」与「Emos API」\n"
     "/status  查看机器人状态\n"
     "/help  查看本帮助\n\n"
     "修正上传目标：直接「回复」某条报错信息并发送目标，例如\n"
@@ -73,6 +75,23 @@ _HELP_TEXT = (
 
 def _now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _candidate_contains_item(video: Dict[str, Any], item_id: str) -> bool:
+    """判断作品候选自身或其季/集里是否包含指定条目 id"""
+    if not isinstance(video, dict) or not item_id:
+        return False
+    if str(video.get("item_id") or "") == item_id:
+        return True
+    for season in video.get("seasons") or []:
+        if not isinstance(season, dict):
+            continue
+        if str(season.get("item_id") or "") == item_id:
+            return True
+        for episode in season.get("episodes") or []:
+            if isinstance(episode, dict) and str(episode.get("item_id") or "") == item_id:
+                return True
+    return False
 
 
 def _cn_to_int(text: str) -> Optional[int]:
@@ -498,6 +517,7 @@ class TelegramBotService:
                 (key, dict(item))
                 for key, item in self._active_errors.items()
                 if now - float(item.get("last_sent") or 0.0) >= _ERROR_NOTIFY_INTERVAL
+                and not item.get("quiet")
             ]
         for key, item in due:
             header = item.get("header") or "上传失败"
@@ -655,6 +675,9 @@ class TelegramBotService:
                 chat_id=chat_id,
             )
             return
+        if context.get("_config_key"):
+            self._apply_config_value(context, text, chat_id, reply_to)
+            return
         self._handle_correction(context, text, chat_id, reply_to)
 
     def _handle_command(
@@ -687,6 +710,9 @@ class TelegramBotService:
             return
         if command in ("/upload", "/files"):
             self._send_browse(chat_id, "", None)
+            return
+        if command in ("/config", "/设置"):
+            self._send_config_menu(chat_id)
             return
         if command == "/status":
             self.send_text(self._status_text(), chat_id=chat_id)
@@ -764,8 +790,14 @@ class TelegramBotService:
         except Exception as exc:
             logger.debug("发送 Telegram 按钮消息失败: %s", exc)
 
-    def _send_browse(self, chat_id: str, path: str, edit_message_id: Optional[int] = None) -> None:
-        """展示目录浏览键盘：目录 / 视频字幕文件"""
+    def _send_browse(
+        self,
+        chat_id: str,
+        path: str,
+        edit_message_id: Optional[int] = None,
+        page: int = 0,
+    ) -> None:
+        """展示目录浏览键盘：目录 / 视频字幕文件，支持翻页与整目录上传"""
         from .online_upload import OnlineUploadService
 
         service = OnlineUploadService.instance()
@@ -789,8 +821,13 @@ class TelegramBotService:
                 )
                 return
             rows = [
-                [{"text": f"📁 {root}", "callback_data": f"up:ls:{self._token_for_path(root)}"}]
-                for root in roots[:40]
+                [
+                    {
+                        "text": f"📁 {root}",
+                        "callback_data": f"up:ls:{self._token_for_path(root)}:0",
+                    }
+                ]
+                for root in roots[:_BROWSE_PAGE_SIZE]
             ]
             self._send_keyboard(
                 chat_id, "请选择要上传文件所在的视频根目录：", rows, edit_message_id
@@ -798,14 +835,6 @@ class TelegramBotService:
             return
 
         base = Path(str(directory))
-        rows: List[List[Dict[str, str]]] = []
-        parent = str(base.parent)
-        rows.append(
-            [
-                {"text": "⬆️ 上一级", "callback_data": f"up:ls:{self._token_for_path(parent)}"},
-                {"text": "🏠 根目录", "callback_data": "up:roots"},
-            ]
-        )
         dirs: List[Path] = []
         files: List[Path] = []
         try:
@@ -823,17 +852,75 @@ class TelegramBotService:
             self.send_text(f"无法读取目录：{exc}", chat_id=chat_id)
             return
 
-        for entry in dirs[:20]:
+        # 子目录 + 文件合并成一个可翻页列表（目录在前）
+        entries: List[Dict[str, Any]] = [{"kind": "dir", "path": d} for d in dirs]
+        entries += [{"kind": "file", "path": f} for f in files]
+        total = len(entries)
+        total_pages = max(1, (total + _BROWSE_PAGE_SIZE - 1) // _BROWSE_PAGE_SIZE)
+        try:
+            page = int(page)
+        except (TypeError, ValueError):
+            page = 0
+        page = max(0, min(page, total_pages - 1))
+        start = page * _BROWSE_PAGE_SIZE
+        page_entries = entries[start : start + _BROWSE_PAGE_SIZE]
+        base_token = self._token_for_path(str(base))
+
+        rows: List[List[Dict[str, str]]] = [
+            [
+                {
+                    "text": "⬆️ 上一级",
+                    "callback_data": f"up:ls:{self._token_for_path(str(base.parent))}:0",
+                },
+                {"text": "🏠 根目录", "callback_data": "up:roots"},
+            ]
+        ]
+        if dirs or files:
             rows.append(
-                [{"text": f"📁 {entry.name}", "callback_data": f"up:ls:{self._token_for_path(str(entry))}"}]
+                [
+                    {
+                        "text": "📤 上传此文件夹全部视频",
+                        "callback_data": f"up:dir:{base_token}",
+                    }
+                ]
             )
-        for entry in files[:40]:
-            rows.append(
-                [{"text": f"🎬 {entry.name}", "callback_data": f"up:file:{self._token_for_path(str(entry))}"}]
-            )
-        if len(rows) == 1:
+        for entry in page_entries:
+            target = entry["path"]
+            token = self._token_for_path(str(target))
+            if entry["kind"] == "dir":
+                rows.append(
+                    [
+                        {"text": f"📁 {target.name}", "callback_data": f"up:ls:{token}:0"},
+                        {"text": "📤 上传", "callback_data": f"up:dir:{token}"},
+                    ]
+                )
+            else:
+                rows.append(
+                    [{"text": f"🎬 {target.name}", "callback_data": f"up:file:{token}"}]
+                )
+        if total_pages > 1:
+            nav: List[Dict[str, str]] = []
+            if page > 0:
+                nav.append(
+                    {
+                        "text": "⬅️ 上一页",
+                        "callback_data": f"up:ls:{base_token}:{page - 1}",
+                    }
+                )
+            nav.append({"text": f"{page + 1}/{total_pages}", "callback_data": "up:noop"})
+            if page < total_pages - 1:
+                nav.append(
+                    {
+                        "text": "下一页 ➡️",
+                        "callback_data": f"up:ls:{base_token}:{page + 1}",
+                    }
+                )
+            rows.append(nav)
+        if not page_entries:
             rows.append([{"text": "（此目录没有可上传文件）", "callback_data": "up:noop"}])
-        text = f"目录：{base}\n选择要上传的文件（{len(files)} 个视频/字幕）："
+        text = f"目录：{base}\n子目录 {len(dirs)} 个 · 视频/字幕 {len(files)} 个"
+        if total_pages > 1:
+            text += f"（第 {page + 1}/{total_pages} 页）"
         self._send_keyboard(chat_id, text, rows, edit_message_id)
 
     def _handle_callback_query(self, query: Dict[str, Any]) -> None:
@@ -864,12 +951,32 @@ class TelegramBotService:
                 self._send_browse(chat_id, "", message_id)
                 return
             if data.startswith("up:ls:"):
-                path = self._path_for_token(data[len("up:ls:"):])
+                payload = data[len("up:ls:"):]
+                token, _, page_text = payload.partition(":")
+                path = self._path_for_token(token)
                 self._answer_callback(query_id, "")
                 if path is None:
                     self.send_text("目录已过期，请重新发送 /upload", chat_id=chat_id)
                     return
-                self._send_browse(chat_id, path, message_id)
+                try:
+                    page = int(page_text) if page_text else 0
+                except ValueError:
+                    page = 0
+                self._send_browse(chat_id, path, message_id, page)
+                return
+            if data.startswith("up:dir:"):
+                path = self._path_for_token(data[len("up:dir:"):])
+                self._answer_callback(query_id, "已收到，开始上传文件夹…")
+                if path is None:
+                    self.send_text("目录已过期，请重新发送 /upload", chat_id=chat_id)
+                    return
+                # 整目录识别/上传耗时较长，放到后台线程，避免阻塞长轮询
+                threading.Thread(
+                    target=self._start_upload_from_folder,
+                    args=(path, chat_id),
+                    name="telegram-upload-folder",
+                    daemon=True,
+                ).start()
                 return
             if data.startswith("up:file:"):
                 path = self._path_for_token(data[len("up:file:"):])
@@ -884,6 +991,21 @@ class TelegramBotService:
                     name="telegram-upload",
                     daemon=True,
                 ).start()
+                return
+            if data == "cfg:root":
+                self._answer_callback(query_id, "")
+                self._send_config_menu(chat_id, message_id)
+                return
+            if data.startswith("cfg:sec:"):
+                section = data[len("cfg:sec:"):]
+                self._answer_callback(query_id, "")
+                self._send_config_section(chat_id, section, message_id)
+                return
+            if data.startswith("cfg:edit:"):
+                payload = data[len("cfg:edit:"):]
+                section, _, key = payload.partition(":")
+                self._answer_callback(query_id, "请回复新值")
+                self._prompt_config_edit(chat_id, section, key)
                 return
             self._answer_callback(query_id, "未知操作")
         except Exception as exc:
@@ -960,6 +1082,313 @@ class TelegramBotService:
                 self._replies[str(message_id)] = dict(
                     context, _error=str(result.get("error") or ""), _at=_now_text()
                 )
+
+    def _start_upload_from_folder(self, path: str, chat_id: str) -> None:
+        """选择文件夹后：递归识别并上传其中所有视频/字幕
+
+        识别不到的文件登记为待修正报错（不逐条提醒，只发一条汇总），
+        回复指定一次目标后，同名剧集的其它文件由
+        ``_retry_pending_same_title`` 自动一起处理。
+        """
+        from .online_upload import OnlineUploadService
+
+        service = OnlineUploadService.instance()
+        base = Path(str(path))
+        if not base.is_dir():
+            self.send_text(f"目录不存在：{path}", chat_id=chat_id)
+            return
+
+        try:
+            from .incomplete_downloads import collect_incomplete_paths, is_incomplete
+
+            incomplete = collect_incomplete_paths()
+        except Exception:
+            incomplete = set()
+
+        files: List[Path] = []
+        for entry in sorted(base.rglob("*"), key=lambda item: str(item).lower()):
+            try:
+                if not entry.is_file():
+                    continue
+                if entry.suffix.lower() not in _UPLOAD_FILE_EXTENSIONS:
+                    continue
+                if incomplete and is_incomplete(entry, incomplete):
+                    continue
+                files.append(entry)
+            except OSError:
+                continue
+
+        if not files:
+            self.send_text(f"该文件夹下没有可上传的视频/字幕：{base}", chat_id=chat_id)
+            return
+
+        self.send_text(
+            f"📂 开始上传文件夹：{base.name}\n共 {len(files)} 个文件，正在逐个识别上传…",
+            chat_id=chat_id,
+        )
+
+        created = 0
+        duplicates = 0
+        failed: List[Dict[str, Any]] = []
+        for entry in files:
+            try:
+                result = service.recognize(str(entry))
+            except Exception as exc:
+                failed.append({"path": str(entry), "meta": {}, "error": str(exc)})
+                continue
+            meta = result.get("metadata") or {}
+            match = result.get("match")
+            if not match:
+                failed.append(
+                    {
+                        "path": str(entry),
+                        "meta": meta,
+                        "error": str(result.get("error") or "未找到上传目标"),
+                    }
+                )
+                continue
+            season_number = match.get("season_number")
+            if season_number is None:
+                season_number = meta.get("season")
+            episode_number = match.get("episode_number")
+            if episode_number is None:
+                episode_number = meta.get("episode")
+            try:
+                task = service.create_task(
+                    {
+                        "file_path": str(entry),
+                        "item_type": match.get("item_type"),
+                        "item_id": match.get("item_id"),
+                        "storage": None,
+                        "title": meta.get("title") or "",
+                        "media_type": meta.get("media_type") or "",
+                        "season_number": season_number,
+                        "episode_number": episode_number,
+                    }
+                )
+            except Exception as exc:
+                failed.append({"path": str(entry), "meta": meta, "error": str(exc)})
+                continue
+            if task.get("duplicate"):
+                duplicates += 1
+            else:
+                created += 1
+
+        lines = [
+            "📂 文件夹上传完成",
+            f"目录：{base}",
+            f"已提交 {created} 个 · 跳过重复 {duplicates} 个 · 待处理 {len(failed)} 个",
+        ]
+        if failed:
+            lines.append("")
+            lines.append("以下文件未能自动识别目标：")
+            for item in failed[:10]:
+                lines.append(f"· {os.path.basename(item['path'])}")
+            if len(failed) > 10:
+                lines.append(f"…… 其余 {len(failed) - 10} 个")
+            lines.append("")
+            lines.append("回复本条消息指定目标（如：剧名 S01E01），同名剧集的其它文件会自动一起处理。")
+        message_id = self.send_text("\n".join(lines), chat_id=chat_id)
+
+        if not failed:
+            return
+        first = failed[0]
+        first_meta = first.get("meta") or {}
+        if message_id:
+            with self._lock:
+                self._replies[str(message_id)] = dict(
+                    {
+                        "file_path": first["path"],
+                        "file_name": os.path.basename(first["path"]),
+                        "title": first_meta.get("title") or "",
+                        "media_type": first_meta.get("media_type") or "",
+                        "season_number": first_meta.get("season"),
+                        "episode_number": first_meta.get("episode"),
+                        "storage": "",
+                    },
+                    _error=first.get("error") or "",
+                    _at=_now_text(),
+                )
+        # 其余待处理文件登记为报错（quiet，不逐条提醒），修正一次后一起重传
+        now = time.time()
+        for item in failed:
+            meta = item.get("meta") or {}
+            with self._lock:
+                self._active_errors[f"{item['path']}|未找到 Emos 上传目标"] = {
+                    "context": {
+                        "file_path": item["path"],
+                        "file_name": os.path.basename(item["path"]),
+                        "title": meta.get("title") or "",
+                        "media_type": meta.get("media_type") or "",
+                        "season_number": meta.get("season"),
+                        "episode_number": meta.get("episode"),
+                        "storage": "",
+                    },
+                    "error": item.get("error") or "未找到上传目标",
+                    "header": "未找到 Emos 上传目标",
+                    "last_sent": now,
+                    "message_id": message_id or 0,
+                    "quiet": True,
+                }
+
+    # ------------------------------------------------------------------
+    # 配置管理（处理配置 / Emos API）
+    # ------------------------------------------------------------------
+
+    _CONFIG_SECTIONS = {
+        "processing": "处理配置",
+        "emos": "Emos API",
+    }
+
+    def _current_config(self) -> Dict[str, Any]:
+        with self._lock:
+            config = self._config
+        if isinstance(config, dict) and config:
+            return config
+        try:
+            from ..web.services.state import get_state_manager
+
+            return get_state_manager().get_config()
+        except Exception:
+            return config if isinstance(config, dict) else {}
+
+    @staticmethod
+    def _mask_config_value(key: Any, value: Any) -> str:
+        key_l = str(key or "").lower()
+        if any(token in key_l for token in ("token", "password", "secret", "api_key")):
+            text = str(value or "")
+            if not text:
+                return "(空)"
+            return "***" if len(text) <= 6 else f"{text[:3]}***{text[-2:]}"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, list):
+            return ", ".join(str(v) for v in value)
+        return str(value)
+
+    def _send_config_menu(self, chat_id: str, edit_message_id: Optional[int] = None) -> None:
+        rows = [
+            [{"text": f"⚙️ {label}", "callback_data": f"cfg:sec:{section}"}]
+            for section, label in self._CONFIG_SECTIONS.items()
+        ]
+        self._send_keyboard(chat_id, "请选择要查看/修改的配置：", rows, edit_message_id)
+
+    def _send_config_section(
+        self, chat_id: str, section: str, edit_message_id: Optional[int] = None
+    ) -> None:
+        if section not in self._CONFIG_SECTIONS:
+            self.send_text("未知配置节。", chat_id=chat_id)
+            return
+        config = self._current_config()
+        values = config.get(section)
+        if not isinstance(values, dict) or not values:
+            self.send_text(f"配置节 {section} 为空。", chat_id=chat_id)
+            return
+        rows: List[List[Dict[str, str]]] = []
+        for key, value in values.items():
+            if isinstance(value, (dict, list)):
+                continue
+            text = f"{key} = {self._mask_config_value(key, value)}"
+            rows.append([{"text": text[:60], "callback_data": f"cfg:edit:{section}:{key}"}])
+        rows.append([{"text": "⬅️ 返回", "callback_data": "cfg:root"}])
+        self._send_keyboard(
+            chat_id,
+            f"{self._CONFIG_SECTIONS[section]}：点按要修改的项，然后回复新值。",
+            rows,
+            edit_message_id,
+        )
+
+    def _prompt_config_edit(self, chat_id: str, section: str, key: str) -> None:
+        config = self._current_config()
+        values = config.get(section)
+        if not isinstance(values, dict) or key not in values:
+            self.send_text("配置项不存在，请重新发送 /config。", chat_id=chat_id)
+            return
+        message_id = self.send_text(
+            f"请回复本条消息，输入 {section}.{key} 的新值：\n"
+            f"当前值：{self._mask_config_value(key, values.get(key))}",
+            chat_id=chat_id,
+        )
+        if message_id:
+            with self._lock:
+                self._replies[str(message_id)] = {
+                    "_config_section": section,
+                    "_config_key": key,
+                    "_at": _now_text(),
+                }
+
+    @staticmethod
+    def _coerce_config_value(current: Any, text: str) -> Any:
+        raw = str(text or "").strip()
+        if isinstance(current, bool):
+            lowered = raw.lower()
+            if lowered in ("true", "1", "yes", "y", "on", "是", "开", "启用"):
+                return True
+            if lowered in ("false", "0", "no", "n", "off", "否", "关", "停用"):
+                return False
+            raise ValueError("请输入 true/false")
+        if isinstance(current, int):
+            return int(raw)
+        if isinstance(current, float):
+            return float(raw)
+        if isinstance(current, list):
+            return [item.strip() for item in re.split(r"[,，;；]", raw) if item.strip()]
+        return raw
+
+    def _save_config(self, config: Dict[str, Any]):
+        config_path = self._config_path
+        try:
+            if config_path:
+                from .config_loader import update_config
+
+                update_config(config, config_path)
+            with self._lock:
+                self._config = config
+            try:
+                from ..web.services.state import get_state_manager
+
+                get_state_manager().set_config(
+                    config, Path(config_path) if config_path else None
+                )
+            except Exception as exc:
+                logger.debug("同步配置到状态管理器失败: %s", exc)
+            try:
+                from ..web.routers.config import _apply_runtime_config
+
+                _apply_runtime_config(config)
+            except Exception as exc:
+                logger.debug("配置热更新失败: %s", exc)
+            return True, "已保存并即时生效"
+        except Exception as exc:
+            logger.warning("保存配置失败: %s", exc)
+            return False, f"保存失败：{exc}"
+
+    def _apply_config_value(
+        self, context: Dict[str, Any], text: str, chat_id: str, reply_to: Optional[int]
+    ) -> None:
+        section = str(context.get("_config_section") or "")
+        key = str(context.get("_config_key") or "")
+        config = self._current_config()
+        values = config.get(section) if isinstance(config.get(section), dict) else None
+        if not section or not key or values is None or key not in values:
+            self.send_text("配置修改已失效，请重新发送 /config。", chat_id=chat_id, reply_to=reply_to)
+            return
+        try:
+            new_value = self._coerce_config_value(values.get(key), text)
+        except Exception as exc:
+            self.send_text(f"值格式不正确：{exc}", chat_id=chat_id, reply_to=reply_to)
+            return
+        values[key] = new_value
+        ok, message = self._save_config(config)
+        with self._lock:
+            if reply_to is not None:
+                self._replies.pop(str(reply_to), None)
+        prefix = "✅ 已更新" if ok else "⚠️ 未能生效"
+        self.send_text(
+            f"{prefix} {section}.{key} = {self._mask_config_value(key, new_value)}\n{message}",
+            chat_id=chat_id,
+            reply_to=reply_to,
+        )
 
     def _status_text(self) -> str:
         status = self.status()
@@ -1113,12 +1542,34 @@ class TelegramBotService:
         logger.info("Telegram 修正目标成功: %s -> %s", expr.describe(), match.get("label"))
 
     @staticmethod
-    def _show_anchor(candidates: List[Dict[str, Any]], title: str) -> Optional[Dict[str, Any]]:
-        """在候选里找「作品级（vl）」条目，作为同名剧集的锚点"""
+    def _show_anchor(
+        candidates: List[Dict[str, Any]],
+        title: str,
+        match: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """在候选里找「作品级（vl）」条目，作为同名剧集的锚点
+
+        先按命中的具体条目 id 反查它所属的作品（标题归一化可能对不上），
+        再退回按标题匹配，尽量保证「指定一集 -> 同名剧集全部生效」。
+        """
         try:
             from .mapping_store import normalize_text
         except Exception:
             return None
+        match_id = str((match or {}).get("item_id") or "")
+        if match_id:
+            for video in candidates or []:
+                if not isinstance(video, dict):
+                    continue
+                if not _candidate_contains_item(video, match_id):
+                    continue
+                item_id = video.get("item_id")
+                if item_id:
+                    return {
+                        "item_type": video.get("item_type") or "vl",
+                        "item_id": str(item_id),
+                        "label": video.get("title") or title,
+                    }
         norm = normalize_text(title)
         if not norm:
             return None
@@ -1153,13 +1604,13 @@ class TelegramBotService:
         """
         result = {"saved": False, "show_level": False}
         try:
-            from .mapping_store import TargetMappingStore
+            from .mapping_store import TargetMappingStore, normalize_text
         except Exception:
             return result
         title = (expr.title or str(context.get("title") or "")).strip()
         if not title:
             return result
-        anchor = self._show_anchor(candidates, title)
+        anchor = self._show_anchor(candidates, title, match)
         show_level = bool(anchor) and (
             media_type == "tv" or expr.episode is not None or expr.season is not None
         )
@@ -1196,6 +1647,22 @@ class TelegramBotService:
             )
             result["saved"] = mapping_id is not None
             result["show_level"] = show_level
+
+            # 用户手填的标题（如中文译名）常常和自动识别出的标题（如英文原名）
+            # 不一样。只记录手填标题的话，以后自动处理同名文件时匹配不上映射。
+            # 这里把自动识别到的标题也存一份别名，保证「指定过一次以后直接上传」。
+            auto_title = str(context.get("title") or "").strip()
+            if auto_title and normalize_text(auto_title) != normalize_text(title):
+                TargetMappingStore.remember(
+                    file_path=str(context.get("file_path") or ""),
+                    title=auto_title,
+                    media_type=media_type,
+                    season=season_for_mapping,
+                    episode=episode_for_mapping,
+                    target=target,
+                    source="telegram",
+                    keyword=auto_title,
+                )
         except Exception as exc:
             logger.debug("记录修正映射失败: %s", exc)
         return result
@@ -1205,13 +1672,11 @@ class TelegramBotService:
     ) -> int:
         """把同一剧名、仍在报错的文件按新映射自动重传"""
         try:
-            from .mapping_store import normalize_text
+            from .mapping_store import TargetMappingStore, normalize_text
             from .online_upload import OnlineUploadService
         except Exception:
             return 0
         norm = normalize_text(title)
-        if not norm:
-            return 0
         with self._lock:
             pending = [(key, dict(item)) for key, item in self._active_errors.items()]
         service = OnlineUploadService.instance()
@@ -1219,12 +1684,31 @@ class TelegramBotService:
         for _key, item in pending:
             ctx = item.get("context") or {}
             ctx_title = str(ctx.get("title") or "")
-            ctx_norm = normalize_text(ctx_title)
-            if not ctx_norm or not (ctx_norm == norm or norm in ctx_norm or ctx_norm in norm):
-                continue
             path = str(ctx.get("file_path") or "")
             if not path or path == exclude_file or not os.path.exists(path):
                 continue
+            # 优先用映射表判断：该文件现在能命中映射，就说明它和刚修正的是同一部剧，
+            # 直接重传。这样即便用户填的是中文译名、自动识别到的是英文原名也能全部生效。
+            mapped = None
+            try:
+                mapped = TargetMappingStore.resolve(
+                    title=ctx_title,
+                    season=ctx.get("season_number"),
+                    episode=ctx.get("episode_number"),
+                    media_type=str(ctx.get("media_type") or media_type or ""),
+                    file_name=os.path.basename(path),
+                )
+            except Exception:
+                mapped = None
+            if not mapped:
+                ctx_norm = normalize_text(ctx_title)
+                if not ctx_norm:
+                    # 报错上下文没有标题时，退回用文件名判断是否同一部剧
+                    ctx_norm = normalize_text(os.path.basename(path))
+                if not norm or not ctx_norm or not (
+                    ctx_norm == norm or norm in ctx_norm or ctx_norm in norm
+                ):
+                    continue
             try:
                 recognized = service.recognize(path)
             except Exception:

@@ -314,5 +314,121 @@ class TestTelegramCorrectionMapping(_TempDbMixin, unittest.TestCase):
         self.assertEqual(created[0]["episode_number"], 3)
 
 
+class TestMappingAliasAndStatus(_TempDbMixin, unittest.TestCase):
+    """映射别名 / 跳过上传判定 / 配置值转换 的回归测试"""
+
+    def setUp(self):
+        self._setup_temp_db()
+
+    def tearDown(self):
+        self._teardown_temp_db()
+
+    def test_correction_stores_alias_for_auto_title(self):
+        """手动填中文译名后，自动识别出的英文原名也要能命中映射"""
+        from src.video_organizer.core.mapping_store import TargetMappingStore
+        from src.video_organizer.core.telegram_bot import (
+            TelegramBotService,
+            TargetExpression,
+        )
+
+        service = TelegramBotService()
+        expr = TargetExpression(title="魔法★探险家", season=1, episode=2)
+        candidates = [
+            {
+                "title": "魔法★探险家",
+                "item_type": "vl",
+                "item_id": "205729",
+                "seasons": [{"item_id": "s1", "episodes": [{"item_id": "3157024"}]}],
+            }
+        ]
+        match = {
+            "item_type": "ve",
+            "item_id": "3157024",
+            "label": "S01E02",
+            "season_number": 1,
+            "episode_number": 2,
+        }
+        context = {
+            "file_path": (
+                "/media/MagicalExplorer.Eroge.no.Yuujin.Chara.ni."
+                "Tensei.Shitakedo.S01E02.mkv"
+            ),
+            "title": "MagicalExplorer Eroge no Yuujin Chara ni Tensei Shitakedo",
+        }
+
+        info = service._remember_correction_mapping(expr, "tv", match, candidates, context)
+        self.assertTrue(info["saved"])
+
+        hit = TargetMappingStore.resolve(
+            title="MagicalExplorer Eroge no Yuujin Chara ni Tensei Shitakedo",
+            season=1,
+            episode=3,
+            media_type="tv",
+            file_name=(
+                "MagicalExplorer.Eroge.no.Yuujin.Chara.ni.Tensei.Shitakedo.S01E03.mkv"
+            ),
+        )
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["item_id"], "205729")
+
+    def test_resolve_target_mapping_helper(self):
+        import logging
+
+        from src.video_organizer.core.mapping_store import TargetMappingStore
+        from src.video_organizer.core.video_file_handler import VideoFileHandler
+
+        TargetMappingStore.create(
+            keyword="魔法★探险家",
+            item_type="vl",
+            item_id="205729",
+            match_type="title",
+            media_type="tv",
+        )
+
+        class _Stub:
+            logger = logging.getLogger("test")
+
+        hit = VideoFileHandler._resolve_target_mapping(
+            _Stub(), "魔法★探险家", 1, 2, "tv", "x.mkv"
+        )
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["item_id"], "205729")
+        self.assertIsNone(
+            VideoFileHandler._resolve_target_mapping(
+                _Stub(), "完全无关的剧", 1, 2, "tv", "y.mkv"
+            )
+        )
+
+    def test_episode_has_media_requires_same_name(self):
+        """同名才算已存在；仅大小相同不能算，避免「失败却显示已完成」"""
+        from src.video_organizer.upload.upload_emos import RobustEmosVideoUploader
+
+        class _Client:
+            def __init__(self, medias):
+                self._medias = medias
+
+            def get_video_base(self, item_type, item_id):
+                return {"video_medias": self._medias}
+
+        uploader = RobustEmosVideoUploader.__new__(RobustEmosVideoUploader)
+        uploader.client = _Client([{"media_name": "A.mkv", "media_file_size": 100}])
+        self.assertTrue(uploader._episode_has_media("ve", "1", "A.mkv", 100))
+        self.assertFalse(uploader._episode_has_media("ve", "1", "B.mkv", 100))
+
+        uploader.client = _Client([{"media_name": "", "media_file_size": 100}])
+        self.assertTrue(uploader._episode_has_media("ve", "1", "B.mkv", 100))
+
+    def test_coerce_config_value(self):
+        from src.video_organizer.core.telegram_bot import TelegramBotService
+
+        self.assertTrue(TelegramBotService._coerce_config_value(False, "true"))
+        self.assertFalse(TelegramBotService._coerce_config_value(True, "否"))
+        self.assertEqual(TelegramBotService._coerce_config_value(1, "5"), 5)
+        self.assertEqual(
+            TelegramBotService._coerce_config_value([], "a, b；c"), ["a", "b", "c"]
+        )
+        self.assertEqual(TelegramBotService._coerce_config_value("x", " y "), "y")
+
+
 if __name__ == "__main__":
     unittest.main()

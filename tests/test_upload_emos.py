@@ -566,7 +566,8 @@ class TestUploadEmosAlreadyUploaded(unittest.TestCase):
         finally:
             os.remove(path)
 
-    def test_episode_has_media_matches_name_or_size(self):
+    def test_episode_has_media_requires_same_name_when_present(self):
+        """有文件名时只认同名，不能仅凭大小把别的文件当成「已上传」"""
         uploader = RobustEmosVideoUploader(auth_token="t", base_url="https://emos.best")
         uploader.client.get_video_base = MagicMock(
             return_value={
@@ -574,6 +575,13 @@ class TestUploadEmosAlreadyUploaded(unittest.TestCase):
             }
         )
         self.assertTrue(uploader._episode_has_media("ve", 1, "b.mkv", 7))
+        self.assertFalse(uploader._episode_has_media("ve", 1, "a.mkv", 42))
+        self.assertFalse(uploader._episode_has_media("ve", 1, "a.mkv", 7))
+
+        # 媒体项没有文件名时才退回按大小判断
+        uploader.client.get_video_base = MagicMock(
+            return_value={"video_medias": [{"media_file_size": 42}]}
+        )
         self.assertTrue(uploader._episode_has_media("ve", 1, "a.mkv", 42))
         self.assertFalse(uploader._episode_has_media("ve", 1, "a.mkv", 7))
 

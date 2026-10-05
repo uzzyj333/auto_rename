@@ -1290,10 +1290,15 @@ class OnlineUploadService:
                     if deleted:
                         self._delete_uploaded_subtitles(result)
                     subtitle_note = self._subtitle_stage_note(result.get("subtitles"))
+                    base_stage = (
+                        "已完成（Emos 已存在，跳过上传）"
+                        if result.get("skipped")
+                        else "已完成"
+                    )
                     self._update_task(
                         task_id,
                         status="completed",
-                        stage="已完成" + subtitle_note + delete_note,
+                        stage=base_stage + subtitle_note + delete_note,
                         progress=100.0,
                         uploaded_bytes=snapshot["file_size"],
                         total_bytes=snapshot["file_size"],
