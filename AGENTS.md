@@ -24,7 +24,7 @@
   - `tmdb_client.py` — TMDB API 客户端
   - `guessit_parser.py` — GuessIt 集成 + 中文文件名预处理
   - `emos_client.py` / `probe.py` / `online_upload.py` — Emos 官方 API 客户端、ffprobe 校验、在线识别上传服务
-  - `telegram_bot.py` — Telegram 机器人：上传报错通知（未解决每 5 分钟提醒）+ 回复修正上传目标 + `/upload` 选择本地文件上传（长轮询 getUpdates，含 inline 按钮）
+  - `telegram_bot.py` — Telegram 机器人：上传报错通知（未解决每 5 分钟提醒，删除任务/回复「删除」即停止）+ 回复修正上传目标 + `/upload` 浏览本地文件（可上传/删除文件、文件夹，正文列出完整文件名）+ `/config` 快捷配置（布尔项开关、其余输入）（长轮询 getUpdates，含 inline 按钮）
   - `mapping_store.py` — 目标映射表（文字映射 / 剧集集数映射），命中后跳过 TMDB/Emos 搜索直接上传
   - `incomplete_downloads.py` — 汇总 qb/aria2 未完成下载，手动识别本地文件时排除半成品
 - **Web 后端** (`web/`):

@@ -46,6 +46,12 @@ _REMINDER_INTERVAL = 30       # 报错提醒检查间隔（秒）
 _MAX_BROWSE_TOKENS = 500      # 最多记住多少个「浏览/上传」路径令牌
 _BROWSE_PAGE_SIZE = 20        # 目录浏览每页显示的条目数
 
+# 回复这些关键词表示「删除该文件的任务并停止提醒」
+_DELETE_KEYWORDS = {
+    "删除", "删掉", "删了", "移除", "取消", "不要了", "不再提醒",
+    "delete", "del", "remove", "cancel",
+}
+
 # Telegram 里可选择上传的文件类型（视频 + 外挂字幕）
 _UPLOAD_FILE_EXTENSIONS = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m2ts",
@@ -61,15 +67,16 @@ _CN_DIGITS = {
 _HELP_TEXT = (
     "可用指令：\n"
     "/bind  绑定当前会话（把 chat_id 写回配置）\n"
-    "/upload  浏览并选择本地文件 / 整个文件夹上传\n"
-    "/config  查看/修改「处理配置」与「Emos API」\n"
+    "/upload  浏览本地文件：上传 / 删除文件或文件夹\n"
+    "/config  快捷配置（开关）+「处理配置」/「Emos API」\n"
     "/status  查看机器人状态\n"
     "/help  查看本帮助\n\n"
     "修正上传目标：直接「回复」某条报错信息并发送目标，例如\n"
     "　时光代理人S04E09\n"
     "　时光代理人 第4季第9集\n"
     "　时光代理人 4x09\n"
-    "　时光代理人 (2024)"
+    "　时光代理人 (2024)\n\n"
+    "删除任务：回复某条报错信息并发送「删除」，即可删除该文件的任务并停止提醒"
 )
 
 
@@ -494,6 +501,7 @@ class TelegramBotService:
         lines.append("")
         lines.append("回复本条消息即可修正目标，例如：")
         lines.append("　时光代理人S04E09")
+        lines.append("回复「删除」可删除该文件的任务并停止提醒")
         message_id = self.send_text("\n".join(lines))
         if not message_id:
             # 发送失败（网络等）不算已通知，下次还能重试
@@ -529,6 +537,14 @@ class TelegramBotService:
             ]
             for key in keys:
                 self._active_errors.pop(key, None)
+
+    def clear_all_errors(self) -> int:
+        """停止所有文件的报错定时提醒（清空全部失败任务时调用）"""
+        with self._lock:
+            count = len(self._active_errors)
+            self._active_errors.clear()
+            self._error_notified_at.clear()
+        return count
 
     def _reminder_loop(self) -> None:
         """未解决的报错每 5 分钟提醒一次"""
@@ -566,6 +582,7 @@ class TelegramBotService:
             lines.append(f"原因：{str(item.get('error') or '未知错误')[:600]}")
             lines.append("")
             lines.append("回复本条消息即可修正目标（未解决前每 5 分钟提醒一次）")
+            lines.append("回复「删除」可删除该文件的任务并停止提醒")
             message_id = self.send_text("\n".join(lines))
             with self._lock:
                 current = self._active_errors.get(key)
@@ -708,6 +725,9 @@ class TelegramBotService:
             return
         if context.get("_config_key"):
             self._apply_config_value(context, text, chat_id, reply_to)
+            return
+        if self._is_delete_intent(text):
+            self._handle_delete_reply(context, chat_id, reply_to)
             return
         self._handle_correction(context, text, chat_id, reply_to)
 
@@ -930,18 +950,20 @@ class TelegramBotService:
                     [
                         {"text": f"📁 {target.name}", "callback_data": f"up:ls:{token}:0"},
                         {"text": "📤 上传", "callback_data": f"up:dir:{token}"},
+                        {"text": "🗑️", "callback_data": f"up:del:{token}"},
                     ]
                 )
             else:
                 size_text = _format_size(entry.get("size"))
                 suffix = f"（{size_text}）" if size_text else ""
-                name = _shorten_text(target.name, max(8, 58 - len(suffix)))
+                name = _shorten_text(target.name, max(8, 46 - len(suffix)))
                 rows.append(
                     [
                         {
                             "text": f"🎬 {name}{suffix}",
                             "callback_data": f"up:file:{token}",
-                        }
+                        },
+                        {"text": "🗑️", "callback_data": f"up:del:{token}"},
                     ]
                 )
         if total_pages > 1:
@@ -964,13 +986,103 @@ class TelegramBotService:
             rows.append(nav)
         if not page_entries:
             rows.append([{"text": "（此目录没有可上传文件）", "callback_data": "up:noop"}])
-        text = f"目录：{base}\n子目录 {len(dirs)} 个 · 视频/字幕 {len(files)} 个"
+        lines = [f"目录：{base}", f"子目录 {len(dirs)} 个 · 视频/字幕 {len(files)} 个"]
         size_text = _format_size(total_size)
+        tail = ""
         if size_text:
-            text += f"（共 {size_text}）"
+            tail += f"（共 {size_text}）"
         if total_pages > 1:
-            text += f"（第 {page + 1}/{total_pages} 页）"
-        self._send_keyboard(chat_id, text, rows, edit_message_id)
+            tail += f"（第 {page + 1}/{total_pages} 页）"
+        lines[-1] += tail
+        if page_entries:
+            listing: List[str] = []
+            listing_len = 0
+            omitted = 0
+            for entry in page_entries:
+                target = entry["path"]
+                if entry["kind"] == "dir":
+                    line = f"📁 {target.name}"
+                else:
+                    size_entry = _format_size(entry.get("size"))
+                    line = f"🎬 {target.name}" + (f"（{size_entry}）" if size_entry else "")
+                if listing_len + len(line) > 3200:
+                    omitted += 1
+                    continue
+                listing.append(line)
+                listing_len += len(line) + 1
+            lines.append("")
+            lines.append("本页完整名称：")
+            lines.extend(listing)
+            if omitted:
+                lines.append(f"…… 其余 {omitted} 个（名称过长已省略，可翻页查看）")
+        self._send_keyboard(chat_id, "\n".join(lines), rows, edit_message_id)
+
+    def _send_delete_confirm(self, chat_id: str, path: str) -> None:
+        """发送删除确认（文件/目录），避免误删"""
+        from .online_upload import OnlineUploadService
+
+        try:
+            service = OnlineUploadService.instance()
+            target = service.resolve(path)
+            roots = [os.path.realpath(str(root)) for root in service.roots()]
+        except Exception:
+            target = Path(str(path))
+            roots = []
+        if os.path.realpath(str(target)) in roots:
+            self.send_text("不允许删除视频根目录本身。", chat_id=chat_id)
+            return
+        kind = "目录（含其中全部文件）" if Path(str(target)).is_dir() else "文件"
+        rows = [
+            [
+                {
+                    "text": "✅ 确认删除",
+                    "callback_data": f"up:delok:{self._token_for_path(str(target))}",
+                },
+                {"text": "↩️ 取消", "callback_data": "up:delcancel"},
+            ]
+        ]
+        self._send_keyboard(
+            chat_id,
+            f"⚠️ 确定要删除该{kind}吗？此操作不可恢复。\n{target}",
+            rows,
+        )
+
+    def _delete_path(self, path: str, chat_id: str, message_id: Optional[int]) -> None:
+        """删除服务器上的文件/目录，并清理对应的任务与报错提醒"""
+        import shutil
+
+        from .online_upload import OnlineUploadService
+
+        service = OnlineUploadService.instance()
+        try:
+            target = service.resolve(path)
+            roots = [os.path.realpath(str(root)) for root in service.roots()]
+        except Exception as exc:
+            self._send_keyboard(chat_id, f"删除失败：{exc}", [], message_id)
+            return
+        if os.path.realpath(str(target)) in roots:
+            self._send_keyboard(chat_id, "不允许删除视频根目录本身。", [], message_id)
+            return
+        if not target.exists():
+            self._send_keyboard(chat_id, f"文件不存在或已删除：{target.name}", [], message_id)
+            return
+        is_dir = target.is_dir()
+        try:
+            if is_dir:
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        except Exception as exc:
+            logger.warning("Telegram 删除失败: %s", exc)
+            self._send_keyboard(chat_id, f"删除失败：{exc}", [], message_id)
+            return
+        try:
+            service.delete_tasks_for_file(str(target))
+        except Exception:
+            pass
+        self.clear_error(str(target))
+        kind = "目录" if is_dir else "文件"
+        self._send_keyboard(chat_id, f"🗑️ 已删除{kind}：{target.name}", [], message_id)
 
     def _handle_callback_query(self, query: Dict[str, Any]) -> None:
         query_id = str(query.get("id") or "")
@@ -1041,6 +1153,26 @@ class TelegramBotService:
                     daemon=True,
                 ).start()
                 return
+            if data.startswith("up:del:"):
+                path = self._path_for_token(data[len("up:del:"):])
+                self._answer_callback(query_id, "")
+                if path is None:
+                    self.send_text("条目已过期，请重新发送 /upload", chat_id=chat_id)
+                    return
+                self._send_delete_confirm(chat_id, path)
+                return
+            if data.startswith("up:delok:"):
+                path = self._path_for_token(data[len("up:delok:"):])
+                self._answer_callback(query_id, "正在删除…")
+                if path is None:
+                    self._send_keyboard(chat_id, "条目已过期，请重新发送 /upload。", [], message_id)
+                    return
+                self._delete_path(path, chat_id, message_id)
+                return
+            if data == "up:delcancel":
+                self._answer_callback(query_id, "已取消")
+                self._send_keyboard(chat_id, "已取消删除。", [], message_id)
+                return
             if data == "cfg:root":
                 self._answer_callback(query_id, "")
                 self._send_config_menu(chat_id, message_id)
@@ -1049,6 +1181,12 @@ class TelegramBotService:
                 section = data[len("cfg:sec:"):]
                 self._answer_callback(query_id, "")
                 self._send_config_section(chat_id, section, message_id)
+                return
+            if data.startswith("cfg:tog:"):
+                payload = data[len("cfg:tog:"):]
+                section, _, key = payload.partition(":")
+                self._answer_callback(query_id, "")
+                self._toggle_config_bool(chat_id, section, key, message_id)
                 return
             if data.startswith("cfg:edit:"):
                 payload = data[len("cfg:edit:"):]
@@ -1122,7 +1260,11 @@ class TelegramBotService:
             "episode_number": meta.get("episode"),
             "storage": "",
         }
-        lines = ["未能自动识别上传目标，请「回复」本条消息指定目标，例如：", "　时光代理人S04E09"]
+        lines = [
+            "未能自动识别上传目标，请「回复」本条消息指定目标，例如：",
+            "　时光代理人S04E09",
+            "或回复「删除」取消该任务并停止提醒",
+        ]
         if result.get("error"):
             lines.append(f"识别信息：{str(result.get('error'))[:300]}")
         message_id = self.send_text("\n".join(lines), chat_id=chat_id)
@@ -1297,6 +1439,23 @@ class TelegramBotService:
         "emos": "Emos API",
     }
 
+    # 快捷配置：布尔项以开关呈现，点按即切换
+    _QUICK_TOGGLES = [
+        ("processing", "delete_after_upload", "上传后删除原文件"),
+        ("emos", "upload_subtitles", "顺带上传字幕"),
+        ("online_upload", "probe_enabled", "上传前 ffprobe 校验"),
+        ("guessit", "enabled", "GuessIt 增强识别"),
+        ("llm_fallback", "enabled", "LLM 兜底识别"),
+        ("monitoring", "enable_directory_monitor", "目录监控"),
+    ]
+    # 快捷配置：需要输入数值/文本的项
+    _QUICK_INPUTS = [
+        ("processing", "max_upload_workers", "上传并发数"),
+        ("emos", "chunk_size_mb", "分片大小(MB)"),
+        ("emos", "upload_concurrency", "分片上传并发"),
+        ("logging", "log_level", "日志等级"),
+    ]
+
     def _current_config(self) -> Dict[str, Any]:
         with self._lock:
             config = self._config
@@ -1324,11 +1483,46 @@ class TelegramBotService:
         return str(value)
 
     def _send_config_menu(self, chat_id: str, edit_message_id: Optional[int] = None) -> None:
-        rows = [
-            [{"text": f"⚙️ {label}", "callback_data": f"cfg:sec:{section}"}]
-            for section, label in self._CONFIG_SECTIONS.items()
-        ]
-        self._send_keyboard(chat_id, "请选择要查看/修改的配置：", rows, edit_message_id)
+        config = self._current_config()
+        rows: List[List[Dict[str, str]]] = []
+        for section, key, label in self._QUICK_TOGGLES:
+            values = config.get(section)
+            if not isinstance(values, dict) or key not in values:
+                continue
+            enabled = bool(values.get(key))
+            mark = "🟢" if enabled else "⚪"
+            rows.append(
+                [
+                    {
+                        "text": f"{mark} {label}：{'开' if enabled else '关'}",
+                        "callback_data": f"cfg:tog:{section}:{key}",
+                    }
+                ]
+            )
+        for section, key, label in self._QUICK_INPUTS:
+            values = config.get(section)
+            if not isinstance(values, dict) or key not in values:
+                continue
+            rows.append(
+                [
+                    {
+                        "text": f"✏️ {label} = {self._mask_config_value(key, values.get(key))}",
+                        "callback_data": f"cfg:edit:{section}:{key}",
+                    }
+                ]
+            )
+        rows.append(
+            [
+                {"text": "⚙️ 处理配置", "callback_data": "cfg:sec:processing"},
+                {"text": "⚙️ Emos API", "callback_data": "cfg:sec:emos"},
+            ]
+        )
+        self._send_keyboard(
+            chat_id,
+            "⚡ 快捷配置（点按开关即可切换；需要输入的点按后回复新值）：",
+            rows,
+            edit_message_id,
+        )
 
     def _send_config_section(
         self, chat_id: str, section: str, edit_message_id: Optional[int] = None
@@ -1373,6 +1567,25 @@ class TelegramBotService:
                     "_config_key": key,
                     "_at": _now_text(),
                 }
+
+    def _toggle_config_bool(
+        self, chat_id: str, section: str, key: str, edit_message_id: Optional[int] = None
+    ) -> None:
+        """快捷配置开关：切换布尔值并即时保存"""
+        config = self._current_config()
+        values = config.get(section) if isinstance(config.get(section), dict) else None
+        if not section or not key or values is None or key not in values:
+            self.send_text("配置修改已失效，请重新发送 /config。", chat_id=chat_id)
+            return
+        current = values.get(key)
+        if not isinstance(current, bool):
+            self._prompt_config_edit(chat_id, section, key)
+            return
+        values[key] = not current
+        ok, message = self._save_config(config)
+        if not ok:
+            self.send_text(f"⚠️ 未能生效 {section}.{key}\n{message}", chat_id=chat_id)
+        self._send_config_menu(chat_id, edit_message_id)
 
     @staticmethod
     def _coerce_config_value(current: Any, text: str) -> Any:
@@ -1480,6 +1693,35 @@ class TelegramBotService:
     # ------------------------------------------------------------------
     # 回复修正
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_delete_intent(text: str) -> bool:
+        """判断回复内容是否为「删除该任务并停止提醒」"""
+        return str(text or "").strip().lower() in _DELETE_KEYWORDS
+
+    def _handle_delete_reply(
+        self, context: Dict[str, Any], chat_id: str, reply_to: Optional[int]
+    ) -> None:
+        """回复「删除」：删除该文件的任务记录并停止所有后续提醒"""
+        file_path = str(context.get("file_path") or "")
+        name = context.get("file_name") or os.path.basename(file_path) or "-"
+        removed = 0
+        if file_path:
+            try:
+                from .online_upload import OnlineUploadService
+
+                removed = OnlineUploadService.instance().delete_tasks_for_file(file_path)
+            except Exception as exc:
+                logger.debug("删除文件任务失败: %s", exc)
+            self.clear_error(file_path)
+        with self._lock:
+            if reply_to is not None:
+                self._replies.pop(str(reply_to), None)
+        if removed:
+            message = f"🗑️ 已删除该文件的任务并停止提醒\n文件：{name}\n（共移除 {removed} 个任务）"
+        else:
+            message = f"🗑️ 已停止该文件的提醒\n文件：{name}\n（未找到对应任务，可能已删除）"
+        self.send_text(message, chat_id=chat_id, reply_to=reply_to)
 
     def _handle_correction(self, context: Dict[str, Any], text: str, chat_id: str, reply_to: Optional[int]) -> None:
         expr = parse_target_expression(text)

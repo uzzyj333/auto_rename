@@ -26,6 +26,20 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _clear_telegram_reminder(file_path: Optional[str] = None) -> None:
+    """删除失败任务时同步停止 Telegram 报错提醒"""
+    try:
+        from ...core.telegram_bot import TelegramBotService
+
+        service = TelegramBotService.instance()
+        if file_path:
+            service.clear_error(file_path)
+        else:
+            service.clear_all_errors()
+    except Exception as exc:
+        logger.debug("清除 Telegram 报错提醒失败: %s", exc)
+
+
 class TaskStatusResponse(BaseModel):
     """任务状态响应"""
     queue_size: int
@@ -590,7 +604,9 @@ async def clear_failed_task(file_path: str):
         
         if handler is not None and hasattr(handler, "_failed_files") and file_path in handler._failed_files:
             del handler._failed_files[file_path]
-        
+
+        _clear_telegram_reminder(file_path)
+
         db_deleted = delete_failed_task(file_path)
         
         if db_deleted:
@@ -617,7 +633,9 @@ async def clear_all_failed_tasks():
         
         if handler is not None and hasattr(handler, "_failed_files"):
             handler._failed_files.clear()
-        
+
+        _clear_telegram_reminder()
+
         db_count = delete_all_failed_tasks()
         
         logger.info(f"已清除 {db_count} 条失败任务记录")

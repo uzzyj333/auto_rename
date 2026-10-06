@@ -1159,17 +1159,46 @@ class OnlineUploadService:
         return self.get_task(task_id) or {}
 
     def delete_task(self, task_id: str) -> bool:
-        """删除任务记录"""
+        """删除任务记录，并停止该文件的 Telegram 报错提醒"""
         with self._lock:
-            return self._tasks.pop(task_id, None) is not None
+            task = self._tasks.pop(task_id, None)
+        if task is None:
+            return False
+        self._clear_error(task.file_path)
+        return True
 
     def clear_finished(self) -> int:
-        """清空已完成/失败的任务"""
+        """清空已完成/失败的任务，并停止其 Telegram 报错提醒"""
         with self._lock:
             removable = [tid for tid, task in self._tasks.items() if task.status in {"completed", "failed"}]
-            for task_id in removable:
-                self._tasks.pop(task_id, None)
-            return len(removable)
+            removed = [self._tasks.pop(tid, None) for tid in removable]
+        for task in removed:
+            if task is not None:
+                self._clear_error(task.file_path)
+        return len([task for task in removed if task is not None])
+
+    def delete_tasks_for_file(self, file_path: str) -> int:
+        """删除某个文件的全部任务记录，并停止其 Telegram 报错提醒（供 TG 回复「删除」）"""
+        raw = str(file_path or "").strip()
+        if not raw:
+            return 0
+        try:
+            target = str(self.resolve(raw))
+        except Exception:
+            target = raw
+        with self._lock:
+            removable = [
+                tid
+                for tid, task in self._tasks.items()
+                if str(task.file_path) in (target, raw)
+            ]
+            removed = [self._tasks.pop(tid, None) for tid in removable]
+        for task in removed:
+            if task is not None:
+                self._clear_error(task.file_path)
+        # 即使没有任务记录，也要清掉该文件遗留的报错提醒
+        self._clear_error(target)
+        return len([task for task in removed if task is not None])
 
     def _update_task(self, task_id: str, **changes: Any) -> None:
         with self._lock:
