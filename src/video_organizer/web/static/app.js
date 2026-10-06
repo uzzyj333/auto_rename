@@ -617,7 +617,7 @@ const FIELD_LABELS = {
     },
     processing: {
         rename_only: '仅重命名（不上传）', copy_mode: '复制模式',
-        delete_original: '删除原始文件', delete_after_upload: '上传后删除源文件',
+        delete_after_upload: '上传后删除源文件',
         min_file_size: '最小文件大小', ignore_patterns: '忽略规则',
         upload_targets: '上传目标', max_upload_workers: '最大并发上传数',
     },

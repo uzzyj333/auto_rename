@@ -219,7 +219,6 @@ DEFAULT_CONFIG = {
     "processing": {
         "rename_only": False,
         "copy_mode": False,
-        "delete_original": False,
         "delete_after_upload": False,
         "min_file_size": 0,
         "ignore_patterns": [],
@@ -434,7 +433,13 @@ def _config_to_dict(config: configparser.ConfigParser) -> Dict[str, Any]:
             "anime": naming.get("anime_format", ""),
             "simple": naming.get("simple_format", ""),
         }
-    
+
+    # 清理历史遗留的无效配置项：
+    # delete_original 从未被任何逻辑读取，真正生效的是 delete_after_upload，
+    # 老配置文件里残留的该项会让配置界面出现一个点了没用的开关，这里统一丢弃。
+    if "processing" in config_dict:
+        config_dict["processing"].pop("delete_original", None)
+
     # 特殊处理下载器配置（支持同一类型多个实例，如 downloader.aria2_1 / downloader.aria2_2）
     config_dict["downloaders"] = []
     for section in config.sections():
