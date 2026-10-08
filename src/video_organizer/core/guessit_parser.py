@@ -52,6 +52,16 @@ class GuessItParser:
         'streaming_service', 'other'
     ]
 
+    # 中文 / 假名 / 谚文（可带结尾数字，如「唐探1900」）：用于找回被 GuessIt 丢掉的中文名
+    _RE_CJK_TOKEN = re.compile(
+        r'^[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+\d*$'
+    )
+    _RE_HAS_CJK = re.compile(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]')
+    # 常见的分类标签前缀，出现在剧名开头时要去掉
+    _CATEGORY_TAGS = (
+        '美剧', '国漫', '日漫', '韩剧', '日剧', '泰剧', '英剧', '欧美剧', '国产剧', '动漫', '动画',
+    )
+
     def __init__(self, enabled: bool = True):
         """
         初始化 GuessIt 解析器
@@ -786,7 +796,7 @@ class GuessItParser:
         if show_name:
             original_show_name = show_name
             # 去除开头的分类标签（如 "美剧"、"国漫"、"日漫"、"韩剧" 等）
-            category_tags = ['美剧', '国漫', '日漫', '韩剧', '日剧', '泰剧', '英剧', '欧美剧', '国产剧', '动漫', '动画']
+            category_tags = list(self._CATEGORY_TAGS)
             for tag in category_tags:
                 if show_name.startswith(tag):
                     show_name = show_name[len(tag):].strip()
@@ -852,7 +862,42 @@ class GuessItParser:
                 metadata['show_name'] = cleaned_name
                 logger.debug(f"清理字幕组格式剧名: '{show_name}' -> '{cleaned_name}'")
 
+        # 「中文名.英文名.SxxExx」格式（如 狂王.Asura.S02E02）：GuessIt 只保留英文名，
+        # 会把中文名整个丢掉，导致后续拿 Asura 去搜 TMDB / Emos 全部匹配失败。
+        # 这里把文件名开头的中文名找回来当主标题，英文名留到 en_title 备用。
+        current_name = metadata.get('show_name') or ''
+        if current_name and not self._RE_HAS_CJK.search(current_name):
+            cjk_prefix = self._extract_cjk_prefix(stem)
+            if cjk_prefix and cjk_prefix != current_name:
+                metadata['en_title'] = self._clean_title(current_name)
+                metadata['show_name'] = cjk_prefix
+                logger.debug(
+                    f"补回中文剧名: '{current_name}' -> '{cjk_prefix}' (来自文件名开头)"
+                )
+
         return metadata
+
+    def _extract_cjk_prefix(self, stem: str) -> str:
+        """取文件名开头连续的中文片段（狂王.Asura.S02E02 -> 狂王）
+
+        只认「整段都是中文 / 假名 / 谚文」的 token，遇到英文或季集号就停，
+        避免把字幕组标记、英文名一起拼进剧名。
+        """
+        text = re.sub(r'^\s*[【\[][^】\]]*[】\]]\s*', '', str(stem or '').strip())
+        tokens = [token for token in re.split(r'[\s._\-·|]+', text) if token]
+        collected: List[str] = []
+        for token in tokens:
+            if not self._RE_CJK_TOKEN.match(token):
+                break
+            collected.append(token)
+        if not collected:
+            return ""
+        name = "".join(collected)
+        for tag in self._CATEGORY_TAGS:
+            if name.startswith(tag) and name != tag:
+                name = name[len(tag):]
+                break
+        return name.strip()
 
     def _convert_result(self, result: Dict, filename: str) -> Dict[str, Any]:
         """

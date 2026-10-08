@@ -607,12 +607,6 @@ class TelegramBotService:
         if target:
             lines.append(f"识别目标：{target}")
         lines.append(f"原因：{(error or '未知错误')[:600]}")
-        lines.append("")
-        lines.append("回复本条消息即可修正目标：")
-        lines.append("· 只发片名关键词 → 搜索候选后点选作品 / 季 / 集")
-        lines.append("· 或直接写「时光代理人S04E09」一步到位")
-        lines.append("· 同名作品可带年份区分，如「狂王 2024」「狂王 (2024) S02E04」")
-        lines.append("回复「删除」可删除该文件的上传任务与下载器任务并停止提醒")
         message_id = self.send_text("\n".join(lines))
         if not message_id:
             # 发送失败（网络等）不算已通知，下次还能重试
@@ -739,11 +733,7 @@ class TelegramBotService:
             if target:
                 lines.append(f"识别目标：{target}")
             lines.append(f"原因：{str(item.get('error') or '未知错误')[:600]}")
-            lines.append("")
-            lines.append("回复本条消息：发片名关键词搜索候选，点选作品 / 季 / 集即可修正目标")
-            lines.append("同名作品可带年份区分，如「狂王 2024」")
             lines.append("（未解决前每 5 分钟提醒一次）")
-            lines.append("回复「删除」可删除该文件的上传任务与下载器任务并停止提醒")
             message_id = self.send_text("\n".join(lines))
             with self._lock:
                 current = self._active_errors.get(key)

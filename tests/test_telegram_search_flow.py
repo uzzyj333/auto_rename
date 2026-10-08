@@ -496,6 +496,37 @@ class TestMissingFileNotifications(unittest.TestCase):
         self.assertEqual(service.sent, [])
         self.assertEqual(service._active_errors, {})
 
+    def test_error_notification_has_no_reply_hint_block(self):
+        """报错通知不再附「回复本条消息即可修正目标」提示块"""
+        service = self._service()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.mkv"
+            path.write_bytes(b"x")
+            service.notify_error(
+                {"file_path": str(path), "file_name": "a.mkv"}, "boom"
+            )
+        body = service.sent[-1]
+        self.assertNotIn("回复本条消息即可修正目标", body)
+        self.assertNotIn("只发片名关键词", body)
+        self.assertIn("原因：boom", body)
+
+    def test_reminder_has_no_reply_hint_block(self):
+        """定时提醒也不再附回复提示，只保留提醒本身"""
+        service = self._service()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.mkv"
+            path.write_bytes(b"x")
+            service._active_errors[f"{path}|上传失败"] = {
+                "context": {"file_path": str(path), "file_name": "a.mkv"},
+                "error": "boom",
+                "header": "上传失败",
+                "last_sent": 0.0,
+            }
+            service._send_reminders()
+        body = service.sent[-1]
+        self.assertNotIn("回复本条消息", body)
+        self.assertIn("仍未解决", body)
+
 
 class TestQuickKeyboard(_BotHarness):
     def test_quick_reply_text_maps_to_command(self):
