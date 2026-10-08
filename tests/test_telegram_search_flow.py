@@ -622,5 +622,94 @@ class TestBrowseGrid(_BotHarness):
         self.assertTrue(any("🗑️ 删除" in label for label in flat))
 
 
+class _FakeEmosApiClient:
+    """只有季 / 集接口有数据（模拟 Emos 手动新增的集不在目录树里）"""
+
+    def __init__(self, seasons=None, episodes=None):
+        self._seasons = list(seasons or [])
+        self._episodes = dict(episodes or {})
+        self.episode_calls = []
+
+    def get_seasons(self, video_id):
+        return list(self._seasons)
+
+    def get_episodes(self, video_id, season_number=None):
+        self.episode_calls.append(season_number)
+        return list(self._episodes.get(season_number, []))
+
+
+class _StubApiService:
+    def __init__(self, client):
+        self._client = client
+
+    def get_client(self):
+        return self._client
+
+
+class TestEmosApiFallback(_BotHarness):
+    """目录树里没有手动新增的季 / 集时，用 Emos 季 / 集接口兜底"""
+
+    def _patch(self, client):
+        return (
+            patch.object(
+                TelegramBotService, "_fetch_tree", lambda self, video: []
+            ),
+            patch(
+                "src.video_organizer.core.online_upload.OnlineUploadService.instance",
+                lambda: _StubApiService(client),
+            ),
+        )
+
+    def test_season_episodes_fall_back_to_emos_api(self):
+        video = {
+            "title": "狂王",
+            "item_type": "vl",
+            "item_id": "vl1",
+            "seasons": [],
+        }
+        season = {"season_number": 2, "item_id": "vs2", "episodes": []}
+        client = _FakeEmosApiClient(
+            episodes={
+                2: [
+                    {
+                        "episode_number": 4,
+                        "episode_title": "第四集",
+                        "item_type": "ve",
+                        "item_id": "ve24",
+                    }
+                ]
+            }
+        )
+        tree_patch, service_patch = self._patch(client)
+        with tree_patch, service_patch:
+            episodes = self.service._load_season_episodes(video, season)
+
+        self.assertEqual([e["item_id"] for e in episodes], ["ve24"])
+        self.assertEqual(client.episode_calls, [2])
+
+    def test_video_seasons_fall_back_to_emos_api(self):
+        video = {
+            "title": "狂王",
+            "item_type": "vl",
+            "item_id": "vl1",
+            "seasons": [],
+        }
+        client = _FakeEmosApiClient(
+            seasons=[
+                {
+                    "season_number": 2,
+                    "season_title": "第二季",
+                    "item_type": "vs",
+                    "item_id": "vs2",
+                }
+            ]
+        )
+        tree_patch, service_patch = self._patch(client)
+        with tree_patch, service_patch:
+            seasons = self.service._load_video_seasons(video)
+
+        self.assertEqual([s["item_id"] for s in seasons], ["vs2"])
+
+
 if __name__ == "__main__":
     unittest.main()

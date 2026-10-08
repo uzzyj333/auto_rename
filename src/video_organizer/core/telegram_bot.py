@@ -2436,7 +2436,27 @@ class TelegramBotService:
             found = [s for s in (item.get("seasons") or []) if isinstance(s, dict)]
             if found:
                 return found
-        return []
+        return self._load_seasons_via_api(video)
+
+    def _load_seasons_via_api(
+        self, video: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """目录树里没有季时，用 Emos 的季接口兜底（手动新增的季可能不在树里）"""
+        vl_id = video.get("item_id")
+        if not vl_id:
+            return []
+        try:
+            from .online_upload import OnlineUploadService
+
+            client = OnlineUploadService.instance().get_client()
+            return [
+                item
+                for item in (client.get_seasons(vl_id) or [])
+                if isinstance(item, dict)
+            ]
+        except Exception as exc:
+            logger.debug("Emos 季接口兜底查询失败: %s", exc)
+            return []
 
     def _load_season_episodes(
         self, video: Dict[str, Any], season: Dict[str, Any]
@@ -2455,12 +2475,31 @@ class TelegramBotService:
                     and int(candidate.get("season_number")) == int(season_number)
                 )
                 if same_id or same_number:
-                    return [
+                    episodes = [
                         episode
                         for episode in (candidate.get("episodes") or [])
                         if isinstance(episode, dict)
                     ]
-        return []
+                    if episodes:
+                        return episodes
+        return self._load_episodes_via_api(video, season_number)
+
+    def _load_episodes_via_api(
+        self, video: Dict[str, Any], season_number: Optional[Any]
+    ) -> List[Dict[str, Any]]:
+        """目录树里没有该季的集时，用 Emos 的集接口兜底（手动新增的集可能不在树里）"""
+        vl_id = video.get("item_id")
+        if not vl_id:
+            return []
+        try:
+            from .online_upload import OnlineUploadService
+
+            client = OnlineUploadService.instance().get_client()
+            episodes = client.get_episodes(vl_id, season_number)
+        except Exception as exc:
+            logger.debug("Emos 集接口兜底查询失败: %s", exc)
+            return []
+        return [item for item in (episodes or []) if isinstance(item, dict)]
 
     def _send_search_results(
         self,

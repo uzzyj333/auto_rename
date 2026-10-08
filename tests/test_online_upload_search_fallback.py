@@ -311,5 +311,92 @@ class TestTelegramCorrectionRetryWithoutType(unittest.TestCase):
         self.assertTrue(any("已按修正目标重新上传" in text for text in sent))
 
 
+class _EndpointOnlyClient:
+    """目录树里没有嵌套的集，只有季 / 集接口能查到（模拟 Emos 手动新增的集）"""
+
+    def __init__(self, seasons, episodes):
+        self._seasons = seasons
+        self._episodes = episodes
+        self.episode_calls = []
+
+    def get_video_tree(
+        self,
+        video_type=None,
+        title=None,
+        todb_id=None,
+        tmdb_id=None,
+        video_id=None,
+    ):
+        return [
+            {
+                "item_id": str(video_id),
+                "title": "狂王",
+                "video_type": "tv",
+                "item_type": "vl",
+                "seasons": [],
+            }
+        ]
+
+    def get_seasons(self, video_id):
+        return list(self._seasons)
+
+    def get_episodes(self, video_id, season_number=None):
+        self.episode_calls.append(season_number)
+        return list(self._episodes.get(season_number, []))
+
+
+class TestEpisodeEndpointFallback(unittest.TestCase):
+    """目录树里没有手动新增的集时，用 Emos 季 / 集接口兜底定位"""
+
+    def test_resolve_uses_episode_endpoint(self):
+        client = _EndpointOnlyClient(
+            seasons=[{"season_number": 1, "item_id": "vs1"}],
+            episodes={
+                1: [
+                    {
+                        "episode_number": 5,
+                        "episode_title": "第五集",
+                        "item_type": "ve",
+                        "item_id": "ve15",
+                    }
+                ]
+            },
+        )
+        match = OnlineUploadService.resolve_episode_from_tree(
+            client, "vl1", 1, 5
+        )
+        self.assertIsNotNone(match)
+        self.assertEqual(match["item_id"], "ve15")
+        self.assertEqual(match["episode_number"], 5)
+
+    def test_resolve_returns_none_when_endpoint_has_no_episode(self):
+        client = _EndpointOnlyClient(
+            seasons=[{"season_number": 1, "item_id": "vs1"}],
+            episodes={1: []},
+        )
+        self.assertIsNone(
+            OnlineUploadService.resolve_episode_from_tree(client, "vl1", 1, 5)
+        )
+
+    def test_resolve_prefers_requested_season_then_avoids_ambiguity(self):
+        client = _EndpointOnlyClient(
+            seasons=[{"season_number": 1}, {"season_number": 2}],
+            episodes={
+                1: [{"episode_number": 5, "item_id": "ve-a"}],
+                2: [{"episode_number": 5, "item_id": "ve-b"}],
+            },
+        )
+        match = OnlineUploadService.resolve_episode_from_tree(
+            client, "vl1", 2, 5
+        )
+        self.assertEqual(match["item_id"], "ve-b")
+        # 没给季号且多季同号时不猜，避免传错集
+        self.assertIsNone(
+            OnlineUploadService.resolve_episode_from_tree(
+                client, "vl1", None, 5
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

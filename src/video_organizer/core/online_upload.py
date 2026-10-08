@@ -793,19 +793,92 @@ class OnlineUploadService:
         """getVideoId 未返回 episode_info 时，用视频目录树兜底定位具体某一集（ve）"""
         if not vl_id or episode is None:
             return None
+        tree: List[Dict[str, Any]] = []
         try:
             tree = client.get_video_tree(video_id=vl_id)
         except Exception as exc:
             logger.debug("Emos 目录树兜底查询失败: %s", exc)
-            return None
         narrowed = [
             item
             for item in (tree or [])
             if isinstance(item, dict) and str(item.get("item_id")) == str(vl_id)
         ]
-        return OnlineUploadService._pick_from_candidates(
+        match = OnlineUploadService._pick_from_candidates(
             narrowed or tree, season, episode, "tv"
         )
+        if match:
+            return match
+        # Emos 里手动新增的集有时不会出现在目录树的嵌套结构里，
+        # 再用 Emos 自己的季 / 集接口兜底查一次，避免「明明有集却匹配不到」。
+        return OnlineUploadService._resolve_episode_via_endpoints(
+            client, vl_id, season, episode
+        )
+
+    @staticmethod
+    def _resolve_episode_via_endpoints(
+        client: EmosClient,
+        vl_id: Any,
+        season: Optional[int],
+        episode: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        """用 Emos 的季 / 集接口兜底定位具体某一集（ve）
+
+        手动新增的集可能不在 /api/video/tree 的嵌套结构里，但能在
+        /api/video/{id}/season 与 /api/video/{id}/episode 查到。
+        只有集号命中且季号能对上（或全局唯一）时才返回，避免误选同号集。
+        """
+        if not vl_id or episode is None:
+            return None
+        season_numbers: List[Optional[int]] = []
+        if season is not None:
+            season_numbers.append(season)
+        try:
+            seasons = [
+                item
+                for item in (client.get_seasons(vl_id) or [])
+                if isinstance(item, dict)
+            ]
+        except Exception as exc:
+            logger.debug("Emos 季接口兜底查询失败: %s", exc)
+            seasons = []
+        for item in seasons:
+            number = _to_int(item.get("season_number"))
+            if number is not None and number not in season_numbers:
+                season_numbers.append(number)
+        if not season_numbers:
+            season_numbers.append(None)
+
+        matches: List[Dict[str, Any]] = []
+        for number in season_numbers:
+            try:
+                episodes = client.get_episodes(vl_id, number) or []
+            except Exception as exc:
+                logger.debug("Emos 集接口兜底查询失败(S%s): %s", number, exc)
+                continue
+            for item in episodes:
+                if not isinstance(item, dict):
+                    continue
+                if _to_int(item.get("episode_number")) != episode:
+                    continue
+                if not item.get("item_id"):
+                    continue
+                matches.append(
+                    {
+                        "item_type": item.get("item_type") or "ve",
+                        "item_id": str(item.get("item_id")),
+                        "label": item.get("episode_title") or "",
+                        "kind": "episode",
+                        "season_number": number,
+                        "episode_number": episode,
+                    }
+                )
+        if not matches:
+            return None
+        if season is not None:
+            for match in matches:
+                if match.get("season_number") == season:
+                    return match
+        return matches[0] if len(matches) == 1 else None
 
     @staticmethod
     def _pick_from_candidates(
