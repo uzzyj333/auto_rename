@@ -194,6 +194,13 @@ class TestOnlineUploadDedup(unittest.TestCase):
 
 
 class TestTelegramReminder(unittest.TestCase):
+    def setUp(self):
+        # 报错通知 / 提醒前会检查本地文件是否存在，所以用真实临时文件
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
     def _service(self):
         from src.video_organizer.core.telegram_bot import TelegramBotService
 
@@ -207,14 +214,19 @@ class TestTelegramReminder(unittest.TestCase):
         )
         return service
 
+    def _context(self, name="a.mkv"):
+        path = Path(self._tmp.name) / name
+        path.write_bytes(b"x")
+        return {"file_path": str(path), "file_name": name, "title": "剧"}
+
     def test_reminder_resends_after_interval(self):
         service = self._service()
-        context = {"file_path": "E:/d/a.mkv", "file_name": "a.mkv", "title": "剧"}
+        context = self._context()
         self.assertTrue(service.notify_error(context, "上传失败"))
         self.assertEqual(len(service.sent), 1)
 
         # 把上次发送时间拨回 6 分钟，模拟一直未解决
-        key = "E:/d/a.mkv|上传失败"
+        key = f"{context['file_path']}|上传失败"
         service._active_errors[key]["last_sent"] = time.time() - 360
         service._send_reminders()
         self.assertEqual(len(service.sent), 2)
@@ -222,10 +234,10 @@ class TestTelegramReminder(unittest.TestCase):
 
     def test_clear_error_stops_reminder(self):
         service = self._service()
-        context = {"file_path": "E:/d/a.mkv", "file_name": "a.mkv"}
+        context = self._context()
         service.notify_error(context, "上传失败")
-        service.clear_error("E:/d/a.mkv")
-        key = "E:/d/a.mkv|上传失败"
+        service.clear_error(context["file_path"])
+        key = f"{context['file_path']}|上传失败"
         self.assertNotIn(key, service._active_errors)
         service._send_reminders()
         self.assertEqual(len(service.sent), 1)

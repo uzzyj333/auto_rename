@@ -75,6 +75,60 @@ def _title_matches(candidate: Any, query: Any) -> bool:
     return left == right or left in right or right in left
 
 
+# 播出 / 上映年份可能出现的字段名（Emos 各条目字段不统一）
+_DATE_KEYS = (
+    "date_air",
+    "air_date",
+    "release_date",
+    "first_air_date",
+    "premiere_date",
+    "year",
+)
+
+
+def _pick_date(item: Any) -> str:
+    """从季 / 集条目里取播出日期（多季剧的年份按季算：第一季 2024、第二季 2026）"""
+    if not isinstance(item, dict):
+        return ""
+    for key in _DATE_KEYS:
+        value = item.get(key)
+        if value in (None, ""):
+            continue
+        text = str(value).strip()
+        if len(text) >= 4 and text[:4].isdigit():
+            return text
+    return ""
+
+
+def _matches_year(item: Any, year: Optional[int]) -> bool:
+    """条目的播出年份是否等于给定年份（取不到年份时不算命中）"""
+    if year is None or not isinstance(item, dict):
+        return False
+    return _pick_date(item)[:4] == str(year)
+
+
+def _video_matches_year(video: Any, year: Optional[int]) -> bool:
+    """年份是否命中作品 / 任意季 / 任意集
+
+    很多剧按季标年份（第一季 2024、第二季 2026），用户回复「狂王.2026.S02E04」
+    里的 2026 属于第二季。只看作品级 date_air 会把「第二季 2026」当成另一部
+    2026 年的同名剧，反而把正确候选过滤掉，所以这里逐层比对。
+    """
+    if year is None or not isinstance(video, dict):
+        return False
+    if _matches_year(video, year):
+        return True
+    for season in video.get("seasons") or []:
+        if not isinstance(season, dict):
+            continue
+        if _matches_year(season, year):
+            return True
+        for episode in season.get("episodes") or []:
+            if _matches_year(episode, year):
+                return True
+    return False
+
+
 @dataclass
 class OnlineUploadTask:
     """在线识别上传任务"""
@@ -768,6 +822,17 @@ class OnlineUploadService:
         候选里定位季/集，避免把别的剧的同名集号当成目标。
         """
         ordered = list(candidates or [])
+        has_year_match = year is not None and any(
+            _video_matches_year(video, year) for video in ordered
+        )
+        if has_year_match:
+            matched_year = [
+                video for video in ordered if _video_matches_year(video, year)
+            ]
+            rest_year = [
+                video for video in ordered if not _video_matches_year(video, year)
+            ]
+            ordered = matched_year + rest_year
         if title:
             matched = [
                 video
@@ -784,14 +849,13 @@ class OnlineUploadService:
         for video in ordered:
             if not isinstance(video, dict):
                 continue
-            seasons = video.get("seasons") or []
+            seasons = [s for s in (video.get("seasons") or []) if isinstance(s, dict)]
             if media_type == "movie" or not seasons:
                 item_id = video.get("item_id")
                 if media_type == "movie" and item_id:
-                    if year is not None:
-                        date_air = str(video.get("date_air") or "")
-                        if date_air[:4].isdigit() and date_air[:4] != str(year):
-                            continue
+                    # 有年份命中的候选时优先它；一个都对不上就不再硬丢弃，退回第一部
+                    if has_year_match and not _video_matches_year(video, year):
+                        continue
                     return {
                         "item_type": video.get("item_type") or "vl",
                         "item_id": str(item_id),
@@ -799,6 +863,13 @@ class OnlineUploadService:
                         "kind": "movie",
                     }
                 continue
+            # 年份命中某季时优先选那季（多季剧按季标年份：S01=2024、S02=2026）
+            if has_year_match:
+                season_matched = [s for s in seasons if _matches_year(s, year)]
+                if season_matched:
+                    seasons = season_matched + [
+                        s for s in seasons if not _matches_year(s, year)
+                    ]
             for season_item in seasons:
                 if not isinstance(season_item, dict):
                     continue
@@ -924,12 +995,14 @@ class OnlineUploadService:
                         {
                             "season_number": season.get("season_number"),
                             "season_title": season.get("season_title") or "",
+                            "date_air": _pick_date(season),
                             "item_type": season.get("item_type") or "vs",
                             "item_id": str(season.get("item_id") or ""),
                             "episodes": [
                                 {
                                     "episode_number": episode.get("episode_number"),
                                     "episode_title": episode.get("episode_title") or "",
+                                    "date_air": _pick_date(episode),
                                     "item_type": episode.get("item_type") or "ve",
                                     "item_id": str(episode.get("item_id") or ""),
                                     "has_media": bool(episode.get("has_media")),

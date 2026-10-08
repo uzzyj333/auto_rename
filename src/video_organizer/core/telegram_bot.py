@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -45,6 +45,19 @@ _ERROR_NOTIFY_INTERVAL = 300  # 同一文件的同类报错 5 分钟只推一次
 _REMINDER_INTERVAL = 30       # 报错提醒检查间隔（秒）
 _MAX_BROWSE_TOKENS = 500      # 最多记住多少个「浏览/上传」路径令牌
 _BROWSE_PAGE_SIZE = 20        # 目录浏览每页显示的条目数
+_MAX_FLOW_TOKENS = 300        # 最多记住多少个「搜索 → 选季 → 选集」会话令牌
+
+# 底部快捷键盘（回复键盘）：点按即发送对应指令，省得每次手输
+_QUICK_KEYBOARD = [
+    [{"text": "📤 上传文件"}, {"text": "⚙️ 快捷配置"}],
+    [{"text": "📊 运行状态"}, {"text": "❓ 使用帮助"}],
+]
+_QUICK_REPLY_MAP = {
+    "📤 上传文件": "/upload",
+    "⚙️ 快捷配置": "/config",
+    "📊 运行状态": "/status",
+    "❓ 使用帮助": "/help",
+}
 
 # 回复这些关键词表示「删除该文件的任务并停止提醒」
 _DELETE_KEYWORDS = {
@@ -70,13 +83,18 @@ _HELP_TEXT = (
     "/upload  浏览本地文件：上传 / 删除文件或文件夹\n"
     "/config  快捷配置（开关）+「处理配置」/「Emos API」\n"
     "/status  查看机器人状态\n"
+    "/keyboard  重新显示底部快捷键盘\n"
     "/help  查看本帮助\n\n"
-    "修正上传目标：直接「回复」某条报错信息并发送目标，例如\n"
+    "修正上传目标：直接「回复」某条报错信息并发送片名关键词，\n"
+    "机器人会搜索 Emos 并列出候选，点选作品后再选季 / 集即可上传；\n"
+    "也可以一步到位直接写：\n"
     "　时光代理人S04E09\n"
     "　时光代理人 第4季第9集\n"
     "　时光代理人 4x09\n"
-    "　时光代理人 (2024)\n\n"
-    "删除任务：回复某条报错信息并发送「删除」，即可删除该文件的任务并停止提醒"
+    "　时光代理人 (2024)\n"
+    "同名作品较多时可带上年份区分，如「狂王 2024」「狂王 (2024) S02E04」\n\n"
+    "删除任务：回复某条报错信息并发送「删除」，会同时删除该文件的上传任务、\n"
+    "aria2 / qBittorrent 下载任务并停止提醒"
 )
 
 
@@ -132,6 +150,42 @@ def _candidate_contains_item(video: Dict[str, Any], item_id: str) -> bool:
     return False
 
 
+def _item_year(item: Any) -> str:
+    """取条目上的 4 位播出年份（date_air / air_date / year… 取不到返回空串）"""
+    if not isinstance(item, dict):
+        return ""
+    for key in ("date_air", "air_date", "release_date", "first_air_date", "premiere_date", "year"):
+        value = item.get(key)
+        if value in (None, ""):
+            continue
+        text = str(value).strip()
+        if len(text) >= 4 and text[:4].isdigit():
+            return text[:4]
+    return ""
+
+
+def _year_matches(video: Any, year: Optional[int]) -> bool:
+    """年份是否命中作品 / 任意季 / 任意集（多季剧按季标年份：S01=2024、S02=2026）
+
+    只看作品级 date_air 会把「第二季 2026」当成另一部 2026 年的同名剧，
+    反而过滤掉正确候选，所以这里逐层比对。
+    """
+    if not year or not isinstance(video, dict):
+        return False
+    target = str(year)
+    if _item_year(video) == target:
+        return True
+    for season in video.get("seasons") or []:
+        if not isinstance(season, dict):
+            continue
+        if _item_year(season) == target:
+            return True
+        for episode in season.get("episodes") or []:
+            if _item_year(episode) == target:
+                return True
+    return False
+
+
 def _cn_to_int(text: str) -> Optional[int]:
     """把「一」「十二」「二十三」「一百」这类中文数字转成整数"""
     text = (text or "").strip()
@@ -172,11 +226,14 @@ class TargetExpression:
 
     @property
     def kind(self) -> str:
-        """tv / movie / unknown"""
+        """tv / unknown
+
+        年份单独出现时不视为电影：它主要用于在同名作品之间区分，
+        到底是剧集还是电影由搜索结果让用户确认，避免「狂王 2024」
+        这类剧集被强制当成电影搜不到。
+        """
         if self.season is not None or self.episode is not None:
             return "tv"
-        if self.year is not None:
-            return "movie"
         return "unknown"
 
     @property
@@ -201,7 +258,21 @@ _RE_NXNN = re.compile(r"(?P<s>\d{1,3})\s*[xX×]\s*(?P<e>\d{1,4})")
 _RE_CN_SEASON = re.compile(rf"第\s*(?P<s>{_CN_NUM})\s*[季部]")
 _RE_CN_EPISODE = re.compile(rf"第\s*(?P<e>{_CN_NUM})\s*[集话話期]")
 _RE_S_ONLY = re.compile(r"[Ss](?P<s>\d{1,3})(?![\dEe])")
-_RE_YEAR = re.compile(r"(?:[\(\[]|\s|^)(?P<y>(?:19|20)\d{2})(?:[\)\]]|\s|$)")
+# 年份两侧可能是空格 / 点 / 短横线（粘贴文件名：狂王.2024.S01E01）
+_RE_YEAR = re.compile(
+    r"(?:[\(\[]|[\s._\-·|]|^)(?P<y>(?:19|20)\d{2})(?:[\)\]]|[\s._\-·|]|$)"
+)
+# 括号里的年份（(2024) / [2024]）：即使同时写了季集也当成年份
+_RE_YEAR_PAREN = re.compile(r"[\(\[]\s*(?P<y>(?:19|20)\d{2})\s*[\)\]]")
+# 粘贴文件名时混进标题的压制 / 片源标签（1080p、WEB-DL、H265、DDP2.0…）
+_RE_RELEASE_TAG = re.compile(
+    r"(?:\d{3,4}[pi]|4k|8k|"
+    r"web(?:[-_. ]?(?:dl|rip))?|blu[-_. ]?ray|bdrip|hdtv|remux|dvdrip|hdrip|"
+    r"h\.?26[45]|hevc|avc|x26[45]|xvid|av1|"
+    r"dd\+?p?\d?(?:\.\d)?|aac|ac3|eac3|dts(?:[-_. ]?hd)?|truehd|atmos|flac|mp3|"
+    r"hdr10\+?|hdr|dv|sdr|10bit|8bit|repack|proper|extended|ma\d\.\d)$",
+    re.IGNORECASE,
+)
 # 用户经常直接粘贴文件名（大王饶命.S03E03.mkv），标题里要清掉视频/字幕后缀
 _RE_MEDIA_EXT = re.compile(
     r"\.(?:mkv|mp4|avi|mov|wmv|flv|ts|m2ts|iso|strm|webm|m4v|mpg|mpeg|rmvb|srt|ass|ssa|vtt|sub)$",
@@ -244,11 +315,14 @@ def parse_target_expression(raw: str) -> TargetExpression:
                 cut(match)
                 break
 
-    if expr.season is None and expr.episode is None:
-        match = _RE_YEAR.search(text)
-        if match:
-            expr.year = int(match.group("y"))
-            cut(match)
+    # 年份：括号写法始终识别，裸年份也识别；但只有去掉年份后仍留有片名时才
+    # 当成年份，避免把片名本身就是年份的作品（如「1899 S01E01」）吃掉
+    year_match = _RE_YEAR_PAREN.search(text) or _RE_YEAR.search(text)
+    if year_match:
+        remainder = f"{text[:year_match.start()]} {text[year_match.end():]}"
+        if re.sub(r"[\s\-_·|,，。:：\[\]【】\(\)（）0-9]+", "", remainder):
+            expr.year = int(year_match.group("y"))
+            cut(year_match)
 
     title = re.sub(r"[\s\-_·|,，。:：\[\]【】\(\)（）]+", " ", text).strip()
     title = title.strip(_TITLE_EDGE_CHARS)
@@ -295,6 +369,8 @@ class TelegramBotService:
         self._reminder_thread: Optional[threading.Thread] = None
         self._browse_tokens: Dict[str, str] = {}
         self._browse_token_seq = 0
+        self._flow_tokens: Dict[str, Dict[str, Any]] = {}
+        self._flow_seq = 0
         self._sent_count = 0
         self._last_error = ""
         self._last_update_at = ""
@@ -459,6 +535,34 @@ class TelegramBotService:
             reason = self._last_error or "未配置 bot_token / chat_id"
         return {"success": False, "message": f"发送失败: {reason}"}
 
+    def send_quick_keyboard(
+        self,
+        chat_id: Optional[str] = None,
+        text: str = "快捷操作：点下方按钮即可，无需手动输入指令。",
+    ) -> None:
+        """发送 / 刷新底部常驻快捷键盘（回复键盘）"""
+        with self._lock:
+            token = self._token
+            target_chat = str(chat_id or self._chat_id or "").strip()
+        if not token or not target_chat:
+            return
+        payload: Dict[str, Any] = {
+            "chat_id": target_chat,
+            "text": text,
+            "reply_markup": {
+                "keyboard": _QUICK_KEYBOARD,
+                "resize_keyboard": True,
+                "is_persistent": True,
+                "input_field_placeholder": "回复报错消息可搜索 / 修正目标",
+            },
+        }
+        try:
+            requests.post(
+                f"{_API_BASE}/bot{token}/sendMessage", json=payload, timeout=_SEND_TIMEOUT
+            )
+        except Exception as exc:
+            logger.debug("发送 Telegram 快捷键盘失败: %s", exc)
+
     def notify_error(
         self, context: Dict[str, Any], error: str, header: str = "上传失败"
     ) -> bool:
@@ -471,6 +575,11 @@ class TelegramBotService:
             if not (self._token and self._chat_id and self._enabled):
                 return False
             task_id = str((context or {}).get("task_id") or "")
+        # 本地文件已经不存在（被移动 / 删除 / 已成功上传后清理）就不再打扰用户
+        local_path = str((context or {}).get("file_path") or "").strip()
+        if local_path and not os.path.exists(local_path):
+            logger.debug("本地文件已不存在，跳过报错通知: %s", local_path)
+            return False
         name = (
             (context or {}).get("file_name")
             or os.path.basename(str((context or {}).get("file_path") or ""))
@@ -499,9 +608,11 @@ class TelegramBotService:
             lines.append(f"识别目标：{target}")
         lines.append(f"原因：{(error or '未知错误')[:600]}")
         lines.append("")
-        lines.append("回复本条消息即可修正目标，例如：")
-        lines.append("　时光代理人S04E09")
-        lines.append("回复「删除」可删除该文件的任务并停止提醒")
+        lines.append("回复本条消息即可修正目标：")
+        lines.append("· 只发片名关键词 → 搜索候选后点选作品 / 季 / 集")
+        lines.append("· 或直接写「时光代理人S04E09」一步到位")
+        lines.append("· 同名作品可带年份区分，如「狂王 2024」「狂王 (2024) S02E04」")
+        lines.append("回复「删除」可删除该文件的上传任务与下载器任务并停止提醒")
         message_id = self.send_text("\n".join(lines))
         if not message_id:
             # 发送失败（网络等）不算已通知，下次还能重试
@@ -523,20 +634,61 @@ class TelegramBotService:
                 self._active_errors.pop(next(iter(self._active_errors)), None)
         return True
 
+    @staticmethod
+    def _norm_path(path: Any) -> str:
+        """归一化路径用于比较（解析真实路径 + 统一大小写 / 分隔符）"""
+        text = str(path or "").strip()
+        if not text:
+            return ""
+        try:
+            return os.path.normcase(os.path.realpath(text))
+        except Exception:
+            return os.path.normcase(text)
+
     def clear_error(self, file_path: str, header: Optional[str] = None) -> None:
-        """上传成功 / 问题解决后停止该文件的定时提醒"""
+        """上传成功 / 问题解决后停止该文件的定时提醒
+
+        既按 key 前缀匹配（兼容 context 为空的旧数据），也按归一化路径匹配，
+        避免调用方传来相对 / 未解析路径时清不掉提醒。
+        """
         file_path = str(file_path or "").strip()
         if not file_path:
             return
         prefix = file_path + "|"
+        target = self._norm_path(file_path)
         with self._lock:
-            keys = [
-                key
-                for key in list(self._active_errors)
-                if key.startswith(prefix) and (header is None or key.endswith("|" + header))
-            ]
+            keys: List[str] = []
+            for key, item in self._active_errors.items():
+                if header is not None and not (
+                    key.endswith("|" + header) or (item or {}).get("header") == header
+                ):
+                    continue
+                if key.startswith(prefix):
+                    keys.append(key)
+                    continue
+                context = (item or {}).get("context") or {}
+                if target and self._norm_path(context.get("file_path")) == target:
+                    keys.append(key)
             for key in keys:
                 self._active_errors.pop(key, None)
+
+    def clear_errors_under(self, path: str) -> int:
+        """删除文件 / 目录后清掉该路径（含子文件）的所有报错提醒"""
+        base = self._norm_path(path)
+        if not base:
+            return 0
+        sep = os.sep
+        removed = 0
+        with self._lock:
+            for key, item in list(self._active_errors.items()):
+                context = (item or {}).get("context") or {}
+                candidate = self._norm_path(context.get("file_path"))
+                if not candidate:
+                    continue
+                if candidate == base or candidate.startswith(base + sep):
+                    self._active_errors.pop(key, None)
+                    removed += 1
+        return removed
 
     def clear_all_errors(self) -> int:
         """停止所有文件的报错定时提醒（清空全部失败任务时调用）"""
@@ -567,8 +719,15 @@ class TelegramBotService:
                 and not item.get("quiet")
             ]
         for key, item in due:
-            header = item.get("header") or "上传失败"
             context = item.get("context") or {}
+            local_path = str(context.get("file_path") or "").strip()
+            if local_path and not os.path.exists(local_path):
+                # 本地文件已经不存在（被移动 / 删除），不再提醒，直接清掉这条报错
+                logger.debug("本地文件已不存在，停止报错提醒: %s", local_path)
+                with self._lock:
+                    self._active_errors.pop(key, None)
+                continue
+            header = item.get("header") or "上传失败"
             name = (
                 context.get("file_name")
                 or os.path.basename(str(context.get("file_path") or ""))
@@ -581,8 +740,10 @@ class TelegramBotService:
                 lines.append(f"识别目标：{target}")
             lines.append(f"原因：{str(item.get('error') or '未知错误')[:600]}")
             lines.append("")
-            lines.append("回复本条消息即可修正目标（未解决前每 5 分钟提醒一次）")
-            lines.append("回复「删除」可删除该文件的任务并停止提醒")
+            lines.append("回复本条消息：发片名关键词搜索候选，点选作品 / 季 / 集即可修正目标")
+            lines.append("同名作品可带年份区分，如「狂王 2024」")
+            lines.append("（未解决前每 5 分钟提醒一次）")
+            lines.append("回复「删除」可删除该文件的上传任务与下载器任务并停止提醒")
             message_id = self.send_text("\n".join(lines))
             with self._lock:
                 current = self._active_errors.get(key)
@@ -696,6 +857,9 @@ class TelegramBotService:
         command = ""
         if text.startswith("/"):
             command = text.split()[0].split("@")[0].lower()
+        elif text in _QUICK_REPLY_MAP:
+            # 底部快捷键盘按钮：把按钮文字映射回对应指令
+            command = _QUICK_REPLY_MAP[text]
         if command in ("/bind", "/start", "/help") and not bound_chat:
             self._handle_command(command, chat_id, user_id, allowed)
             return
@@ -749,15 +913,21 @@ class TelegramBotService:
                 return
             if bound_chat == chat_id:
                 self.send_text("机器人已绑定当前会话 ✅\n发送 /help 查看用法。", chat_id=chat_id)
+                self.send_quick_keyboard(chat_id)
                 return
             self._bind_chat(chat_id)
             self.send_text(
                 f"绑定成功 ✅\nchat_id = {chat_id}\n\n上传失败时会推送报错信息，直接回复即可修正目标。",
                 chat_id=chat_id,
             )
+            self.send_quick_keyboard(chat_id)
             return
         if command == "/help":
             self.send_text(_HELP_TEXT, chat_id=chat_id)
+            self.send_quick_keyboard(chat_id)
+            return
+        if command in ("/keyboard", "/menu", "/快捷栏"):
+            self.send_quick_keyboard(chat_id)
             return
         if command in ("/upload", "/files"):
             self._send_browse(chat_id, "", None)
@@ -924,46 +1094,44 @@ class TelegramBotService:
         page_entries = entries[start : start + _BROWSE_PAGE_SIZE]
         base_token = self._token_for_path(str(base))
 
-        rows: List[List[Dict[str, str]]] = [
-            [
-                {
-                    "text": "⬆️ 上一级",
-                    "callback_data": f"up:ls:{self._token_for_path(str(base.parent))}:0",
-                },
-                {"text": "🏠 根目录", "callback_data": "up:roots"},
-            ]
+        # 统一成 3 列网格：导航行 / 目录行 / 文件行 / 翻页行外观保持一致
+        rows: List[List[Dict[str, str]]] = []
+        nav_row: List[Dict[str, str]] = [
+            {
+                "text": "⬆️ 上一级",
+                "callback_data": f"up:ls:{self._token_for_path(str(base.parent))}:0",
+            },
+            {"text": "🏠 根目录", "callback_data": "up:roots"},
         ]
         if dirs or files:
-            rows.append(
-                [
-                    {
-                        "text": "📤 上传此文件夹全部视频",
-                        "callback_data": f"up:dir:{base_token}",
-                    }
-                ]
-            )
+            nav_row.append({"text": "📤 上传全部", "callback_data": f"up:dir:{base_token}"})
+        else:
+            nav_row.append({"text": "🚫 无可上传", "callback_data": "up:noop"})
+        rows.append(nav_row)
         for entry in page_entries:
             target = entry["path"]
             token = self._token_for_path(str(target))
             if entry["kind"] == "dir":
+                name = _shorten_text(target.name, 26)
                 rows.append(
                     [
-                        {"text": f"📁 {target.name}", "callback_data": f"up:ls:{token}:0"},
+                        {"text": f"📂 {name}", "callback_data": f"up:ls:{token}:0"},
                         {"text": "📤 上传", "callback_data": f"up:dir:{token}"},
-                        {"text": "🗑️", "callback_data": f"up:del:{token}"},
+                        {"text": "🗑️ 删除", "callback_data": f"up:del:{token}"},
                     ]
                 )
             else:
                 size_text = _format_size(entry.get("size"))
                 suffix = f"（{size_text}）" if size_text else ""
-                name = _shorten_text(target.name, max(8, 46 - len(suffix)))
+                name = _shorten_text(target.name, max(8, 26 - len(suffix)))
                 rows.append(
                     [
                         {
                             "text": f"🎬 {name}{suffix}",
                             "callback_data": f"up:file:{token}",
                         },
-                        {"text": "🗑️", "callback_data": f"up:del:{token}"},
+                        {"text": "📤 上传", "callback_data": f"up:file:{token}"},
+                        {"text": "🗑️ 删除", "callback_data": f"up:del:{token}"},
                     ]
                 )
         if total_pages > 1:
@@ -1080,9 +1248,21 @@ class TelegramBotService:
             service.delete_tasks_for_file(str(target))
         except Exception:
             pass
-        self.clear_error(str(target))
+        removed_downloads: List[str] = []
+        try:
+            from .downloader_monitor import remove_downloader_tasks
+
+            # 只清下载器里的任务，本地文件由上面的删除逻辑负责
+            removed_downloads = remove_downloader_tasks(str(target), delete_files=False)
+        except Exception as exc:
+            logger.debug("删除下载器任务失败: %s", exc)
+        # 目录删除时把子文件遗留的报错提醒一起清掉
+        self.clear_errors_under(str(target))
         kind = "目录" if is_dir else "文件"
-        self._send_keyboard(chat_id, f"🗑️ 已删除{kind}：{target.name}", [], message_id)
+        text = f"🗑️ 已删除{kind}：{target.name}"
+        if removed_downloads:
+            text += f"\n已同步删除下载器任务：{'、'.join(removed_downloads)}"
+        self._send_keyboard(chat_id, text, [], message_id)
 
     def _handle_callback_query(self, query: Dict[str, Any]) -> None:
         query_id = str(query.get("id") or "")
@@ -1193,6 +1373,11 @@ class TelegramBotService:
                 section, _, key = payload.partition(":")
                 self._answer_callback(query_id, "请回复新值")
                 self._prompt_config_edit(chat_id, section, key)
+                return
+            if data.startswith("fx:"):
+                self._answer_callback(query_id, "")
+                action, _, token = data[len("fx:"):].partition(":")
+                self._handle_flow_callback(chat_id, action, token, message_id)
                 return
             self._answer_callback(query_id, "未知操作")
         except Exception as exc:
@@ -1706,6 +1891,7 @@ class TelegramBotService:
         file_path = str(context.get("file_path") or "")
         name = context.get("file_name") or os.path.basename(file_path) or "-"
         removed = 0
+        removed_downloads: List[str] = []
         if file_path:
             try:
                 from .online_upload import OnlineUploadService
@@ -1713,6 +1899,13 @@ class TelegramBotService:
                 removed = OnlineUploadService.instance().delete_tasks_for_file(file_path)
             except Exception as exc:
                 logger.debug("删除文件任务失败: %s", exc)
+            try:
+                from .downloader_monitor import remove_downloader_tasks
+
+                # 只清下载器里的任务，本地文件保留（需要删文件用 /upload 里的删除键）
+                removed_downloads = remove_downloader_tasks(file_path, delete_files=False)
+            except Exception as exc:
+                logger.debug("删除下载器任务失败: %s", exc)
             self.clear_error(file_path)
         with self._lock:
             if reply_to is not None:
@@ -1721,6 +1914,11 @@ class TelegramBotService:
             message = f"🗑️ 已删除该文件的任务并停止提醒\n文件：{name}\n（共移除 {removed} 个任务）"
         else:
             message = f"🗑️ 已停止该文件的提醒\n文件：{name}\n（未找到对应任务，可能已删除）"
+        if removed_downloads:
+            message += (
+                f"\n已同步删除下载器任务：{'、'.join(removed_downloads)}"
+                "（本地文件未删除，需要删文件用 /upload 里的删除键）"
+            )
         self.send_text(message, chat_id=chat_id, reply_to=reply_to)
 
     def _handle_correction(self, context: Dict[str, Any], text: str, chat_id: str, reply_to: Optional[int]) -> None:
@@ -1749,11 +1947,46 @@ class TelegramBotService:
         video_type = "movie" if media_type == "movie" else ("tv" if media_type == "tv" else None)
 
         try:
-            candidates = (
-                service.search_targets(video_type=video_type, title=expr.title) if expr.title else []
-            )
+            candidates, matched_title = self._search_by_title(service, expr.title, video_type)
         except Exception as exc:
             self.send_text(f"查询 Emos 失败：{exc}", reply_to=reply_to, chat_id=chat_id)
+            return
+        if matched_title:
+            expr.title = matched_title
+        raw_candidates = candidates
+        candidates = self._filter_by_year(raw_candidates, expr.year)
+        year_note = self._year_filter_note(expr.year, raw_candidates, candidates)
+
+        if not candidates:
+            # 回复里的关键词搜不到时，退回报错文件本身的标题再搜一次兜底
+            fallback_title = str(context.get("title") or "").strip()
+            if fallback_title and fallback_title != expr.title:
+                try:
+                    candidates, fallback_matched = self._search_by_title(
+                        service, fallback_title, video_type
+                    )
+                except Exception as exc:
+                    logger.debug("用报错标题兜底搜索失败: %s", exc)
+                    candidates, fallback_matched = [], ""
+                if candidates:
+                    if fallback_matched:
+                        expr.title = fallback_matched
+                    raw_candidates = candidates
+                    candidates = self._filter_by_year(raw_candidates, expr.year)
+                    year_note = self._year_filter_note(
+                        expr.year, raw_candidates, candidates
+                    )
+
+        # 没写季 / 集时不做一次性匹配，直接列出候选让用户点选作品 / 季 / 集
+        if expr.season is None and expr.episode is None:
+            self._send_search_results(
+                chat_id,
+                context,
+                candidates,
+                expr.title,
+                reply_to=reply_to,
+                note=year_note,
+            )
             return
 
         match = self._locate_target(service, candidates, expr, media_type)
@@ -1766,14 +1999,29 @@ class TelegramBotService:
             except Exception:
                 retry_candidates = []
             if retry_candidates:
-                candidates = retry_candidates
+                raw_candidates = retry_candidates
+                candidates = self._filter_by_year(raw_candidates, expr.year)
+                year_note = self._year_filter_note(
+                    expr.year, raw_candidates, candidates
+                )
                 match = self._locate_target(service, candidates, expr, media_type)
         if not match:
-            hint = self._candidate_hint(candidates)
-            message = f"未在 Emos 中找到匹配条目：{expr.describe()}"
-            if hint:
-                message += f"\n\n可能的目标：\n{hint}"
-            message += "\n\n请调整标题 / 季集后重新回复。"
+            # 直接匹配不到时不再死胡同：列出候选，让用户点选正确的作品 / 季 / 集
+            if candidates:
+                note = f"未找到 {expr.describe()}，可直接在下面点选正确的作品 / 季 / 集。"
+                if year_note:
+                    note += f"\n{year_note}"
+                hint = self._candidate_hint(candidates)
+                if hint:
+                    note += f"\n\n搜索到：\n{hint}"
+                self._send_search_results(
+                    chat_id, context, candidates, expr.title, reply_to=reply_to, note=note
+                )
+                return
+            message = (
+                f"未在 Emos 中找到匹配条目：{expr.describe()}"
+                "\n\n请换几个关键词后重新回复本条报错消息。"
+            )
             self.send_text(message, reply_to=reply_to, chat_id=chat_id)
             return
 
@@ -2044,6 +2292,510 @@ class TelegramBotService:
             count += 1
         return count
 
+    # ------------------------------------------------------------------
+    # 搜索 → 选作品 → 选季 → 选集（回复报错信息后的交互式修正）
+    # ------------------------------------------------------------------
+
+    def _flow_token(self, payload: Dict[str, Any]) -> str:
+        """为「搜索 / 选季 / 选集」会话生成短令牌（规避 callback_data 64 字节限制）"""
+        with self._lock:
+            self._flow_seq += 1
+            token = f"f{self._flow_seq}"
+            self._flow_tokens[token] = payload
+            while len(self._flow_tokens) > _MAX_FLOW_TOKENS:
+                self._flow_tokens.pop(next(iter(self._flow_tokens)), None)
+            return token
+
+    def _flow_payload(self, token: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return self._flow_tokens.get(str(token))
+
+    @staticmethod
+    def _work_label(video: Dict[str, Any]) -> str:
+        """作品候选按钮文案：《片名》（S01 2024、S02 2026）"""
+        title = str(video.get("title") or "").strip() or "?"
+        year = _item_year(video)
+        entries: List[Tuple[int, str]] = []
+        for season in video.get("seasons") or []:
+            if not isinstance(season, dict) or season.get("season_number") is None:
+                continue
+            entries.append((int(season.get("season_number")), _item_year(season)))
+        # 季各自标了年份（第一季 2024、第二季 2026）时按季展示，否则显示作品级年份
+        if entries and any(season_year for _, season_year in entries):
+            bits = []
+            for number, season_year in entries:
+                shown = season_year or year
+                bits.append(f"S{number:02d} {shown}" if shown else f"S{number:02d}")
+            return f"《{title}》（{'、'.join(bits)}）"
+        parts: List[str] = []
+        if year:
+            parts.append(year)
+        if entries:
+            parts.append("、".join(f"S{number:02d}" for number, _ in entries))
+        if parts:
+            return f"《{title}》（{' · '.join(parts)}）"
+        return f"《{title}》"
+
+    @staticmethod
+    def _filter_by_year(
+        candidates: List[Dict[str, Any]], year: Optional[int]
+    ) -> List[Dict[str, Any]]:
+        """回复里带了年份时，优先只保留年份匹配的候选（同名作品区分）
+
+        年份可能标在作品上，也可能标在季 / 集上（第一季 2024、第二季 2026），
+        逐层比对；一个候选都对不上时不再清空，退回全部候选兜底。
+        """
+        if not year:
+            return candidates
+        matched = [video for video in candidates if _year_matches(video, year)]
+        return matched or candidates
+
+    @staticmethod
+    def _year_filter_note(
+        year: Optional[int],
+        raw: List[Dict[str, Any]],
+        filtered: List[Dict[str, Any]],
+    ) -> str:
+        """按年份筛选后给用户的说明（区分「筛掉了同名作品」和「一个都对不上」）"""
+        if not year or not raw:
+            return ""
+        if any(_year_matches(video, year) for video in raw):
+            return f"已按年份 {year} 优先筛选同名作品。"
+        return f"没有年份为 {year} 的候选，已列出全部结果。"
+
+    @staticmethod
+    def _title_variants(title: str) -> List[str]:
+        """粘贴文件名时标题常带 ASCII 点 / 多余片段，给出依次尝试的搜索词
+
+        例如「狂王.Asura.S02E04」解析出的标题是「狂王.Asura」，
+        而「狂王.2024.1080p.S01E01」会剩下「狂王 1080p」；
+        Emos 里通常只叫「狂王」，所以按「原样 → 点换空格 → 去掉压制标签
+        → 去掉年份 → 第一段 → 去掉空格」依次搜。
+        """
+        base = str(title or "").strip()
+        variants: List[str] = []
+        spaced = base.replace(".", " ")
+        for candidate in (
+            base,
+            spaced,
+            TelegramBotService._strip_release_tags(base),
+            TelegramBotService._strip_release_tags(spaced),
+            TelegramBotService._strip_years(base),
+            TelegramBotService._strip_years(spaced),
+            base.split(".")[0],
+            "".join(base.split()),
+        ):
+            candidate = " ".join(str(candidate).split()).strip()
+            if candidate and candidate not in variants:
+                variants.append(candidate)
+        return variants
+
+    @staticmethod
+    def _strip_years(title: str) -> str:
+        """去掉标题里混入的年份（狂王 2024 → 狂王），避免把年份当片名搜"""
+        cleaned = re.sub(r"(?<!\d)(?:19|20)\d{2}(?!\d)", " ", str(title or ""))
+        return " ".join(cleaned.split()).strip()
+
+    @staticmethod
+    def _strip_release_tags(title: str) -> str:
+        """去掉标题里混入的压制 / 片源标签（1080p、WEB-DL、H265、DDP2.0…）"""
+        tokens = re.split(r"[\s._\-·|]+", str(title or "").strip())
+        kept: List[str] = []
+        for token in tokens:
+            if not token:
+                continue
+            if kept and _RE_RELEASE_TAG.match(token):
+                break
+            kept.append(token)
+        return " ".join(kept)
+
+    def _search_by_title(
+        self, service: Any, title: str, video_type: Optional[str]
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """按标题变体依次搜索 Emos，返回（候选列表，真正搜到结果的标题）"""
+        for variant in self._title_variants(title):
+            candidates = service.search_targets(video_type=video_type, title=variant)
+            if candidates:
+                return candidates, variant
+        return [], title
+
+    @staticmethod
+    def _fetch_tree(video: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """按作品 id 拉 Emos 完整目录树（失败时返回空列表）"""
+        vl_id = video.get("item_id")
+        if not vl_id:
+            return []
+        try:
+            from .online_upload import OnlineUploadService
+
+            client = OnlineUploadService.instance().get_client()
+            tree = client.get_video_tree(video_id=vl_id) or []
+        except Exception as exc:
+            logger.debug("获取 Emos 目录树失败: %s", exc)
+            return []
+        items = [item for item in tree if isinstance(item, dict)]
+        narrowed = [item for item in items if str(item.get("item_id")) == str(vl_id)]
+        return narrowed or items
+
+    def _load_video_seasons(self, video: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """取作品的季列表；搜索结果没带季时拉完整目录树补齐"""
+        seasons = [s for s in (video.get("seasons") or []) if isinstance(s, dict)]
+        if seasons:
+            return seasons
+        for item in self._fetch_tree(video):
+            found = [s for s in (item.get("seasons") or []) if isinstance(s, dict)]
+            if found:
+                return found
+        return []
+
+    def _load_season_episodes(
+        self, video: Dict[str, Any], season: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """取某季的集列表；搜索结果没带集号时拉完整目录树补齐"""
+        season_id = str(season.get("item_id") or "")
+        season_number = season.get("season_number")
+        for item in self._fetch_tree(video):
+            for candidate in item.get("seasons") or []:
+                if not isinstance(candidate, dict):
+                    continue
+                same_id = bool(season_id) and str(candidate.get("item_id")) == season_id
+                same_number = (
+                    season_number is not None
+                    and candidate.get("season_number") is not None
+                    and int(candidate.get("season_number")) == int(season_number)
+                )
+                if same_id or same_number:
+                    return [
+                        episode
+                        for episode in (candidate.get("episodes") or [])
+                        if isinstance(episode, dict)
+                    ]
+        return []
+
+    def _send_search_results(
+        self,
+        chat_id: str,
+        context: Dict[str, Any],
+        candidates: List[Dict[str, Any]],
+        title: str,
+        edit_message_id: Optional[int] = None,
+        reply_to: Optional[int] = None,
+        note: str = "",
+    ) -> None:
+        """列出搜索结果按钮，供用户点选作品"""
+        title = str(title or "").strip()
+        if not candidates:
+            text = (
+                f"🔍 没有搜到与「{title}」相关的条目。\n"
+                "请换几个关键词（例如片名简写 / 原名）后重新回复本条报错消息。"
+            )
+            if edit_message_id:
+                self._send_keyboard(chat_id, text, [], edit_message_id)
+            else:
+                self.send_text(text, reply_to=reply_to, chat_id=chat_id)
+            return
+        rows: List[List[Dict[str, str]]] = []
+        for video in candidates[:8]:
+            if not isinstance(video, dict):
+                continue
+            token = self._flow_token(
+                {
+                    "context": dict(context or {}),
+                    "video": video,
+                    "candidates": candidates,
+                    "title": title or str(video.get("title") or ""),
+                }
+            )
+            rows.append(
+                [
+                    {
+                        "text": _shorten_text(self._work_label(video), 60),
+                        "callback_data": f"fx:work:{token}",
+                    }
+                ]
+            )
+        rows.append([{"text": "✖️ 取消", "callback_data": "fx:cancel"}])
+        text = f"🔍 搜索「{title}」找到 {len(candidates)} 个结果，请点选作品："
+        if note:
+            text = f"{note}\n\n{text}"
+        if edit_message_id:
+            self._send_keyboard(chat_id, text, rows, edit_message_id)
+        else:
+            self._send_keyboard(chat_id, text, rows)
+
+    def _send_work_choices(
+        self, chat_id: str, payload: Dict[str, Any], edit_message_id: Optional[int] = None
+    ) -> None:
+        """点选作品后：电影直接上传，剧集列出可选季"""
+        video = payload.get("video") or {}
+        context = payload.get("context") or {}
+        candidates = payload.get("candidates") or []
+        title = str(payload.get("title") or video.get("title") or "")
+        seasons = self._load_video_seasons(video)
+        if not seasons:
+            item_id = video.get("item_id")
+            if not item_id:
+                self._send_keyboard(chat_id, "该条目没有可上传的季 / 集。", [], edit_message_id)
+                return
+            self._apply_target_selection(
+                chat_id,
+                context,
+                {
+                    "item_type": video.get("item_type") or "vl",
+                    "item_id": str(item_id),
+                    "label": video.get("title") or title,
+                    "season_number": None,
+                    "episode_number": None,
+                },
+                candidates,
+                title,
+                edit_message_id,
+            )
+            return
+        rows: List[List[Dict[str, str]]] = []
+        for season in seasons:
+            number = season.get("season_number")
+            episodes = [e for e in (season.get("episodes") or []) if isinstance(e, dict)]
+            label = f"S{int(number):02d}" if number is not None else "未标注季"
+            if episodes:
+                label += f"（{len(episodes)} 集）"
+            token = self._flow_token(
+                {
+                    "context": context,
+                    "video": video,
+                    "season": season,
+                    "candidates": candidates,
+                    "title": title,
+                }
+            )
+            rows.append([{"text": label, "callback_data": f"fx:season:{token}"}])
+        back_token = self._flow_token(
+            {"context": context, "candidates": candidates, "title": title}
+        )
+        rows.append([{"text": "↩️ 返回搜索结果", "callback_data": f"fx:search:{back_token}"}])
+        self._send_keyboard(
+            chat_id, f"{self._work_label(video)} 请选择要上传的季：", rows, edit_message_id
+        )
+
+    def _send_season_choices(
+        self, chat_id: str, payload: Dict[str, Any], edit_message_id: Optional[int] = None
+    ) -> None:
+        """点选季后：列出该季的集，支持整季上传"""
+        video = payload.get("video") or {}
+        season = payload.get("season") or {}
+        context = payload.get("context") or {}
+        candidates = payload.get("candidates") or []
+        title = str(payload.get("title") or video.get("title") or "")
+        episodes = [e for e in (season.get("episodes") or []) if isinstance(e, dict)]
+        if not episodes:
+            episodes = self._load_season_episodes(video, season)
+        rows: List[List[Dict[str, str]]] = []
+        row: List[Dict[str, str]] = []
+        for episode in episodes:
+            number = episode.get("episode_number")
+            label = f"E{int(number):02d}" if number is not None else "未标注集"
+            episode_title = str(episode.get("episode_title") or "").strip()
+            if episode_title:
+                label += f" {_shorten_text(episode_title, 10)}"
+            token = self._flow_token(
+                {
+                    "context": context,
+                    "video": video,
+                    "season": season,
+                    "episode": episode,
+                    "candidates": candidates,
+                    "title": title,
+                }
+            )
+            row.append({"text": label, "callback_data": f"fx:ep:{token}"})
+            if len(row) >= 4:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        if season.get("item_id"):
+            all_token = self._flow_token(
+                {
+                    "context": context,
+                    "video": video,
+                    "season": season,
+                    "candidates": candidates,
+                    "title": title,
+                }
+            )
+            rows.append([{"text": "📦 上传整季", "callback_data": f"fx:season_all:{all_token}"}])
+        back_token = self._flow_token(
+            {"context": context, "video": video, "candidates": candidates, "title": title}
+        )
+        rows.append([{"text": "↩️ 返回季列表", "callback_data": f"fx:work:{back_token}"}])
+        if not episodes:
+            rows.append([{"text": "（该季没有可上传的集）", "callback_data": "up:noop"}])
+        number = season.get("season_number")
+        head = f"S{int(number):02d}" if number is not None else "该季"
+        self._send_keyboard(chat_id, f"{title} {head} 请选择要上传的集：", rows, edit_message_id)
+
+    def _apply_target_selection(
+        self,
+        chat_id: str,
+        context: Dict[str, Any],
+        selection: Dict[str, Any],
+        candidates: List[Dict[str, Any]],
+        title: str,
+        edit_message_id: Optional[int] = None,
+    ) -> None:
+        """按用户点选的目标创建上传任务，并记住映射"""
+        file_path = str(context.get("file_path") or "")
+        if not file_path:
+            self._send_keyboard(chat_id, "这条报错信息没有关联到文件，无法重传。", [], edit_message_id)
+            return
+        from .online_upload import OnlineUploadService
+
+        service = OnlineUploadService.instance()
+        title = str(title or context.get("title") or "")
+        media_type = str(context.get("media_type") or "").strip().lower()
+        if not media_type:
+            media_type = (
+                "tv"
+                if selection.get("season_number") is not None
+                or selection.get("episode_number") is not None
+                else ""
+            )
+        try:
+            task = service.create_task(
+                {
+                    "file_path": file_path,
+                    "item_type": selection.get("item_type"),
+                    "item_id": selection.get("item_id"),
+                    "storage": context.get("storage"),
+                    "title": title,
+                    "media_type": media_type,
+                    "season_number": selection.get("season_number"),
+                    "episode_number": selection.get("episode_number"),
+                }
+            )
+        except Exception as exc:
+            self._send_keyboard(chat_id, f"创建上传任务失败：{exc}", [], edit_message_id)
+            return
+        if task.get("duplicate"):
+            self._send_keyboard(
+                chat_id,
+                f"未重复提交：{task.get('duplicate_reason')}\n文件：{os.path.basename(file_path)}",
+                [],
+                edit_message_id,
+            )
+            return
+
+        expr = TargetExpression(
+            title=title,
+            season=selection.get("season_number"),
+            episode=selection.get("episode_number"),
+        )
+        match = {
+            "item_type": selection.get("item_type"),
+            "item_id": selection.get("item_id"),
+            "label": selection.get("label"),
+            "season_number": selection.get("season_number"),
+            "episode_number": selection.get("episode_number"),
+        }
+        mapping_info = self._remember_correction_mapping(
+            expr, media_type, match, candidates, context
+        )
+        retried = 0
+        if mapping_info.get("show_level"):
+            retried = self._retry_pending_same_title(title, media_type, exclude_file=file_path)
+        self.clear_error(file_path)
+        with self._lock:
+            for key, item in list(self._replies.items()):
+                if str((item or {}).get("file_path") or "") == file_path:
+                    self._replies.pop(key, None)
+        note = ""
+        try:
+            if service.delete_after_upload_enabled():
+                note = "\n（按配置，上传完成后会删除原文件）"
+        except Exception:
+            note = ""
+        if retried:
+            extra = f"\n已记住映射，同名剧集后续直接上传（本次自动重传 {retried} 个）"
+        elif mapping_info.get("saved"):
+            extra = "\n已记住映射，之后同名文件可直接上传"
+        else:
+            extra = ""
+        text = (
+            "✅ 已按选择的目标提交上传\n"
+            f"文件：{os.path.basename(file_path)}\n"
+            f"目标：{selection.get('label') or title}\n"
+            f"任务：{task.get('id')}{note}{extra}"
+        )
+        if edit_message_id:
+            self._send_keyboard(chat_id, text, [], edit_message_id)
+        else:
+            self.send_text(text, chat_id=chat_id)
+        logger.info("Telegram 手动锁定目标成功: %s -> %s", title, selection.get("label"))
+
+    def _handle_flow_callback(
+        self, chat_id: str, action: str, token: str, message_id: Optional[int]
+    ) -> None:
+        """处理「搜索 → 选作品 → 选季 → 选集」流程里的按钮"""
+        if action == "cancel":
+            self._send_keyboard(chat_id, "已取消。", [], message_id)
+            return
+        payload = self._flow_payload(token)
+        if payload is None:
+            self.send_text("该操作已过期，请重新回复报错信息搜索目标。", chat_id=chat_id)
+            return
+        context = payload.get("context") or {}
+        candidates = payload.get("candidates") or []
+        title = str(payload.get("title") or "")
+        if action == "search":
+            self._send_search_results(chat_id, context, candidates, title, message_id)
+            return
+        if action == "work":
+            self._send_work_choices(chat_id, payload, message_id)
+            return
+        if action == "season":
+            self._send_season_choices(chat_id, payload, message_id)
+            return
+        if action == "ep":
+            season = payload.get("season") or {}
+            episode = payload.get("episode") or {}
+            self._apply_target_selection(
+                chat_id,
+                context,
+                {
+                    "item_type": episode.get("item_type") or "ve",
+                    "item_id": str(episode.get("item_id") or ""),
+                    "label": episode.get("episode_title")
+                    or (payload.get("video") or {}).get("title")
+                    or "",
+                    "season_number": season.get("season_number"),
+                    "episode_number": episode.get("episode_number"),
+                },
+                candidates,
+                title,
+                message_id,
+            )
+            return
+        if action == "season_all":
+            season = payload.get("season") or {}
+            self._apply_target_selection(
+                chat_id,
+                context,
+                {
+                    "item_type": season.get("item_type") or "vs",
+                    "item_id": str(season.get("item_id") or ""),
+                    "label": season.get("season_title")
+                    or (payload.get("video") or {}).get("title")
+                    or "",
+                    "season_number": season.get("season_number"),
+                    "episode_number": None,
+                },
+                candidates,
+                title,
+                message_id,
+            )
+            return
+        self._send_keyboard(chat_id, "未知操作。", [], message_id)
+
     @staticmethod
     def _locate_target(
         service: Any,
@@ -2076,16 +2828,5 @@ class TelegramBotService:
             title = str(video.get("title") or "").strip()
             if not title:
                 continue
-            seasons = video.get("seasons") or []
-            if seasons:
-                names = [
-                    f"S{int(season.get('season_number')):02d}"
-                    for season in seasons
-                    if isinstance(season, dict) and season.get("season_number") is not None
-                ]
-                if names:
-                    lines.append(f"· {title} （{'、'.join(names)}）")
-                    continue
-            date_air = str(video.get("date_air") or "")
-            lines.append(f"· {title}" + (f" （{date_air[:4]}）" if date_air[:4].isdigit() else ""))
+            lines.append(f"· {TelegramBotService._work_label(video)}")
         return "\n".join(lines)

@@ -99,6 +99,51 @@ class TestReplyDelete(_BotHarness):
         self.assertEqual(self.service._active_errors, {})
         self.assertEqual(self.service._error_notified_at, {})
 
+    def test_delete_directory_clears_child_error_reminders(self):
+        """删除目录时要清掉目录下子文件遗留的报错提醒"""
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = Path(tmp) / "sub"
+            sub.mkdir()
+            child = sub / "a.mkv"
+            child.write_bytes(b"x")
+            other = Path(tmp) / "other.mkv"
+            self.service._active_errors[f"{child}|未识别到条目"] = {
+                "context": {"file_path": str(child)},
+                "header": "未识别到条目",
+                "last_sent": 0.0,
+            }
+            self.service._active_errors[f"{other}|上传失败"] = {
+                "context": {"file_path": str(other)},
+                "header": "上传失败",
+                "last_sent": 0.0,
+            }
+            _FakeUploadService._current = _FakeUploadService(roots=[tmp])
+            with patch(
+                "src.video_organizer.core.online_upload.OnlineUploadService",
+                _FakeUploadService,
+            ):
+                self.service._delete_path(str(sub), "1", None)
+
+            self.assertFalse(sub.exists())
+            self.assertNotIn(f"{child}|未识别到条目", self.service._active_errors)
+            # 目录外的报错不受影响
+            self.assertIn(f"{other}|上传失败", self.service._active_errors)
+            self.assertIn("已删除目录", self.keyboards[-1][0])
+
+    def test_clear_error_matches_normalized_path(self):
+        """调用方传来带 .. 的等价路径时也要能清掉提醒"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.mkv"
+            path.write_bytes(b"x")
+            key = f"{path}|上传失败"
+            self.service._active_errors[key] = {
+                "context": {"file_path": str(path)},
+                "header": "上传失败",
+            }
+            weird = os.path.join(tmp, "sub", "..", "a.mkv")
+            self.service.clear_error(weird)
+            self.assertNotIn(key, self.service._active_errors)
+
 
 class TestBrowseFullName(_BotHarness):
     def test_browse_lists_full_file_name_in_message(self):

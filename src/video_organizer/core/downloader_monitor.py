@@ -226,6 +226,50 @@ class DownloaderMonitor(ABC):
         """
         return set()
 
+    def delete_download(self, file_path: str, delete_files: bool = True) -> bool:
+        """删除该文件对应的下载任务（用户主动删除时使用）
+
+        与 remove_download 的区别：不再检查「同一种子内其它视频是否已
+        处理完毕」，只要匹配到任务就删除，避免用户手动删除后下载器里仍残留任务。
+        默认基类不支持，返回 False。
+        """
+        return False
+
+
+def remove_downloader_tasks(
+    file_path: str,
+    delete_files: bool = True,
+    monitors: Optional[List[Any]] = None,
+) -> List[str]:
+    """把文件对应的下载任务从所有下载器中删除
+
+    供 Telegram「删除任务」等用户主动删除场景使用：只要匹配到任务就删除，
+    不再等待同一种子里其它视频处理完毕。返回成功清理任务的下载器名称列表；
+    下载器不可用 / 未配置时安全跳过。
+    """
+    if not file_path:
+        return []
+    if monitors is None:
+        try:
+            from ..web.services.state import get_state_manager
+
+            monitors = get_state_manager().get_downloader_monitors()
+        except Exception as exc:
+            logger.debug("获取下载器监控失败，跳过下载器任务清理: %s", exc)
+            return []
+    removed: List[str] = []
+    for monitor in monitors or []:
+        deleter = getattr(monitor, "delete_download", None)
+        if not callable(deleter):
+            continue
+        try:
+            if deleter(file_path, delete_files=delete_files):
+                name = getattr(monitor, "name", None) or getattr(monitor, "id", None)
+                removed.append(str(name or "downloader"))
+        except Exception as exc:
+            logger.debug("清理下载器任务失败 (%s): %s", getattr(monitor, "id", ""), exc)
+    return removed
+
 
 class Aria2Monitor(DownloaderMonitor):
     """
@@ -414,6 +458,110 @@ class Aria2Monitor(DownloaderMonitor):
 
         except Exception as e:
             logger.error(f"从 aria2 删除下载任务时出错: {e}")
+            return False
+
+    def _get_all_downloads(self) -> List[Dict[str, Any]]:
+        """获取 aria2 中全部下载记录（含正在下载 / 等待 / 已停止）"""
+        headers = {"Content-Type": "application/json"}
+        base_params = [f"token:{self.secret}"] if self.secret else []
+        keys = ["gid", "status", "files"]
+        requests_spec = [
+            ("aria2.tellActive", [keys]),
+            ("aria2.tellWaiting", [0, 2000, keys]),
+            ("aria2.tellStopped", [0, 2000, keys]),
+        ]
+        downloads: List[Dict[str, Any]] = []
+        seen = set()
+        for method, extra in requests_spec:
+            try:
+                payload = {
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "id": "1",
+                    "params": base_params + extra,
+                }
+                response = requests.post(self.rpc_url, headers=headers, json=payload, timeout=30)
+                response.raise_for_status()
+                result = response.json().get("result") or []
+            except Exception as exc:
+                logger.debug("获取 aria2 下载列表失败 (%s): %s", method, exc)
+                continue
+            for item in result:
+                if not isinstance(item, dict):
+                    continue
+                gid = item.get("gid")
+                if gid and gid in seen:
+                    continue
+                if gid:
+                    seen.add(gid)
+                downloads.append(item)
+        return downloads
+
+    def delete_download(self, file_path: str, delete_files: bool = True) -> bool:
+        """删除 aria2 中与该文件关联的下载任务（无条件，用户主动删除时使用）"""
+        try:
+            decoded_input_path = decode_file_path(file_path)
+            norm_input_path = os.path.normpath(decoded_input_path).lower()
+            input_filename = os.path.basename(norm_input_path)
+            headers = {"Content-Type": "application/json"}
+            for download in self._get_all_downloads():
+                matched_path = ""
+                for file_info in download.get("files") or []:
+                    if not isinstance(file_info, dict):
+                        continue
+                    aria2_path = file_info.get("path")
+                    if not aria2_path:
+                        continue
+                    decoded_aria2_path = decode_file_path(aria2_path)
+                    mapped_aria2_path = self._apply_path_mapping(decoded_aria2_path)
+                    norm_aria2_path = os.path.normpath(mapped_aria2_path).lower()
+                    if (
+                        norm_aria2_path == norm_input_path
+                        or input_filename == os.path.basename(norm_aria2_path)
+                    ):
+                        matched_path = decoded_aria2_path
+                        break
+                if not matched_path:
+                    continue
+                gid = download.get("gid")
+                status = str(download.get("status") or "")
+                if status in ("active", "waiting", "paused"):
+                    methods = ["aria2.forceRemove", "aria2.removeDownloadResult"]
+                else:
+                    methods = ["aria2.removeDownloadResult"]
+                removed = False
+                for method in methods:
+                    params = [f"token:{self.secret}"] if self.secret else []
+                    payload = {
+                        "jsonrpc": "2.0",
+                        "method": method,
+                        "id": "delete",
+                        "params": params + [gid],
+                    }
+                    try:
+                        response = requests.post(
+                            self.rpc_url, headers=headers, json=payload, timeout=30
+                        )
+                        if response.status_code == 200 and "result" in response.json():
+                            removed = True
+                    except Exception as exc:
+                        logger.debug("aria2 %s 失败: %s", method, exc)
+                if not removed:
+                    logger.warning("从 aria2 删除下载任务失败: %s (%s)", gid, file_path)
+                    return False
+                logger.info("已从 aria2 删除下载任务: %s (%s)", gid, file_path)
+                if delete_files and matched_path:
+                    try:
+                        if os.path.exists(matched_path):
+                            os.remove(matched_path)
+                            logger.info("已删除本地文件: %s", matched_path)
+                    except Exception as del_e:
+                        logger.warning("删除本地文件失败: %s", del_e)
+                return True
+            logger.debug("在 aria2 中未找到文件的下载任务: %s", file_path)
+            return False
+        except Exception as exc:
+            logger.error("从 aria2 删除下载任务时出错: %s", exc)
             return False
 
     def start(self):
@@ -1193,6 +1341,58 @@ class QBittorrentMonitor(DownloaderMonitor):
 
         except Exception as e:
             logger.error(f"强制从 qBittorrent 删除任务时发生错误: {e}")
+            return False
+
+    def delete_download(self, file_path: str, delete_files: bool = True) -> bool:
+        """删除 qBittorrent 中与该文件关联的种子任务（无条件，用户主动删除时使用）"""
+        try:
+            url = f"{self.rpc_url}/torrents/info"
+            response = self.session.get(url, timeout=30)
+            if response.status_code != 200:
+                logger.error(f"获取种子列表失败: {response.status_code}")
+                return False
+
+            norm_input_path = os.path.normpath(file_path).lower()
+            target_torrent = None
+            for torrent in response.json():
+                save_path = torrent.get("save_path", "")
+                for f in self._get_torrent_files(torrent["hash"]):
+                    f_name = f["name"]
+                    full_torrent_file_path = os.path.normpath(
+                        os.path.join(save_path, f_name)
+                    ).lower()
+                    if (
+                        full_torrent_file_path == norm_input_path
+                        or norm_input_path.endswith(os.path.normpath(f_name).lower())
+                    ):
+                        target_torrent = torrent
+                        break
+                if target_torrent:
+                    break
+
+            if not target_torrent:
+                logger.debug(f"在 qBittorrent 中未找到对应文件的任务: {file_path}")
+                return False
+
+            torrent_hash = target_torrent["hash"]
+            delete_url = f"{self.rpc_url}/torrents/delete"
+            data = {
+                "hashes": torrent_hash,
+                "deleteFiles": "true" if delete_files else "false",
+            }
+            response = self.session.post(delete_url, data=data, timeout=30)
+            if response.status_code == 200:
+                logger.info(
+                    f"已删除 qBittorrent 任务: {target_torrent.get('name')} ({torrent_hash})"
+                )
+                return True
+            logger.warning(
+                f"从 qBittorrent 删除任务失败: {torrent_hash}, 状态码: {response.status_code}"
+            )
+            return False
+
+        except Exception as e:
+            logger.error(f"从 qBittorrent 删除任务时发生错误: {e}")
             return False
 
     def pause_torrent_for_file(self, file_path: str) -> bool:
