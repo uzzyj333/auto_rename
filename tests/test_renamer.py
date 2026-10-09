@@ -154,5 +154,52 @@ class TestVideoRenamer(unittest.TestCase):
         )
 
 
+class TestTmdbNameCacheYearIsolation(unittest.TestCase):
+    """同名不同版本（如 1996 / 2001 版《笑傲江湖》）不应命中同一个 TMDB 缓存"""
+
+    def setUp(self):
+        self.renamer = VideoRenamer(tmdb_api_key="test_api_key_12345")
+
+    def _remember(self, year, tmdb_id):
+        self.renamer._save_to_tmdb_cache(
+            {
+                "show_name": "笑傲江湖",
+                "title": "笑傲江湖",
+                "year": year,
+                "tmdb_id": tmdb_id,
+                "media_type": "tv",
+            }
+        )
+
+    def test_same_name_different_year_is_not_reused(self):
+        """先识别 1996 版，再识别 2001 版时不能复用 1996 版的 TMDB ID"""
+        self._remember("1996", 11111)
+
+        # 同年份命中
+        self.assertEqual(
+            self.renamer._lookup_tmdb_id_by_name("笑傲江湖", "1996"), 11111
+        )
+        # 年份不同不能复用，否则 2001 版会被识别成 1996 版
+        self.assertIsNone(self.renamer._lookup_tmdb_id_by_name("笑傲江湖", "2001"))
+        # 文件名没有年份时也不能借用带年份的缓存
+        self.assertIsNone(self.renamer._lookup_tmdb_id_by_name("笑傲江湖", ""))
+
+    def test_yearless_cache_still_reused(self):
+        """文件名不带年份时仍可复用（保持原来的缓存加速效果）"""
+        self._remember("", 22222)
+        self.assertEqual(self.renamer._lookup_tmdb_id_by_name("笑傲江湖", ""), 22222)
+
+    def test_different_years_cached_side_by_side(self):
+        """不同年份各自缓存，互不覆盖"""
+        self._remember("1996", 11111)
+        self._remember("2001", 33333)
+        self.assertEqual(
+            self.renamer._lookup_tmdb_id_by_name("笑傲江湖", "1996"), 11111
+        )
+        self.assertEqual(
+            self.renamer._lookup_tmdb_id_by_name("笑傲江湖", "2001"), 33333
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

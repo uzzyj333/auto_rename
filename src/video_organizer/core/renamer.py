@@ -822,7 +822,9 @@ class VideoRenamer:
         # 缓存键: show_name (或 tmdb_id)，值: 完整的元数据
         self._tmdb_cache: Dict[str, Dict] = {}
         # 缓存键到 tmdb_id 的映射（用于同一剧集不同集数的快速查找）
-        self._tmdb_name_to_id: Dict[str, int] = {}
+        # 值为 {年份: tmdb_id}，按年份区分同名作品，
+        # 避免 1996 版 / 2001 版《笑傲江湖》这类同名剧互相串台
+        self._tmdb_name_to_id: Dict[str, Dict[str, Union[int, str]]] = {}
         # TMDB 搜索结果缓存：避免重复搜索
         self._search_cache: Dict[str, List] = {}
         logger.info("VideoRenamer: TMDB 缓存已初始化")
@@ -2750,6 +2752,24 @@ class VideoRenamer:
 
         return results
 
+    def _lookup_tmdb_id_by_name(
+        self, show_name: str, year
+    ) -> Optional[Union[int, str]]:
+        """按「剧名 + 年份」查名称缓存，避免同名不同版本互相串台
+
+        只有年份一致（或双方都没有年份）时才复用缓存里的 TMDB ID；
+        年份对不上（如缓存是 1996 版《笑傲江湖》，当前文件是 2001 版）
+        就返回 None，让调用方走正常的 TMDB 搜索流程。
+        """
+        name_key = str(show_name or "").lower().strip()
+        if not name_key:
+            return None
+        entries = self._tmdb_name_to_id.get(name_key) or {}
+        year_key = str(year or "").strip()
+        if year_key:
+            return entries.get(year_key)
+        return entries.get("")
+
     def _save_to_tmdb_cache(self, metadata: Dict) -> None:
         """
         将元数据保存到 TMDB 缓存，供同一剧集的其他集数使用
@@ -2765,11 +2785,17 @@ class VideoRenamer:
         if not show_name or not tmdb_id:
             return
         
-        # 保存 name -> tmdb_id 映射
+        # 保存 name -> tmdb_id 映射（按年份区分，避免同名不同版本串台）
         name_key = show_name.lower().strip()
-        if name_key and name_key not in self._tmdb_name_to_id:
-            self._tmdb_name_to_id[name_key] = tmdb_id
-            logger.debug(f"TMDB 缓存: 保存名称映射 {show_name} -> TMDB ID {tmdb_id}")
+        year_key = str(year or "").strip()
+        if name_key:
+            entries = self._tmdb_name_to_id.setdefault(name_key, {})
+            if entries.get(year_key) != tmdb_id:
+                entries[year_key] = tmdb_id
+                logger.debug(
+                    f"TMDB 缓存: 保存名称映射 {show_name}"
+                    f"（{year_key or '无年份'}）-> TMDB ID {tmdb_id}"
+                )
         
         # 保存完整元数据缓存
         cache_key = f"tmdb_{tmdb_id}"
@@ -2942,9 +2968,13 @@ class VideoRenamer:
                     return metadata
             
             # 检查是否已有 name -> tmdb_id 的映射（用于同一剧集不同集数）
-            if show_name and show_name.lower().strip() in self._tmdb_name_to_id:
-                cached_tmdb_id = self._tmdb_name_to_id[show_name.lower().strip()]
-                logger.info(f"TMDB 名称缓存命中: {show_name} -> TMDB ID {cached_tmdb_id}")
+            # 年份不一致时不能复用，否则同名不同版本会被识别成同一部剧
+            cached_tmdb_id = self._lookup_tmdb_id_by_name(show_name, year)
+            if cached_tmdb_id:
+                logger.info(
+                    f"TMDB 名称缓存命中: {show_name}"
+                    f"（{str(year or '').strip() or '无年份'}）-> TMDB ID {cached_tmdb_id}"
+                )
                 # 使用缓存的 tmdb_id 直接获取详情
                 metadata["tmdb_id"] = cached_tmdb_id
                 existing_tmdb_id = cached_tmdb_id
@@ -3815,6 +3845,17 @@ class VideoRenamer:
                     score = 500
 
                 total_score = score + result.get("popularity", 0)
+                # 年份加权：同名不同版本（如 1996 / 2001 版《笑傲江湖》）时，
+                # 优先选择年份与文件名一致的结果，避免被高热度版本带偏
+                if search_year:
+                    result_date = str(
+                        result.get("first_air_date") or result.get("release_date") or ""
+                    )
+                    result_year = result_date.split("-")[0] if result_date else ""
+                    if result_year == str(search_year):
+                        total_score += 5000
+                    elif result_year:
+                        total_score -= 5000
                 return total_score
 
             # 按得分排序
