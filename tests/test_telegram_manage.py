@@ -160,6 +160,8 @@ class TestBrowseFullName(_BotHarness):
 
         self.assertEqual(len(self.keyboards), 1)
         text, rows = self.keyboards[0]
+        # 导航行 + 文件行都是 3 个键（一行放完）
+        self.assertEqual([len(row) for row in rows], [3, 3])
         self.assertIn("本页完整名称：", text)
         self.assertIn(long_name, text)  # 正文里能看到完整文件名
         self.assertIn(f"1. 🎬 {long_name}", text)  # 正文序号与上传按钮一致

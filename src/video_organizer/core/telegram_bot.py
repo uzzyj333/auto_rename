@@ -1158,16 +1158,12 @@ class TelegramBotService:
             target = entry["path"]
             token = self._token_for_path(str(target))
             if entry["kind"] == "dir":
-                name = _shorten_text(target.name, 96)
+                name = _shorten_text(target.name, 26)
                 rows.append(
                     [
                         {"text": f"📂 {name}", "callback_data": f"up:ls:{token}:0"},
-                    ]
-                )
-                rows.append(
-                    [
                         {
-                            "text": f"📤 {number} 上传全部",
+                            "text": f"📤 {number} 上传",
                             "callback_data": f"up:dir:{token}",
                         },
                         {"text": "🗑️ 删除", "callback_data": f"up:del:{token}"},
@@ -1176,13 +1172,14 @@ class TelegramBotService:
             else:
                 size_text = _format_size(entry.get("size"))
                 suffix = f"（{size_text}）" if size_text else ""
-                # 名称独占整行，按钮里的长文件名交给 Telegram 自动换行，只做兜底截断
-                name = _shorten_text(target.name, max(8, 96 - len(suffix)))
-                rows.append(
-                    [{"text": f"🎬 {name}{suffix}", "callback_data": "up:noop"}]
-                )
+                # 名称按钮只放短名，完整名称在正文里按序号列出
+                name = _shorten_text(target.name, max(8, 26 - len(suffix)))
                 rows.append(
                     [
+                        {
+                            "text": f"🎬 {name}{suffix}",
+                            "callback_data": f"up:file:{token}",
+                        },
                         {
                             "text": f"📤 {number} 上传",
                             "callback_data": f"up:file:{token}",

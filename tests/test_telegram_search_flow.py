@@ -6,8 +6,8 @@
    用户再点选作品 → 季 → 集，避免「狂王 S02E04」定位不到时的死胡同；
 2. 回复「删除」时，除了删除上传任务与提醒，还要连带删除
    aria2 / qBittorrent 里的对应下载任务；
-3. 文件浏览每条目两行：名称独占一行、下一行「📤 N 上传 / 🗑️ 删除」，
-   正文再列出本页完整名称。
+3. 文件浏览每条目一行三个按钮（短名称 / 📤 N 上传 / 🗑️ 删除），
+   完整名称在本页正文里按同样的序号列出。
 """
 
 import os
@@ -600,8 +600,8 @@ class TestDownloaderCleanup(unittest.TestCase):
 
 
 class TestBrowseGrid(_BotHarness):
-    def test_browse_entry_uses_name_row_then_action_row(self):
-        """每个条目两行：名称独享整行，下一行才是「上传 / 删除」"""
+    def test_browse_entry_is_one_row_of_three_buttons(self):
+        """每个条目一行三个按钮：短名称 / 📤 N 上传 / 🗑️ 删除，完整名称在正文"""
         with tempfile.TemporaryDirectory() as tmp:
             long_name = "魅影神捕.Shadow.Punished.2024.2160p.WEB-DL.HEVC.DDP5.1.mkv"
             (Path(tmp) / long_name).write_bytes(b"x")
@@ -617,29 +617,23 @@ class TestBrowseGrid(_BotHarness):
                 self.service._send_browse("1", tmp)
 
         text, rows = self.keyboards[-1]
-        # 正文序号与「📤 N 上传」按钮一一对应
-        self.assertIn("1. 📁 sub", text)
-        # 导航行仍是「上一级 / 根目录 / 上传全部」三个键
+        # 导航行与每个条目行都是 3 个键（一行放完）
         self.assertEqual(len(rows[0]), 3)
-        entry_rows = rows[1:]
-        self.assertEqual(len(entry_rows), 4)  # 1 个目录 + 1 个文件，各 2 行
-        name_labels = []
-        action_labels = []
-        for index in range(0, len(entry_rows), 2):
-            name_row, action_row = entry_rows[index], entry_rows[index + 1]
-            self.assertEqual(len(name_row), 1, f"名称应独享一行：{name_row}")
-            self.assertEqual(len(action_row), 2, f"操作行应有两个键：{action_row}")
-            self.assertTrue(action_row[1]["text"].startswith("🗑️"))
-            name_labels.append(name_row[0]["text"])
-            action_labels.append(action_row[0]["text"])
-        # 名称独占整行后可以显示得更长（以前压到 26 字以内）
-        self.assertTrue(any(len(label) > 26 for label in name_labels), name_labels)
-        # 序号只挂在上传按钮上，名称按钮不带序号
-        self.assertEqual(action_labels, ["📤 1 上传全部", "📤 2 上传"])
-        self.assertEqual(name_labels[0], "📂 sub")
-        flat = [button["text"] for row in rows for button in row]
-        self.assertTrue(any("上传全部" in label for label in flat))
-        self.assertTrue(any("🗑️ 删除" in label for label in flat))
+        self.assertEqual([len(row) for row in rows[1:]], [3, 3])
+        dir_row, file_row = rows[1], rows[2]
+        self.assertEqual(dir_row[0]["text"], "📂 sub")
+        self.assertEqual(dir_row[1]["text"], "📤 1 上传")
+        self.assertEqual(dir_row[2]["text"], "🗑️ 删除")
+        self.assertTrue(dir_row[0]["callback_data"].startswith("up:ls:"))
+        self.assertTrue(dir_row[1]["callback_data"].startswith("up:dir:"))
+        self.assertTrue(dir_row[2]["callback_data"].startswith("up:del:"))
+        self.assertTrue(file_row[0]["text"].startswith("🎬 魅影神捕"))
+        self.assertEqual(file_row[1]["text"], "📤 2 上传")
+        self.assertTrue(file_row[1]["callback_data"].startswith("up:file:"))
+        self.assertTrue(file_row[2]["callback_data"].startswith("up:del:"))
+        # 正文列出完整名称，序号与「📤 N 上传」按钮一致
+        self.assertIn("1. 📁 sub", text)
+        self.assertIn(f"2. 🎬 {long_name}", text)
 
 
 class _FakeEmosApiClient:
