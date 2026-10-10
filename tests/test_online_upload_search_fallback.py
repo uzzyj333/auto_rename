@@ -398,5 +398,124 @@ class TestEpisodeEndpointFallback(unittest.TestCase):
         )
 
 
+class _EndpointTreeClient:
+    """目录树里没有嵌套季 / 集，只有季 / 集接口能查到（模拟 Emos 手动新增的集）"""
+
+    def __init__(self):
+        self.season_calls = []
+        self.episode_calls = []
+
+    def get_video_tree(self, video_type=None, title=None, todb_id=None):
+        return [
+            {
+                "title": "狂王",
+                "video_type": "tv",
+                "item_type": "vl",
+                "item_id": "1001",
+                "seasons": [],
+            }
+        ]
+
+    def get_seasons(self, video_id):
+        self.season_calls.append(video_id)
+        return [
+            {
+                "season_number": 1,
+                "season_title": "第 1 季",
+                "item_type": "vs",
+                "item_id": "2001",
+            }
+        ]
+
+    def get_episodes(self, video_id, season_number=None):
+        self.episode_calls.append((video_id, season_number))
+        return [
+            {
+                "episode_number": 5,
+                "episode_title": "第五集",
+                "item_type": "ve",
+                "item_id": "ve15",
+            }
+        ]
+
+
+class TestSearchTargetsSeasonFallback(unittest.TestCase):
+    """搜索结果也用季 / 集接口补齐，网页端才能选到具体某一集（ve）"""
+
+    def setUp(self):
+        self.service = OnlineUploadService()
+        self.service.configure({"emos": {"auth_token": "t", "base_url": "https://emos.best"}})
+
+    def test_fills_seasons_from_endpoints(self):
+        client = _EndpointTreeClient()
+        with patch.object(OnlineUploadService, "get_client", lambda self: client):
+            results = self.service.search_targets(title="狂王")
+
+        self.assertEqual(len(results), 1)
+        seasons = results[0]["seasons"]
+        self.assertEqual([season["season_number"] for season in seasons], [1])
+        self.assertEqual(seasons[0]["episodes"][0]["item_id"], "ve15")
+        self.assertEqual(client.season_calls, ["1001"])
+        self.assertEqual(client.episode_calls, [("1001", 1)])
+
+    def test_keeps_tree_seasons_without_extra_calls(self):
+        client = _FakeClient(tree_without_type=[_tv("202974", "死有对证", "ve-19")])
+        with patch.object(OnlineUploadService, "get_client", lambda self: client):
+            results = self.service.search_targets(title="死有对证")
+
+        self.assertEqual(results[0]["seasons"][0]["episodes"][0]["item_id"], "ve-19")
+
+    def test_skips_movie_items(self):
+        calls = []
+
+        class _MovieClient:
+            def get_video_tree(self, video_type=None, title=None, todb_id=None):
+                return [
+                    {
+                        "title": "测试电影",
+                        "video_type": "movie",
+                        "item_type": "vl",
+                        "item_id": "9001",
+                        "seasons": [],
+                    }
+                ]
+
+            def get_seasons(self, video_id):
+                calls.append(video_id)
+                return []
+
+        with patch.object(
+            OnlineUploadService, "get_client", lambda self: _MovieClient()
+        ):
+            results = self.service.search_targets(title="测试电影")
+
+        self.assertEqual(results[0]["seasons"], [])
+        self.assertEqual(calls, [])
+
+    def test_endpoint_errors_do_not_break_search(self):
+        class _BrokenClient:
+            def get_video_tree(self, video_type=None, title=None, todb_id=None):
+                return [
+                    {
+                        "title": "狂王",
+                        "video_type": "tv",
+                        "item_type": "vl",
+                        "item_id": "1001",
+                        "seasons": [],
+                    }
+                ]
+
+            def get_seasons(self, video_id):
+                raise RuntimeError("Emos 接口返回 HTTP 500")
+
+        with patch.object(
+            OnlineUploadService, "get_client", lambda self: _BrokenClient()
+        ):
+            results = self.service.search_targets(title="狂王")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["seasons"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

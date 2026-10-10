@@ -2703,7 +2703,8 @@ function renderTargetMappings() {
     let html = '<div class="config-section"><div class="config-section-title">目标映射表</div>';
     html += '<div class="config-hint" style="margin-bottom:12px;font-size:0.8125rem;color:var(--text-muted)">' +
         '命中映射的文件会直接上传到记录的目标，跳过 TMDB / Emos 搜索。在 Telegram 手动回复修正过的目标会自动记入此表。' +
-        '「文字映射」按关键词匹配标题或文件名；「剧集集数映射」需同时匹配剧名与季/集号。</div>';
+        '「文字映射」按关键词匹配标题或文件名；「剧集集数映射」需同时匹配剧名与季/集号。' +
+        '点「搜索目标」后，电视剧会展开季/集，直接选具体某一集即可。</div>';
     if (!mappings.length) {
         html += '<div class="config-empty"><span class="empty-icon">⌀</span><span>暂无映射</span></div>';
     } else {
@@ -2751,7 +2752,9 @@ async function searchTmTarget() {
             return;
         }
         window._tmSearchResults = results;
-        let html = '<div class="table-container" style="max-height:240px;overflow:auto"><table>' +
+        // 电视剧把季/集也列出来，才能直接选到具体某一集（ve）建「剧集集数映射」
+        const episodes = [];
+        let html = '<div class="table-container" style="max-height:320px;overflow:auto"><table>' +
             '<thead><tr><th>标题</th><th style="width:70px">年份</th><th style="width:90px">类型</th><th style="width:150px">item_id</th><th style="width:110px">操作</th></tr></thead><tbody>';
         results.forEach((item, i) => {
             html += '<tr><td>' + escapeOnline(item.title || '') + '</td>' +
@@ -2759,6 +2762,27 @@ async function searchTmTarget() {
                 '<td>' + escapeOnline(item.video_type || '') + '</td>' +
                 '<td>' + escapeOnline(item.item_type + '/' + item.item_id) + '</td>' +
                 '<td><button class="btn btn-secondary btn-sm" data-tm-pick="' + i + '">选为目标</button></td></tr>';
+            (item.seasons || []).forEach(season => {
+                if (!(season.episodes || []).length) return;
+                html += '<tr><td colspan="5" style="padding-left:18px;font-size:0.75rem;color:var(--text-muted)">' +
+                    escapeOnline('第 ' + (season.season_number == null ? '?' : season.season_number) + ' 季') + '</td></tr>';
+                (season.episodes || []).forEach(ep => {
+                    const idx = episodes.length;
+                    const label = 'S' + (season.season_number == null ? '?' : season.season_number) + 'E' + ep.episode_number;
+                    episodes.push({
+                        item_type: ep.item_type || 've',
+                        item_id: String(ep.item_id || ''),
+                        label: label + ' ' + (ep.episode_title || item.title || ''),
+                        season_number: season.season_number,
+                        episode_number: ep.episode_number,
+                    });
+                    html += '<tr><td style="padding-left:34px">└ ' + escapeOnline(label + ' ' + (ep.episode_title || '')) + '</td>' +
+                        '<td>' + escapeOnline(String(ep.date_air || '').slice(0, 4) || '-') + '</td>' +
+                        '<td>' + escapeOnline(ep.item_type || 've') + '</td>' +
+                        '<td>' + escapeOnline((ep.item_type || 've') + '/' + ep.item_id) + '</td>' +
+                        '<td><button class="btn btn-secondary btn-sm" data-tm-pick-ep="' + idx + '">选为目标</button></td></tr>';
+                });
+            });
         });
         html += '</tbody></table></div>';
         if (box) {
@@ -2766,7 +2790,11 @@ async function searchTmTarget() {
             box.querySelectorAll('[data-tm-pick]').forEach(node => node.addEventListener('click', () => {
                 pickTmTarget(parseInt(node.getAttribute('data-tm-pick'), 10));
             }));
+            box.querySelectorAll('[data-tm-pick-ep]').forEach(node => node.addEventListener('click', () => {
+                pickTmEpisodeTarget(parseInt(node.getAttribute('data-tm-pick-ep'), 10));
+            }));
         }
+        window._tmSearchEpisodes = episodes;
     } catch (e) {
         if (box) box.innerHTML = '<div style="color:#e5534b">搜索失败: ' + escapeOnline(e.message) + '</div>';
     }
@@ -2780,6 +2808,22 @@ function pickTmTarget(index) {
     const input = document.getElementById('newTmItem');
     if (input) input.value = _tmSelectedTarget.item_type + '/' + _tmSelectedTarget.item_id + ' ' + _tmSelectedTarget.label;
     showToast('已选择目标：' + _tmSelectedTarget.label, 'success');
+}
+
+function pickTmEpisodeTarget(index) {
+    const item = (window._tmSearchEpisodes || [])[index];
+    if (!item) return;
+    _tmSelectedTarget = { item_type: item.item_type || 've', item_id: String(item.item_id), label: item.label };
+    const input = document.getElementById('newTmItem');
+    if (input) input.value = _tmSelectedTarget.item_type + '/' + _tmSelectedTarget.item_id + ' ' + item.label;
+    // 选中具体某一集时自动切到「剧集集数映射」并填好季 / 集
+    const typeSelect = document.getElementById('newTmType');
+    if (typeSelect) typeSelect.value = 'episode';
+    const seasonInput = document.getElementById('newTmSeason');
+    const episodeInput = document.getElementById('newTmEpisode');
+    if (seasonInput && item.season_number != null) seasonInput.value = item.season_number;
+    if (episodeInput && item.episode_number != null) episodeInput.value = item.episode_number;
+    showToast('已选择剧集目标：' + item.label, 'success');
 }
 
 function parseTmItemInput() {

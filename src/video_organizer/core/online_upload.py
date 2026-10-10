@@ -1043,12 +1043,13 @@ class OnlineUploadService:
         """在线搜索 Emos 视频目录树（识别候选）"""
         if not (title or todb_id):
             return []
-        tree = self.get_client().get_video_tree(video_type=video_type, title=title, todb_id=todb_id)
+        client = self.get_client()
+        tree = client.get_video_tree(video_type=video_type, title=title, todb_id=todb_id)
         if not tree and video_type:
             # Emos 的 type 过滤值不稳定（带 type=tv 时可能什么都搜不到），
             # 去掉类型再搜一次兜底，否则 TG 回复修正会误报「未在 Emos 中找到匹配条目」
             logger.debug("带 video_type=%s 搜索无结果，去掉类型重试: %s", video_type, title)
-            tree = self.get_client().get_video_tree(title=title, todb_id=todb_id)
+            tree = client.get_video_tree(title=title, todb_id=todb_id)
         results: List[Dict[str, Any]] = []
         for item in tree:
             if not isinstance(item, dict):
@@ -1064,32 +1065,91 @@ class OnlineUploadService:
                     "date_air": item.get("date_air") or "",
                     "has_media": bool(item.get("has_media")),
                     "kind": "video",
-                    "seasons": [
+                    "seasons": self._shape_seasons(item.get("seasons")),
+                }
+            )
+        self._fill_missing_seasons(client, results)
+        return results
+
+    @staticmethod
+    def _shape_seasons(raw_seasons: Any) -> List[Dict[str, Any]]:
+        """把 Emos 目录树里的季 / 集整理成前端使用的结构"""
+        shaped: List[Dict[str, Any]] = []
+        for season in raw_seasons or []:
+            if not isinstance(season, dict):
+                continue
+            shaped.append(
+                {
+                    "season_number": season.get("season_number"),
+                    "season_title": season.get("season_title") or "",
+                    "date_air": _pick_date(season),
+                    "item_type": season.get("item_type") or "vs",
+                    "item_id": str(season.get("item_id") or ""),
+                    "episodes": [
                         {
-                            "season_number": season.get("season_number"),
-                            "season_title": season.get("season_title") or "",
-                            "date_air": _pick_date(season),
-                            "item_type": season.get("item_type") or "vs",
-                            "item_id": str(season.get("item_id") or ""),
-                            "episodes": [
-                                {
-                                    "episode_number": episode.get("episode_number"),
-                                    "episode_title": episode.get("episode_title") or "",
-                                    "date_air": _pick_date(episode),
-                                    "item_type": episode.get("item_type") or "ve",
-                                    "item_id": str(episode.get("item_id") or ""),
-                                    "has_media": bool(episode.get("has_media")),
-                                }
-                                for episode in (season.get("episodes") or [])
-                                if isinstance(episode, dict)
-                            ],
+                            "episode_number": episode.get("episode_number"),
+                            "episode_title": episode.get("episode_title") or "",
+                            "date_air": _pick_date(episode),
+                            "item_type": episode.get("item_type") or "ve",
+                            "item_id": str(episode.get("item_id") or ""),
+                            "has_media": bool(episode.get("has_media")),
                         }
-                        for season in (item.get("seasons") or [])
-                        if isinstance(season, dict)
+                        for episode in (season.get("episodes") or [])
+                        if isinstance(episode, dict)
                     ],
                 }
             )
-        return results
+        return shaped
+
+    @staticmethod
+    def _fill_missing_seasons(
+        client: EmosClient,
+        results: List[Dict[str, Any]],
+        limit: int = 3,
+    ) -> None:
+        """目录树没带季 / 集时，用 Emos 季 / 集接口补齐
+
+        手动新增的季 / 集有时不会出现在 ``/api/video/tree`` 的嵌套结构里，
+        补齐后网页端搜索才能选到具体某一集（ve）来建「剧集集数映射」。
+        只补前 ``limit`` 个候选，避免一次搜索打太多接口。
+        """
+        budget = limit
+        for item in results:
+            if budget <= 0:
+                break
+            if item.get("seasons"):
+                continue
+            if re.search(r"movie|电影", str(item.get("video_type") or ""), re.I):
+                continue
+            vl_id = item.get("item_id")
+            if not vl_id:
+                continue
+            budget -= 1
+            try:
+                seasons = [
+                    season
+                    for season in (client.get_seasons(vl_id) or [])
+                    if isinstance(season, dict)
+                ]
+            except Exception as exc:
+                logger.debug("补齐季列表失败(vl=%s): %s", vl_id, exc)
+                continue
+            raw: List[Dict[str, Any]] = []
+            for season in seasons:
+                number = _to_int(season.get("season_number"))
+                try:
+                    episodes = [
+                        episode
+                        for episode in (client.get_episodes(vl_id, number) or [])
+                        if isinstance(episode, dict)
+                    ]
+                except Exception as exc:
+                    logger.debug("补齐集列表失败(vl=%s S%s): %s", vl_id, number, exc)
+                    episodes = []
+                raw.append({**season, "episodes": episodes})
+            shaped = OnlineUploadService._shape_seasons(raw)
+            if shaped:
+                item["seasons"] = shaped
 
     def video_base(self, item_type: str, item_id: Any) -> Dict[str, Any]:
         """获取上传目标详情"""
