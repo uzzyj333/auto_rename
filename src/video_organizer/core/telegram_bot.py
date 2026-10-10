@@ -28,6 +28,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -44,8 +45,9 @@ _SEND_TIMEOUT = 15
 _ERROR_NOTIFY_INTERVAL = 300  # 同一文件的同类报错 5 分钟只推一次
 _REMINDER_INTERVAL = 30       # 报错提醒检查间隔（秒）
 _MAX_BROWSE_TOKENS = 500      # 最多记住多少个「浏览/上传」路径令牌
-_BROWSE_PAGE_SIZE = 20        # 目录浏览每页最多显示的条目数
-_BROWSE_TEXT_BUDGET = 2600    # 目录浏览正文最多字符数（超出就提前分页，避免被截断）
+_BROWSE_PAGE_SIZE = 20        # 目录浏览每页显示的条目数
+_BROWSE_NAME_WIDTH = 34       # 按钮名称按显示宽度折行（CJK 记 2），保证在按钮里完整显示
+_BROWSE_NAME_ROWS = 3         # 单个名称最多折成几行按钮（再多就省略中段）
 _MAX_FLOW_TOKENS = 300        # 最多记住多少个「搜索 → 选季 → 选集」会话令牌
 
 # 旧版底部快捷键盘按钮文字 → 指令的映射：仅用于兼容客户端上残留的旧键盘
@@ -137,6 +139,89 @@ def _shorten_text(text: str, limit: int) -> str:
     head = keep // 2 + keep % 2
     tail = keep - head
     return f"{text[:head]}…{text[-tail:]}"
+
+
+def _display_width(text: str) -> int:
+    """粗略计算显示宽度：CJK 全角字符记 2，英文/数字/半角记 1"""
+    return sum(
+        2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        for ch in str(text or "")
+    )
+
+
+def _truncate_by_width(text: str, limit: int) -> str:
+    """按显示宽度从头部截断文本（不超宽）"""
+    if limit <= 0:
+        return ""
+    width = 0
+    head: List[str] = []
+    for ch in str(text or ""):
+        char_width = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if width + char_width > limit:
+            break
+        head.append(ch)
+        width += char_width
+    return "".join(head)
+
+
+def _shorten_by_width(text: str, limit: int) -> str:
+    """按显示宽度截断，超宽时保留头尾并省略中间"""
+    text = str(text or "")
+    if limit <= 0 or _display_width(text) <= limit:
+        return text
+    if limit <= 3:
+        return _truncate_by_width(text, limit)
+    keep = limit - 1
+    head = _truncate_by_width(text, keep // 2 + keep % 2)
+    tail_limit = keep - _display_width(head)
+    tail = _truncate_by_width(text[::-1], tail_limit)[::-1]
+    return f"{head}…{tail}"
+
+
+def _wrap_by_width(text: str, limit: int) -> List[str]:
+    """按显示宽度把长名称折成多段（每段 ≤ limit），供多行按钮完整显示"""
+    text = str(text or "")
+    if limit <= 0:
+        return [text]
+    chunks: List[str] = []
+    current = ""
+    width = 0
+    for ch in text:
+        char_width = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if current and width + char_width > limit:
+            chunks.append(current)
+            current = ""
+            width = 0
+        current += ch
+        width += char_width
+    if current or not chunks:
+        chunks.append(current)
+    return chunks
+
+
+def _browse_name_lines(
+    name: str,
+    suffix: str = "",
+    limit: int = _BROWSE_NAME_WIDTH,
+    max_rows: int = _BROWSE_NAME_ROWS,
+) -> List[str]:
+    """把名称（含可选后缀）折成多行按钮文本，供 Telegram 按钮内完整显示"""
+    text = str(name or "")
+    allowed = limit * max_rows - _display_width(suffix)
+    allowed = max(limit, allowed)
+    if _display_width(text) > allowed:
+        text = _shorten_by_width(text, allowed)
+    chunks = _wrap_by_width(text, limit)
+    if len(chunks) > max_rows:
+        keep = max_rows - 1
+        merged = "".join(chunks[keep:])
+        chunks = chunks[:keep] + [_shorten_by_width(merged, limit)]
+    if suffix:
+        if _display_width(chunks[-1]) + _display_width(suffix) <= limit:
+            chunks[-1] += suffix
+        else:
+            chunks.append(suffix)
+    return chunks
 
 
 def _candidate_contains_item(video: Dict[str, Any], item_id: str) -> bool:
@@ -1129,44 +1214,19 @@ class TelegramBotService:
                 size = 0
             total_size += size
             entries.append({"kind": "file", "path": item, "size": size})
-        # 正文按序号列出完整名称，键盘只放编号按钮；分页同时受「每页条数」与
-        # 「正文字数」两个预算约束，避免长文件名把消息撑爆或编号对不上正文
-        entry_lines: List[str] = []
-        for entry in entries:
-            target = entry["path"]
-            if entry["kind"] == "dir":
-                entry_lines.append(f"📁 {target.name}")
-            else:
-                size_text = _format_size(entry.get("size"))
-                suffix = f"（{size_text}）" if size_text else ""
-                entry_lines.append(f"🎬 {target.name}{suffix}")
-        pages: List[List[int]] = []
-        current_page: List[int] = []
-        current_len = 0
-        for index, line in enumerate(entry_lines):
-            line_len = len(line) + 8  # 序号前缀与换行余量
-            if current_page and (
-                len(current_page) >= _BROWSE_PAGE_SIZE
-                or current_len + line_len > _BROWSE_TEXT_BUDGET
-            ):
-                pages.append(current_page)
-                current_page = []
-                current_len = 0
-            current_page.append(index)
-            current_len += line_len
-        pages.append(current_page)
-
-        total_pages = max(1, len(pages))
+        total = len(entries)
+        total_pages = max(1, (total + _BROWSE_PAGE_SIZE - 1) // _BROWSE_PAGE_SIZE)
         try:
             page = int(page)
         except (TypeError, ValueError):
             page = 0
         page = max(0, min(page, total_pages - 1))
-        page_indices = pages[page]
-        page_entries = [entries[index] for index in page_indices]
+        start = page * _BROWSE_PAGE_SIZE
+        page_entries = entries[start : start + _BROWSE_PAGE_SIZE]
         base_token = self._token_for_path(str(base))
 
-        # 键盘只放编号按钮（名称在正文里完整列出）：目录一行三键，文件一行两键
+        # 每个条目占多行：名称按显示宽度折成若干整行按钮（按钮里能显示完整名字），
+        # 最后一行才是「上传 / 删除」操作键
         rows: List[List[Dict[str, str]]] = []
         nav_row: List[Dict[str, str]] = [
             {
@@ -1181,26 +1241,45 @@ class TelegramBotService:
             nav_row.append({"text": "🚫 无可上传", "callback_data": "up:noop"})
         rows.append(nav_row)
         for number, entry in enumerate(page_entries, start=1):
-            token = self._token_for_path(str(entry["path"]))
+            target = entry["path"]
+            token = self._token_for_path(str(target))
             if entry["kind"] == "dir":
+                name_lines = _browse_name_lines(target.name)
                 rows.append(
                     [
                         {
-                            "text": f"📂 {number} 进入",
+                            "text": f"📂 {name_lines[0]}",
                             "callback_data": f"up:ls:{token}:0",
-                        },
+                        }
+                    ]
+                )
+                for extra in name_lines[1:]:
+                    rows.append([{"text": extra, "callback_data": "up:noop"}])
+                rows.append(
+                    [
                         {
-                            "text": f"📤 {number} 全部",
+                            "text": f"📤 {number} 上传全部",
                             "callback_data": f"up:dir:{token}",
                         },
-                        {"text": f"🗑️ {number}", "callback_data": f"up:del:{token}"},
+                        {"text": "🗑️ 删除", "callback_data": f"up:del:{token}"},
                     ]
                 )
             else:
+                size_text = _format_size(entry.get("size"))
+                suffix = f"（{size_text}）" if size_text else ""
+                name_lines = _browse_name_lines(target.name, suffix)
+                rows.append(
+                    [{"text": f"🎬 {name_lines[0]}", "callback_data": "up:noop"}]
+                )
+                for extra in name_lines[1:]:
+                    rows.append([{"text": extra, "callback_data": "up:noop"}])
                 rows.append(
                     [
-                        {"text": f"📤 {number}", "callback_data": f"up:file:{token}"},
-                        {"text": f"🗑️ {number}", "callback_data": f"up:del:{token}"},
+                        {
+                            "text": f"📤 {number} 上传",
+                            "callback_data": f"up:file:{token}",
+                        },
+                        {"text": "🗑️ 删除", "callback_data": f"up:del:{token}"},
                     ]
                 )
         if total_pages > 1:
@@ -1231,10 +1310,6 @@ class TelegramBotService:
         if total_pages > 1:
             tail += f"（第 {page + 1}/{total_pages} 页）"
         lines[-1] += tail
-        if page_indices:
-            lines.append("")
-            for number, index in enumerate(page_indices, start=1):
-                lines.append(f"{number}. {entry_lines[index]}")
         self._send_keyboard(chat_id, "\n".join(lines), rows, edit_message_id)
 
     def _send_delete_confirm(self, chat_id: str, path: str) -> None:

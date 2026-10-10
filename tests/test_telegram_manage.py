@@ -146,7 +146,7 @@ class TestReplyDelete(_BotHarness):
 
 
 class TestBrowseFullName(_BotHarness):
-    def test_browse_lists_full_file_name_in_message_with_number_button(self):
+    def test_browse_shows_full_file_name_in_buttons(self):
         long_name = "魅影神捕.Shadow.Punished.2024.2160p.WEB-DL.HEVC.DDP5.1.mkv"
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / long_name).write_bytes(b"x")
@@ -160,12 +160,20 @@ class TestBrowseFullName(_BotHarness):
 
         self.assertEqual(len(self.keyboards), 1)
         text, rows = self.keyboards[0]
-        # 正文按序号列出完整文件名（不再被按钮截断）
-        self.assertIn(f"1. 🎬 {long_name}", text)
-        # 键盘只用编号按钮指代正文条目
+        # 正文不再重复整页完整名称
+        self.assertNotIn("本页完整名称：", text)
+        self.assertNotIn(long_name, text)
+        # 完整文件名按显示宽度折行显示在按钮里（不再被客户端截断）
         labels = [button["text"] for row in rows for button in row]
-        self.assertIn("📤 1", labels)
-        self.assertIn("🗑️ 1", labels)
+        name_label = "".join(
+            label
+            for label in labels
+            if not label.startswith(("📤", "🗑️", "⬆️", "🏠", "🚫"))
+        )
+        self.assertIn(long_name, name_label)
+        self.assertNotIn("…", name_label)
+        self.assertIn("📤 1 上传", labels)  # 序号只挂在上传按钮上
+        self.assertTrue(any("🗑️" in label for label in labels))  # 有删除键
 
 
 class TestQuickConfig(_BotHarness):
