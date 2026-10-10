@@ -108,7 +108,7 @@ tests/
 - **File stability check:** Files aren't processed until size stabilizes (checked 3 times at 1s intervals).
 - **Subtitle handling:** `SubtitleHandler.find_matching_video` 只匹配真实视频（排除字幕自身和其它字幕扩展名），并支持 `A_track9_chi` / `A.chs` / `A-eng` 这类「视频主名 + 分隔符」后缀；当同目录没有视频（视频已上传并删除）或视频已上传但仍保留在本地时，`VideoFileHandler._upload_standalone_subtitle` 会按字幕自身识别目标并单独上传（只调 Emos 的 subtitle/save），是否启用受 `emos.upload_subtitles` 控制。
 - **Telegram 报错通知:** TMDB 没搜到条目、TMDB 请求失败、字幕识别不到上传目标、上传失败或被 Emos 拒绝重复上传，都会推送 Telegram 报错（同一文件同类报错 5 分钟只推一次）；直接「回复」该消息写 `标题 S01E01` / `标题 第4季第9集` / `标题 (2024)` 即可修正目标并重传。
-- **在线识别目标搜索:** Emos 的 `/api/video/tree` 带 `type=tv` 过滤时可能搜不到已存在的条目（Web 搜索不带 type 却能搜到），所以 `OnlineUploadService.search_targets` 带类型搜不到时会去掉类型再搜一次；从候选里定位季/集时优先选标题相关的作品，避免把别的剧的同名集号当成目标。「在线识别上传」页会按识别出的剧名/文件名前缀给结果分组，每组一个搜索框，「搜索并匹配本组」按各文件自己的季/集号批量落到对应的 ve。
+- **在线识别目标搜索:** Emos 的 `/api/video/tree` 带 `type=tv` 过滤时可能搜不到已存在的条目（Web 搜索不带 type 却能搜到），所以 `OnlineUploadService.search_targets` 带类型搜不到时会去掉类型再搜一次；从候选里定位季/集时优先选标题相关的作品，避免把别的剧的同名集号当成目标。「在线识别上传」页会按识别出的剧名/文件名前缀给结果分组，每组一个搜索框，「搜索并匹配本组」按各文件自己的季/集号批量落到对应的 ve。搜索结果里电视剧没带嵌套季/集时，`_fill_missing_seasons` 会用 Emos 季/集接口补齐前 3 个候选（手动新增的集只在季/集接口里），网页端「目标映射表 → 搜索目标」把季/集展开，选中某一集自动切到「剧集集数映射」并填好季/集与 `ve` 目标。
 - **TG 回复修正定位剧集:** 按标题搜索返回的候选有时只有作品级信息、没有嵌套季/集（带 `type` 过滤时尤其明显），只靠 `pick_target` 会误报「未在 Emos 中找到匹配条目」。`TelegramBotService._locate_target` 在 `pick_target` 失败后会用候选的 `item_id` 调 `resolve_episode_from_candidates` 拉完整目录树定位具体某一集（`/api/video/tree?video_id=`），并且带类型搜不到时再去掉类型重搜一次；`OnlineUploadService.recognize` 的标题搜索兜底同样补了这个完整目录树定位。
 - **TG 回复标题清洗:** `parse_target_expression` 会去掉粘贴文件名带的后缀（`.mkv` 等）和标题两侧的分隔符，包含 ASCII 点——否则「大王饶命.S03E03」会解析成标题「大王饶命.」，拿去搜 Emos 必然搜不到；标题内部的点（`Mr. Robot`）保留。
 

@@ -19,12 +19,12 @@
 - **核心模块** (`src/video_organizer/core/`):
   - `renamer.py` — 文件识别/重命名核心
   - `config_loader.py` — 配置加载/保存/验证（支持 frozen 打包环境路径）
-  - `video_file_handler.py` — 文件处理主循环
-  - `filesystem_monitor.py` — 目录/下载器监控
+  - `video_file_handler.py` — 文件处理主循环（「未找到 TMDB / Emos 目标」的失败文件会加入重试队列，由 `filesystem_monitor._retry_loop` 每 1 分钟自动重跑识别 + 上传，命中后自动完成，无需手动重传）
+  - `filesystem_monitor.py` — 目录/下载器监控（`_retry_files` 重试队列：每 60 秒处理一次）
   - `tmdb_client.py` — TMDB API 客户端
   - `guessit_parser.py` — GuessIt 集成 + 中文文件名预处理
-  - `emos_client.py` / `probe.py` / `online_upload.py` — Emos 官方 API 客户端、ffprobe 校验、在线识别上传服务
-  - `telegram_bot.py` — Telegram 机器人：上传报错通知（未解决每 5 分钟提醒；回复「删除」即停止提醒，并连带删除上传任务与 aria2/qB 下载任务），本地文件已不存在则不再提醒）+ 回复修正上传目标（发片名关键词 → 搜索候选 → 点选作品/季/集，可用年份区分同名作品；也可直接写「剧名SxxExx」）+ 底部快捷键盘（绑定/`/help` 后常驻，`/keyboard` 重显）+ `/upload` 浏览本地文件（可上传/删除文件、文件夹，正文列出完整文件名）+ `/config` 快捷配置（布尔项开关、其余输入）（长轮询 getUpdates，含 inline 按钮）
+  - `emos_client.py` / `probe.py` / `online_upload.py` — Emos 官方 API 客户端、ffprobe 校验、在线识别上传服务（`search_targets` 搜索结果里电视剧没带季/集时，会用 Emos 季/集接口补齐前 3 个候选，网页端才能选到手动新增的集）
+  - `telegram_bot.py` — Telegram 机器人：上传报错通知（未解决每 5 分钟提醒；回复「删除」即停止提醒，并连带删除上传任务与 aria2/qB 下载任务），本地文件已不存在则不再提醒）+ 回复修正上传目标（发片名关键词 → 搜索候选 → 点选作品/季/集，可用年份区分同名作品；也可直接写「剧名SxxExx」）+ Telegram 原生命令菜单（`setMyCommands` + 菜单按钮：输入框左侧「菜单」/输入 `/` 列出指令，启动、绑定、测试消息时自动注册；底部快捷键盘改为按需显示，`/keyboard` 显示、`/keyboard off` 收起）+ `/upload` 浏览本地文件（可上传/删除文件、文件夹，正文列出完整文件名）+ `/config` 快捷配置（布尔项开关、其余输入）（长轮询 getUpdates，含 inline 按钮）
   - `mapping_store.py` — 目标映射表（文字映射 / 剧集集数映射），命中后跳过 TMDB/Emos 搜索直接上传
   - `incomplete_downloads.py` — 汇总 qb/aria2 未完成下载，手动识别本地文件时排除半成品
 - **Web 后端** (`web/`):
@@ -81,7 +81,7 @@ python -c "import sys; sys.path.insert(0,'src'); from pathlib import Path; p=Pat
 - `/api/auth/`、`/static/`、`/api/health` 无需认证
 - WebSocket: `/api/tasks/ws/progress`, `/api/tasks/ws/dashboard`, `/api/logs/ws/{filename}`
 - 在线识别上传: `GET /api/online-upload/config|roots|search|tasks`、`POST /api/online-upload/browse|scan|probe|recognize|recognize-batch|tasks|save-internal`、`POST /api/online-upload/tasks/{id}/retry`、`DELETE /api/online-upload/tasks/{id}|tasks/clear`（`recognize-batch` 并发识别；创建任务按文件去重，重复提交返回 `duplicates`）
-- 目标映射表: `GET|POST /api/config/db/target-mappings`、`PUT|DELETE /api/config/db/target-mappings/{id}`（`match_type` 为 `title`（文字映射）或 `episode`（剧集集数映射）；TG 修正过的目标自动写入）
+- 目标映射表: `GET|POST /api/config/db/target-mappings`、`PUT|DELETE /api/config/db/target-mappings/{id}`（`match_type` 为 `title`（文字映射）或 `episode`（剧集集数映射）；TG 修正过的目标自动写入；网页端「搜索目标」会展开电视剧的季/集，选中某一集自动填好季/集并指向 `ve` 目标）
 - Telegram 机器人: `GET /api/config/telegram/status`、`POST /api/config/telegram/test`（绑定 / 测试消息；TG 内发送 `/upload` 选择服务器本地文件上传）
 - 下载器: `GET /api/downloaders` 返回每个实例的 `id`（配置节标识）与 `type`，`/api/downloaders/{id}/{status|tasks|remove|pause|resume|processed}` 按实例标识访问
 - 配置在线修改后会自动热更新到视频处理器、在线识别上传服务、Telegram 机器人与下载器监控（新增/删除 aria2 实例、调整上传并发数均立即生效），无需重启容器
