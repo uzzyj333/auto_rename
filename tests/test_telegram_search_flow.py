@@ -543,19 +543,16 @@ class TestQuickKeyboard(_BotHarness):
         )
         self.assertEqual(calls, ["/upload"])
 
-    def test_help_does_not_send_quick_keyboard(self):
-        # 默认改用 Telegram 原生命令菜单，底部快捷键盘改为 /keyboard 按需显示
+    def test_help_sends_quick_keyboard(self):
+        # 底部快捷键盘保持常驻：/help 时一并弹出，原生命令菜单只是补充
         sent_keyboards = []
-        sent_texts = []
 
         def _fake_keyboard(chat_id=None, text=None):
             sent_keyboards.append(chat_id)
 
         self.service.send_quick_keyboard = _fake_keyboard
-        self.service.send_text = lambda text, reply_to=None, chat_id=None: sent_texts.append(text)
         self.service._handle_command("/help", "1", "1", [])
-        self.assertEqual(sent_keyboards, [])
-        self.assertTrue(sent_texts)
+        self.assertEqual(sent_keyboards, ["1"])
 
 
 class TestDownloaderCleanup(unittest.TestCase):
@@ -603,9 +600,11 @@ class TestDownloaderCleanup(unittest.TestCase):
 
 
 class TestBrowseGrid(_BotHarness):
-    def test_browse_rows_are_uniform_three_columns(self):
+    def test_browse_entry_uses_name_row_then_action_row(self):
+        """每个条目两行：名称独享整行，下一行才是「上传 / 删除」"""
         with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp) / "a.mkv").write_bytes(b"x")
+            long_name = "魅影神捕.Shadow.Punished.2024.2160p.WEB-DL.HEVC.DDP5.1.mkv"
+            (Path(tmp) / long_name).write_bytes(b"x")
             (Path(tmp) / "sub").mkdir()
             fake = _FakeUploadService()
             fake.roots = lambda: [tmp]
@@ -618,9 +617,19 @@ class TestBrowseGrid(_BotHarness):
                 self.service._send_browse("1", tmp)
 
         text, rows = self.keyboards[-1]
-        self.assertGreaterEqual(len(rows), 3)
-        for row in rows:
-            self.assertEqual(len(row), 3, f"行列数不一致：{row}")
+        # 导航行仍是「上一级 / 根目录 / 上传全部」三个键
+        self.assertEqual(len(rows[0]), 3)
+        entry_rows = rows[1:]
+        self.assertEqual(len(entry_rows), 4)  # 1 个目录 + 1 个文件，各 2 行
+        name_labels = []
+        for index in range(0, len(entry_rows), 2):
+            name_row, action_row = entry_rows[index], entry_rows[index + 1]
+            self.assertEqual(len(name_row), 1, f"名称应独享一行：{name_row}")
+            self.assertEqual(len(action_row), 2, f"操作行应有两个键：{action_row}")
+            self.assertTrue(action_row[1]["text"].startswith("🗑️"))
+            name_labels.append(name_row[0]["text"])
+        # 名称独占整行后可以显示得更长（以前压到 26 字以内）
+        self.assertTrue(any(len(label) > 26 for label in name_labels), name_labels)
         flat = [button["text"] for row in rows for button in row]
         self.assertTrue(any("上传全部" in label for label in flat))
         self.assertTrue(any("🗑️ 删除" in label for label in flat))

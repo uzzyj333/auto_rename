@@ -24,7 +24,7 @@
   - `tmdb_client.py` — TMDB API 客户端
   - `guessit_parser.py` — GuessIt 集成 + 中文文件名预处理
   - `emos_client.py` / `probe.py` / `online_upload.py` — Emos 官方 API 客户端、ffprobe 校验、在线识别上传服务（`search_targets` 搜索结果里电视剧没带季/集时，会用 Emos 季/集接口补齐前 3 个候选，网页端才能选到手动新增的集）
-  - `telegram_bot.py` — Telegram 机器人：上传报错通知（未解决每 5 分钟提醒；回复「删除」即停止提醒，并连带删除上传任务与 aria2/qB 下载任务），本地文件已不存在则不再提醒）+ 回复修正上传目标（发片名关键词 → 搜索候选 → 点选作品/季/集，可用年份区分同名作品；也可直接写「剧名SxxExx」）+ Telegram 原生命令菜单（`setMyCommands` + 菜单按钮：输入框左侧「菜单」/输入 `/` 列出指令，启动、绑定、测试消息时自动注册；底部快捷键盘改为按需显示，`/keyboard` 显示、`/keyboard off` 收起）+ `/upload` 浏览本地文件（可上传/删除文件、文件夹，正文列出完整文件名）+ `/config` 快捷配置（布尔项开关、其余输入）（长轮询 getUpdates，含 inline 按钮）
+  - `telegram_bot.py` — Telegram 机器人：上传报错通知（未解决每 5 分钟提醒；回复「删除」即停止提醒，并连带删除上传任务与 aria2/qB 下载任务），本地文件已不存在则不再提醒）+ 回复修正上传目标（发片名关键词 → 搜索候选 → 点选作品/季/集，可用年份区分同名作品；也可直接写「剧名SxxExx」）+ 底部快捷键盘（绑定/`/help` 后常驻，`/keyboard` 重显、`/keyboard off` 收起）+ Telegram 原生命令菜单（`setMyCommands` + 菜单按钮：输入框左侧「菜单」/输入 `/` 列出指令，启动、绑定、测试消息时自动注册）+ `/upload` 浏览本地文件（每个条目两行：名称独占一行、下一行「上传 / 删除」，正文列出完整文件名）+ `/config` 快捷配置（布尔项开关、其余输入）（长轮询 getUpdates，含 inline 按钮）
   - `mapping_store.py` — 目标映射表（文字映射 / 剧集集数映射），命中后跳过 TMDB/Emos 搜索直接上传
   - `incomplete_downloads.py` — 汇总 qb/aria2 未完成下载，手动识别本地文件时排除半成品
 - **Web 后端** (`web/`):

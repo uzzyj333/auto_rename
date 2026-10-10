@@ -93,9 +93,9 @@ _HELP_TEXT = (
     "/upload  浏览本地文件：上传 / 删除文件或文件夹\n"
     "/config  快捷配置（开关）+「处理配置」/「Emos API」\n"
     "/status  查看机器人状态\n"
-    "/keyboard  显示底部快捷键盘（发送「/keyboard off」改用原生命令菜单）\n"
+    "/keyboard  重新显示底部快捷键盘（发送「/keyboard off」可收起）\n"
     "/help  查看本帮助\n\n"
-    "命令菜单：点输入框左侧「菜单」或输入「/」即可看到全部指令\n\n"
+    "底部快捷键盘常驻，也可以点输入框左侧「菜单」或输入「/」查看全部指令\n\n"
     "修正上传目标：直接「回复」某条报错信息并发送片名关键词，\n"
     "机器人会搜索 Emos 并列出候选，点选作品后再选季 / 集即可上传；\n"
     "也可以一步到位直接写：\n"
@@ -993,6 +993,7 @@ class TelegramBotService:
                     "发送 /help 查看用法，或点输入框左侧「菜单」选择指令。",
                     chat_id=chat_id,
                 )
+                self.send_quick_keyboard(chat_id)
                 return
             self._bind_chat(chat_id)
             self.sync_command_menu()
@@ -1002,11 +1003,11 @@ class TelegramBotService:
                 "点输入框左侧「菜单」或输入 / 可查看全部指令。",
                 chat_id=chat_id,
             )
-            # 之前若显示过底部快捷键盘，这里收起来，默认使用 Telegram 原生命令菜单
-            self.hide_quick_keyboard(chat_id)
+            self.send_quick_keyboard(chat_id)
             return
         if command == "/help":
             self.send_text(_HELP_TEXT, chat_id=chat_id)
+            self.send_quick_keyboard(chat_id)
             return
         if command in ("/keyboard", "/menu", "/快捷栏"):
             if raw_text.strip().lower().endswith(("off", "hide", "关闭", "收起")):
@@ -1179,7 +1180,8 @@ class TelegramBotService:
         page_entries = entries[start : start + _BROWSE_PAGE_SIZE]
         base_token = self._token_for_path(str(base))
 
-        # 统一成 3 列网格：导航行 / 目录行 / 文件行 / 翻页行外观保持一致
+        # 每个条目占两行：第一行整行放名称（按钮独享一行，名字能显示得更长，
+        # 超长时 Telegram 会自动在按钮内换行），第二行才是「上传 / 删除」操作键
         rows: List[List[Dict[str, str]]] = []
         nav_row: List[Dict[str, str]] = [
             {
@@ -1197,24 +1199,28 @@ class TelegramBotService:
             target = entry["path"]
             token = self._token_for_path(str(target))
             if entry["kind"] == "dir":
-                name = _shorten_text(target.name, 26)
+                name = _shorten_text(target.name, 96)
                 rows.append(
                     [
                         {"text": f"📂 {name}", "callback_data": f"up:ls:{token}:0"},
-                        {"text": "📤 上传", "callback_data": f"up:dir:{token}"},
+                    ]
+                )
+                rows.append(
+                    [
+                        {"text": "📤 上传全部", "callback_data": f"up:dir:{token}"},
                         {"text": "🗑️ 删除", "callback_data": f"up:del:{token}"},
                     ]
                 )
             else:
                 size_text = _format_size(entry.get("size"))
                 suffix = f"（{size_text}）" if size_text else ""
-                name = _shorten_text(target.name, max(8, 26 - len(suffix)))
+                # 名称独占整行，按钮里的长文件名交给 Telegram 自动换行，只做兜底截断
+                name = _shorten_text(target.name, max(8, 96 - len(suffix)))
+                rows.append(
+                    [{"text": f"🎬 {name}{suffix}", "callback_data": "up:noop"}]
+                )
                 rows.append(
                     [
-                        {
-                            "text": f"🎬 {name}{suffix}",
-                            "callback_data": f"up:file:{token}",
-                        },
                         {"text": "📤 上传", "callback_data": f"up:file:{token}"},
                         {"text": "🗑️ 删除", "callback_data": f"up:del:{token}"},
                     ]

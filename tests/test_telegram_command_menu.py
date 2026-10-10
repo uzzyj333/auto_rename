@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Telegram 原生命令菜单（setMyCommands / 「菜单」按钮）的回归测试
 
-以前只有底部回复键盘，用户看不到 Telegram 原生的「菜单」按钮和输入 / 时的
-命令列表；现在启动 / 绑定 / 测试消息时都会注册命令菜单，默认使用原生菜单，
-底部快捷键盘改为按需显示（/keyboard 显示、/keyboard off 收起）。
+除了底部回复键盘，启动 / 绑定 / 测试消息时还会注册 Telegram 原生的「菜单」
+按钮和输入 / 时的命令列表，两者并存：绑定、/help 照常弹出底部快捷键盘，
+/keyboard off 可以收起。
 """
 
 import os
@@ -81,9 +81,10 @@ class TestTelegramCommandMenu(unittest.TestCase):
             self.assertFalse(self.service.sync_command_menu())
         post.assert_not_called()
 
-    def test_bind_uses_native_menu_instead_of_keyboard(self):
+    def test_bind_registers_menu_and_keeps_keyboard(self):
         self.service._chat_id = "42"
         shown = []
+        keyboards = []
         with patch.object(
             TelegramBotService, "sync_command_menu", lambda self: True
         ), patch.object(
@@ -93,15 +94,16 @@ class TestTelegramCommandMenu(unittest.TestCase):
         ), patch.object(
             TelegramBotService,
             "send_quick_keyboard",
-            lambda self, *a, **k: self.fail("绑定后不应再弹底部快捷键盘"),
+            lambda self, *a, **k: keyboards.append(True),
         ), patch.object(
             TelegramBotService,
             "hide_quick_keyboard",
-            lambda self, *a, **k: None,
+            lambda self, *a, **k: self.fail("绑定后不应收起底部快捷键盘"),
         ):
             self.service._handle_command("/bind", "42", "1", [])
 
         self.assertTrue(shown)
+        self.assertEqual(keyboards, [True])
 
     def test_keyboard_off_hides_bottom_keyboard(self):
         hidden = []
