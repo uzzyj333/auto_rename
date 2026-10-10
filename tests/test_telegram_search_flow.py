@@ -543,15 +543,19 @@ class TestQuickKeyboard(_BotHarness):
         )
         self.assertEqual(calls, ["/upload"])
 
-    def test_help_sends_quick_keyboard(self):
+    def test_help_does_not_send_quick_keyboard(self):
+        # 默认改用 Telegram 原生命令菜单，底部快捷键盘改为 /keyboard 按需显示
         sent_keyboards = []
+        sent_texts = []
 
         def _fake_keyboard(chat_id=None, text=None):
             sent_keyboards.append(chat_id)
 
         self.service.send_quick_keyboard = _fake_keyboard
+        self.service.send_text = lambda text, reply_to=None, chat_id=None: sent_texts.append(text)
         self.service._handle_command("/help", "1", "1", [])
-        self.assertEqual(sent_keyboards, ["1"])
+        self.assertEqual(sent_keyboards, [])
+        self.assertTrue(sent_texts)
 
 
 class TestDownloaderCleanup(unittest.TestCase):

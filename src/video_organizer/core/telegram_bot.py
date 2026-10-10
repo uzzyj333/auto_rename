@@ -59,6 +59,16 @@ _QUICK_REPLY_MAP = {
     "❓ 使用帮助": "/help",
 }
 
+# 原生命令菜单（setMyCommands）：输入框左侧「菜单」按钮 + 输入 / 时的命令列表
+_BOT_COMMANDS = [
+    {"command": "upload", "description": "浏览本地文件：上传 / 删除文件或文件夹"},
+    {"command": "config", "description": "快捷配置：布尔开关与常用参数"},
+    {"command": "status", "description": "查看机器人运行状态"},
+    {"command": "keyboard", "description": "显示底部快捷键盘（/keyboard off 收起）"},
+    {"command": "help", "description": "查看用法：修正目标 / 删除任务"},
+    {"command": "bind", "description": "绑定当前 Telegram 会话"},
+]
+
 # 回复这些关键词表示「删除该文件的任务并停止提醒」
 _DELETE_KEYWORDS = {
     "删除", "删掉", "删了", "移除", "取消", "不要了", "不再提醒",
@@ -83,8 +93,9 @@ _HELP_TEXT = (
     "/upload  浏览本地文件：上传 / 删除文件或文件夹\n"
     "/config  快捷配置（开关）+「处理配置」/「Emos API」\n"
     "/status  查看机器人状态\n"
-    "/keyboard  重新显示底部快捷键盘\n"
+    "/keyboard  显示底部快捷键盘（发送「/keyboard off」改用原生命令菜单）\n"
     "/help  查看本帮助\n\n"
+    "命令菜单：点输入框左侧「菜单」或输入「/」即可看到全部指令\n\n"
     "修正上传目标：直接「回复」某条报错信息并发送片名关键词，\n"
     "机器人会搜索 Emos 并列出候选，点选作品后再选季 / 集即可上传；\n"
     "也可以一步到位直接写：\n"
@@ -455,6 +466,10 @@ class TelegramBotService:
         worker.start()
         if reminder is not None:
             reminder.start()
+        # 在后台注册原生命令菜单，避免网络慢时阻塞配置保存请求
+        threading.Thread(
+            target=self.sync_command_menu, name="telegram-commands", daemon=True
+        ).start()
         logger.info("Telegram 机器人已启动（长轮询）")
 
     def stop(self) -> None:
@@ -528,6 +543,8 @@ class TelegramBotService:
 
     def test_message(self, chat_id: Optional[str] = None) -> Dict[str, Any]:
         """发送一条测试消息，用于验证绑定是否可用"""
+        # 顺手注册原生命令菜单，用户不必等下一次重启 / 绑定
+        self.sync_command_menu()
         message_id = self.send_text("✅ Video Organizer Telegram 机器人连接正常。", chat_id=chat_id)
         if message_id:
             return {"success": True, "message": "测试消息已发送", "message_id": message_id}
@@ -562,6 +579,68 @@ class TelegramBotService:
             )
         except Exception as exc:
             logger.debug("发送 Telegram 快捷键盘失败: %s", exc)
+
+    def hide_quick_keyboard(
+        self,
+        chat_id: Optional[str] = None,
+        text: str = "已收起底部快捷键盘，改用 Telegram 原生命令菜单：点输入框左侧「菜单」或输入 / 。",
+    ) -> None:
+        """收起底部快捷键盘（回复键盘），配合原生命令菜单使用"""
+        with self._lock:
+            token = self._token
+            target_chat = str(chat_id or self._chat_id or "").strip()
+        if not token or not target_chat:
+            return
+        payload: Dict[str, Any] = {
+            "chat_id": target_chat,
+            "text": text,
+            "reply_markup": {"remove_keyboard": True},
+        }
+        try:
+            requests.post(
+                f"{_API_BASE}/bot{token}/sendMessage",
+                json=payload,
+                timeout=_SEND_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.debug("收起 Telegram 快捷键盘失败: %s", exc)
+
+    def sync_command_menu(self) -> bool:
+        """注册原生命令菜单（Telegram「菜单」按钮 + 输入 / 时的命令列表）
+
+        setMyCommands 只需要 bot_token，与是否已绑定 chat_id 无关；
+        再把默认菜单按钮设为 commands，未弹出底部键盘时输入框左侧会显示「菜单」。
+        老版本 Bot API 不支持 setChatMenuButton 时忽略失败，命令列表照常可用。
+        """
+        with self._lock:
+            token = self._token
+        if not token:
+            return False
+        ok = True
+        try:
+            response = requests.post(
+                f"{_API_BASE}/bot{token}/setMyCommands",
+                json={"commands": _BOT_COMMANDS},
+                timeout=_SEND_TIMEOUT,
+            )
+            body = response.json() if response.content else {}
+            if not body.get("ok"):
+                ok = False
+                description = str(body.get("description") or response.status_code)
+                self._record_error(description)
+                logger.warning("注册 Telegram 命令菜单失败: %s", description)
+        except Exception as exc:
+            ok = False
+            logger.warning("注册 Telegram 命令菜单异常: %s", exc)
+        try:
+            requests.post(
+                f"{_API_BASE}/bot{token}/setChatMenuButton",
+                json={"menu_button": {"type": "commands"}},
+                timeout=_SEND_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.debug("设置 Telegram 菜单按钮异常: %s", exc)
+        return ok
 
     def notify_error(
         self, context: Dict[str, Any], error: str, header: str = "上传失败"
@@ -607,6 +686,8 @@ class TelegramBotService:
         if target:
             lines.append(f"识别目标：{target}")
         lines.append(f"原因：{(error or '未知错误')[:600]}")
+        if (context or {}).get("auto_retry"):
+            lines.append("（已每 1 分钟自动重试）")
         message_id = self.send_text("\n".join(lines))
         if not message_id:
             # 发送失败（网络等）不算已通知，下次还能重试
@@ -733,7 +814,10 @@ class TelegramBotService:
             if target:
                 lines.append(f"识别目标：{target}")
             lines.append(f"原因：{str(item.get('error') or '未知错误')[:600]}")
-            lines.append("（未解决前每 5 分钟提醒一次）")
+            if context.get("auto_retry"):
+                lines.append("（已每 1 分钟自动重试；未解决前每 5 分钟提醒一次）")
+            else:
+                lines.append("（未解决前每 5 分钟提醒一次）")
             message_id = self.send_text("\n".join(lines))
             with self._lock:
                 current = self._active_errors.get(key)
@@ -851,7 +935,7 @@ class TelegramBotService:
             # 底部快捷键盘按钮：把按钮文字映射回对应指令
             command = _QUICK_REPLY_MAP[text]
         if command in ("/bind", "/start", "/help") and not bound_chat:
-            self._handle_command(command, chat_id, user_id, allowed)
+            self._handle_command(command, chat_id, user_id, allowed, text)
             return
         if not bound_chat or bound_chat != chat_id:
             self.send_text(
@@ -863,7 +947,7 @@ class TelegramBotService:
             self.send_text("你没有权限操作此机器人。", chat_id=chat_id)
             return
         if command:
-            self._handle_command(command, chat_id, user_id, allowed)
+            self._handle_command(command, chat_id, user_id, allowed, text)
             return
 
         reply_to = (message.get("reply_to_message") or {}).get("message_id")
@@ -891,6 +975,7 @@ class TelegramBotService:
         chat_id: str,
         user_id: str,
         allowed: List[str],
+        raw_text: str = "",
     ) -> None:
         if allowed and user_id not in allowed:
             self.send_text("你没有权限操作此机器人。", chat_id=chat_id)
@@ -902,22 +987,32 @@ class TelegramBotService:
                 self.send_text("机器人已绑定其他会话，如需改绑请先清空配置里的 chat_id。", chat_id=chat_id)
                 return
             if bound_chat == chat_id:
-                self.send_text("机器人已绑定当前会话 ✅\n发送 /help 查看用法。", chat_id=chat_id)
-                self.send_quick_keyboard(chat_id)
+                self.sync_command_menu()
+                self.send_text(
+                    "机器人已绑定当前会话 ✅\n"
+                    "发送 /help 查看用法，或点输入框左侧「菜单」选择指令。",
+                    chat_id=chat_id,
+                )
                 return
             self._bind_chat(chat_id)
+            self.sync_command_menu()
             self.send_text(
-                f"绑定成功 ✅\nchat_id = {chat_id}\n\n上传失败时会推送报错信息，直接回复即可修正目标。",
+                f"绑定成功 ✅\nchat_id = {chat_id}\n\n"
+                "上传失败时会推送报错信息，直接回复即可修正目标。\n"
+                "点输入框左侧「菜单」或输入 / 可查看全部指令。",
                 chat_id=chat_id,
             )
-            self.send_quick_keyboard(chat_id)
+            # 之前若显示过底部快捷键盘，这里收起来，默认使用 Telegram 原生命令菜单
+            self.hide_quick_keyboard(chat_id)
             return
         if command == "/help":
             self.send_text(_HELP_TEXT, chat_id=chat_id)
-            self.send_quick_keyboard(chat_id)
             return
         if command in ("/keyboard", "/menu", "/快捷栏"):
-            self.send_quick_keyboard(chat_id)
+            if raw_text.strip().lower().endswith(("off", "hide", "关闭", "收起")):
+                self.hide_quick_keyboard(chat_id)
+            else:
+                self.send_quick_keyboard(chat_id)
             return
         if command in ("/upload", "/files"):
             self._send_browse(chat_id, "", None)
