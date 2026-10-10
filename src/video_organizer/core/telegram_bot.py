@@ -1222,7 +1222,7 @@ class TelegramBotService:
             listing: List[str] = []
             listing_len = 0
             omitted = 0
-            for entry in page_entries:
+            for number, entry in enumerate(page_entries, start=1):
                 target = entry["path"]
                 if entry["kind"] == "dir":
                     line = f"📁 {target.name}"
@@ -1232,7 +1232,8 @@ class TelegramBotService:
                 if listing_len + len(line) > 3200:
                     omitted += 1
                     continue
-                listing.append(line)
+                # 序号与下面的「📤 N 上传」按钮一致，方便对上号
+                listing.append(f"{number}. {line}")
                 listing_len += len(line) + 1
             lines.append("")
             lines.append("本页完整名称：")

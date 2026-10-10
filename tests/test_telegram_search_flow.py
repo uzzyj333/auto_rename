@@ -617,6 +617,8 @@ class TestBrowseGrid(_BotHarness):
                 self.service._send_browse("1", tmp)
 
         text, rows = self.keyboards[-1]
+        # 正文序号与「📤 N 上传」按钮一一对应
+        self.assertIn("1. 📁 sub", text)
         # 导航行仍是「上一级 / 根目录 / 上传全部」三个键
         self.assertEqual(len(rows[0]), 3)
         entry_rows = rows[1:]

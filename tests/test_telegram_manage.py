@@ -162,6 +162,7 @@ class TestBrowseFullName(_BotHarness):
         text, rows = self.keyboards[0]
         self.assertIn("本页完整名称：", text)
         self.assertIn(long_name, text)  # 正文里能看到完整文件名
+        self.assertIn(f"1. 🎬 {long_name}", text)  # 正文序号与上传按钮一致
         flat = [button["text"] for row in rows for button in row]
         self.assertIn("📤 1 上传", flat)  # 序号只挂在上传按钮上
         self.assertTrue(any("🗑️" in button for button in flat))  # 有删除键
