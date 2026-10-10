@@ -146,7 +146,7 @@ class TestReplyDelete(_BotHarness):
 
 
 class TestBrowseFullName(_BotHarness):
-    def test_browse_lists_full_file_name_in_message(self):
+    def test_browse_shows_full_file_name_in_buttons(self):
         long_name = "魅影神捕.Shadow.Punished.2024.2160p.WEB-DL.HEVC.DDP5.1.mkv"
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / long_name).write_bytes(b"x")
@@ -160,10 +160,19 @@ class TestBrowseFullName(_BotHarness):
 
         self.assertEqual(len(self.keyboards), 1)
         text, rows = self.keyboards[0]
-        self.assertIn("本页完整名称：", text)
-        self.assertIn(long_name, text)  # 正文里能看到完整文件名
-        flat = [button["text"] for row in rows for button in row]
-        self.assertTrue(any("🗑️" in button for button in flat))  # 有删除键
+        # 正文不再重复整页完整名称
+        self.assertNotIn("本页完整名称：", text)
+        self.assertNotIn(long_name, text)
+        # 完整文件名按显示宽度折行显示在按钮里（不再被客户端截断）
+        labels = [button["text"] for row in rows for button in row]
+        name_label = "".join(
+            label
+            for label in labels
+            if not label.startswith(("📤", "🗑️", "⬆️", "🏠", "🚫"))
+        )
+        self.assertIn(long_name, name_label)
+        self.assertNotIn("…", name_label)
+        self.assertTrue(any("🗑️" in label for label in labels))  # 有删除键
 
 
 class TestQuickConfig(_BotHarness):

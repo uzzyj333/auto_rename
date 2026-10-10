@@ -6,7 +6,7 @@
    用户再点选作品 → 季 → 集，避免「狂王 S02E04」定位不到时的死胡同；
 2. 回复「删除」时，除了删除上传任务与提醒，还要连带删除
    aria2 / qBittorrent 里的对应下载任务；
-3. 文件浏览键盘统一成 3 列网格，避免行与行之间宽窄不一。
+3. 文件浏览键盘里长名称按显示宽度折成多行按钮，保证按钮里显示完整。
 """
 
 import os
@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.video_organizer.core.telegram_bot import TelegramBotService
+from src.video_organizer.core.telegram_bot import TelegramBotService, _display_width
 from src.video_organizer.core.downloader_monitor import remove_downloader_tasks
 
 
@@ -599,8 +599,8 @@ class TestDownloaderCleanup(unittest.TestCase):
 
 
 class TestBrowseGrid(_BotHarness):
-    def test_browse_entry_uses_name_row_then_action_row(self):
-        """每个条目两行：名称独享整行，下一行才是「上传 / 删除」"""
+    def test_browse_entry_wraps_name_rows_then_action_row(self):
+        """长名称按显示宽度折成多行按钮（显示完整），最后才是「上传 / 删除」"""
         with tempfile.TemporaryDirectory() as tmp:
             long_name = "魅影神捕.Shadow.Punished.2024.2160p.WEB-DL.HEVC.DDP5.1.mkv"
             (Path(tmp) / long_name).write_bytes(b"x")
@@ -618,17 +618,27 @@ class TestBrowseGrid(_BotHarness):
         text, rows = self.keyboards[-1]
         # 导航行仍是「上一级 / 根目录 / 上传全部」三个键
         self.assertEqual(len(rows[0]), 3)
-        entry_rows = rows[1:]
-        self.assertEqual(len(entry_rows), 4)  # 1 个目录 + 1 个文件，各 2 行
-        name_labels = []
-        for index in range(0, len(entry_rows), 2):
-            name_row, action_row = entry_rows[index], entry_rows[index + 1]
-            self.assertEqual(len(name_row), 1, f"名称应独享一行：{name_row}")
-            self.assertEqual(len(action_row), 2, f"操作行应有两个键：{action_row}")
+        # 每个条目：若干行名称按钮（每行 1 个）+ 一行「上传 / 删除」（2 个）
+        groups = []
+        current = []
+        for row in rows[1:]:
+            current.append(row)
+            if len(row) == 2:
+                groups.append(current)
+                current = []
+        self.assertEqual(len(groups), 2)  # 1 个目录 + 1 个文件
+        for group in groups:
+            name_rows, action_row = group[:-1], group[-1]
+            self.assertTrue(name_rows)
+            for name_row in name_rows:
+                self.assertEqual(len(name_row), 1, f"名称应独享一行：{name_row}")
+                self.assertLessEqual(_display_width(name_row[0]["text"]), 37)
             self.assertTrue(action_row[1]["text"].startswith("🗑️"))
-            name_labels.append(name_row[0]["text"])
-        # 名称独占整行后可以显示得更长（以前压到 26 字以内）
-        self.assertTrue(any(len(label) > 26 for label in name_labels), name_labels)
+        # 文件名称折行后完整拼出原文件名（不再被截断）
+        file_group = next(g for g in groups if g[0][0]["text"].startswith("🎬"))
+        label = "".join(row[0]["text"] for row in file_group[:-1])[len("🎬 ") :]
+        self.assertTrue(label.startswith(long_name), label)
+        self.assertNotIn("…", label)
         flat = [button["text"] for row in rows for button in row]
         self.assertTrue(any("上传全部" in label for label in flat))
         self.assertTrue(any("🗑️ 删除" in label for label in flat))
