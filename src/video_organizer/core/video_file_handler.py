@@ -465,7 +465,15 @@ class VideoFileHandler:
         return None
 
     def _notify_match_error(
-        self, file_path, title, media_type, season, episode, reason, header="未找到 Emos 上传目标"
+        self,
+        file_path,
+        title,
+        media_type,
+        season,
+        episode,
+        reason,
+        header="未找到 Emos 上传目标",
+        auto_retry=False,
     ):
         """识别不到 Emos 上传目标时推送 Telegram 报错，便于用户回复修正"""
         self._notify_upload_error(
@@ -476,6 +484,7 @@ class VideoFileHandler:
             season=season,
             episode=episode,
             header=header,
+            auto_retry=auto_retry,
         )
 
     def _notify_upload_error(
@@ -489,6 +498,7 @@ class VideoFileHandler:
         item_type="",
         item_id="",
         header="上传失败",
+        auto_retry=False,
     ):
         """上传阶段出错（含被 Emos 拒绝重复上传）时推送 Telegram 报错
 
@@ -508,6 +518,7 @@ class VideoFileHandler:
                     "item_type": item_type,
                     "item_id": item_id,
                     "storage": getattr(self, "emos_file_storage", None),
+                    "auto_retry": bool(auto_retry),
                 },
                 reason,
                 header=header,
@@ -988,10 +999,13 @@ class VideoFileHandler:
                     )
                 else:
                     console_log(f"⚠️  建议：请手动处理该文件或确认文件名是否正确")
-                    console_log(f"⚠️  文件将跳过上传，等待手动处理\n")
+                    console_log(f"⚠️  文件将加入每 1 分钟自动重试，等待手动处理\n")
                     # 记录失败原因，但不标记为已上传（以便后续可以重试）
                     self._failed_files[file_path] = "未找到 TMDB 匹配结果"
                     record_task(file_path, "failed", error_message="未找到 TMDB 匹配结果", end_time=datetime.now())
+                    # 每分钟自动重试：文件名/剧集信息补齐后无需手动干预即可自动上传
+                    if self._parent_monitor:
+                        self._parent_monitor._retry_files.add(file_path)
                     self._notify_match_error(
                         file_path,
                         metadata.get("show_name") or metadata.get("title") or "",
@@ -1000,6 +1014,7 @@ class VideoFileHandler:
                         metadata.get("episode"),
                         "未找到 TMDB 匹配结果，无法确定剧名/电影名，请在 Telegram 回复本条报错修正目标",
                         header="未识别到条目",
+                        auto_retry=True,
                     )
                 self._uploading_files.discard(file_path)
                 return False
@@ -1201,7 +1216,13 @@ class VideoFileHandler:
                         )
                     console_log(f"✗ [线程#{worker_id}] {match_error}")
                     self._notify_match_error(
-                        file_path, title, media_type, season_num, episode_num, match_error
+                        file_path,
+                        title,
+                        media_type,
+                        season_num,
+                        episode_num,
+                        match_error,
+                        auto_retry=True,
                     )
                 else:
                     match_error = f"Emos 中没有「{title}」这一条目，可在「在线识别上传」中手动选择目标"
@@ -1225,6 +1246,13 @@ class VideoFileHandler:
                 reason = match_error or "未找到匹配的 Emos 条目（item_id），可在「在线识别上传」中手动选择目标"
                 self._failed_files[file_path] = reason
                 record_task(file_path, "failed", error_message=reason, end_time=datetime.now())
+                # 每分钟自动重试：用户在 Emos 补建条目 / 剧集后即可自动上传
+                if self._parent_monitor:
+                    self._parent_monitor._retry_files.add(file_path)
+                    console_log(
+                        f"🔁 [线程#{worker_id}] 未找到 Emos 目标，已加入每 1 分钟自动重试: "
+                        f"{os.path.basename(file_path)}"
+                    )
                 log_success(
                     self.logger,
                     "文件元数据获取成功但未匹配到item_id",
