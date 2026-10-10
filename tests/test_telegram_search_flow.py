@@ -543,16 +543,15 @@ class TestQuickKeyboard(_BotHarness):
         )
         self.assertEqual(calls, ["/upload"])
 
-    def test_help_sends_quick_keyboard(self):
-        # 底部快捷键盘保持常驻：/help 时一并弹出，原生命令菜单只是补充
-        sent_keyboards = []
-
-        def _fake_keyboard(chat_id=None, text=None):
-            sent_keyboards.append(chat_id)
-
-        self.service.send_quick_keyboard = _fake_keyboard
-        self.service._handle_command("/help", "1", "1", [])
-        self.assertEqual(sent_keyboards, ["1"])
+    def test_help_does_not_send_quick_keyboard(self):
+        # 只用 Telegram 原生命令菜单，/help 不再弹底部快捷键盘
+        with patch.object(
+            TelegramBotService,
+            "send_quick_keyboard",
+            lambda self, *a, **k: self.fail("/help 不应再显示底部快捷键盘"),
+            create=True,
+        ):
+            self.service._handle_command("/help", "1", "1", [])
 
 
 class TestDownloaderCleanup(unittest.TestCase):

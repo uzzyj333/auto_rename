@@ -47,11 +47,7 @@ _MAX_BROWSE_TOKENS = 500      # 最多记住多少个「浏览/上传」路径�
 _BROWSE_PAGE_SIZE = 20        # 目录浏览每页显示的条目数
 _MAX_FLOW_TOKENS = 300        # 最多记住多少个「搜索 → 选季 → 选集」会话令牌
 
-# 底部快捷键盘（回复键盘）：点按即发送对应指令，省得每次手输
-_QUICK_KEYBOARD = [
-    [{"text": "📤 上传文件"}, {"text": "⚙️ 快捷配置"}],
-    [{"text": "📊 运行状态"}, {"text": "❓ 使用帮助"}],
-]
+# 旧版底部快捷键盘按钮文字 → 指令的映射：仅用于兼容客户端上残留的旧键盘
 _QUICK_REPLY_MAP = {
     "📤 上传文件": "/upload",
     "⚙️ 快捷配置": "/config",
@@ -64,7 +60,6 @@ _BOT_COMMANDS = [
     {"command": "upload", "description": "浏览本地文件：上传 / 删除文件或文件夹"},
     {"command": "config", "description": "快捷配置：布尔开关与常用参数"},
     {"command": "status", "description": "查看机器人运行状态"},
-    {"command": "keyboard", "description": "显示底部快捷键盘（/keyboard off 收起）"},
     {"command": "help", "description": "查看用法：修正目标 / 删除任务"},
     {"command": "bind", "description": "绑定当前 Telegram 会话"},
 ]
@@ -93,9 +88,8 @@ _HELP_TEXT = (
     "/upload  浏览本地文件：上传 / 删除文件或文件夹\n"
     "/config  快捷配置（开关）+「处理配置」/「Emos API」\n"
     "/status  查看机器人状态\n"
-    "/keyboard  重新显示底部快捷键盘（发送「/keyboard off」可收起）\n"
     "/help  查看本帮助\n\n"
-    "底部快捷键盘常驻，也可以点输入框左侧「菜单」或输入「/」查看全部指令\n\n"
+    "点输入框左侧「菜单」或输入「/」查看全部指令\n\n"
     "修正上传目标：直接「回复」某条报错信息并发送片名关键词，\n"
     "机器人会搜索 Emos 并列出候选，点选作品后再选季 / 集即可上传；\n"
     "也可以一步到位直接写：\n"
@@ -552,34 +546,6 @@ class TelegramBotService:
             reason = self._last_error or "未配置 bot_token / chat_id"
         return {"success": False, "message": f"发送失败: {reason}"}
 
-    def send_quick_keyboard(
-        self,
-        chat_id: Optional[str] = None,
-        text: str = "快捷操作：点下方按钮即可，无需手动输入指令。",
-    ) -> None:
-        """发送 / 刷新底部常驻快捷键盘（回复键盘）"""
-        with self._lock:
-            token = self._token
-            target_chat = str(chat_id or self._chat_id or "").strip()
-        if not token or not target_chat:
-            return
-        payload: Dict[str, Any] = {
-            "chat_id": target_chat,
-            "text": text,
-            "reply_markup": {
-                "keyboard": _QUICK_KEYBOARD,
-                "resize_keyboard": True,
-                "is_persistent": True,
-                "input_field_placeholder": "回复报错消息可搜索 / 修正目标",
-            },
-        }
-        try:
-            requests.post(
-                f"{_API_BASE}/bot{token}/sendMessage", json=payload, timeout=_SEND_TIMEOUT
-            )
-        except Exception as exc:
-            logger.debug("发送 Telegram 快捷键盘失败: %s", exc)
-
     def hide_quick_keyboard(
         self,
         chat_id: Optional[str] = None,
@@ -935,7 +901,7 @@ class TelegramBotService:
             # 底部快捷键盘按钮：把按钮文字映射回对应指令
             command = _QUICK_REPLY_MAP[text]
         if command in ("/bind", "/start", "/help") and not bound_chat:
-            self._handle_command(command, chat_id, user_id, allowed, text)
+            self._handle_command(command, chat_id, user_id, allowed)
             return
         if not bound_chat or bound_chat != chat_id:
             self.send_text(
@@ -947,7 +913,7 @@ class TelegramBotService:
             self.send_text("你没有权限操作此机器人。", chat_id=chat_id)
             return
         if command:
-            self._handle_command(command, chat_id, user_id, allowed, text)
+            self._handle_command(command, chat_id, user_id, allowed)
             return
 
         reply_to = (message.get("reply_to_message") or {}).get("message_id")
@@ -975,7 +941,6 @@ class TelegramBotService:
         chat_id: str,
         user_id: str,
         allowed: List[str],
-        raw_text: str = "",
     ) -> None:
         if allowed and user_id not in allowed:
             self.send_text("你没有权限操作此机器人。", chat_id=chat_id)
@@ -993,7 +958,7 @@ class TelegramBotService:
                     "发送 /help 查看用法，或点输入框左侧「菜单」选择指令。",
                     chat_id=chat_id,
                 )
-                self.send_quick_keyboard(chat_id)
+                self.hide_quick_keyboard(chat_id)
                 return
             self._bind_chat(chat_id)
             self.sync_command_menu()
@@ -1003,17 +968,11 @@ class TelegramBotService:
                 "点输入框左侧「菜单」或输入 / 可查看全部指令。",
                 chat_id=chat_id,
             )
-            self.send_quick_keyboard(chat_id)
+            # 只用 Telegram 原生命令菜单：顺手收起以前显示过的底部快捷键盘
+            self.hide_quick_keyboard(chat_id)
             return
         if command == "/help":
             self.send_text(_HELP_TEXT, chat_id=chat_id)
-            self.send_quick_keyboard(chat_id)
-            return
-        if command in ("/keyboard", "/menu", "/快捷栏"):
-            if raw_text.strip().lower().endswith(("off", "hide", "关闭", "收起")):
-                self.hide_quick_keyboard(chat_id)
-            else:
-                self.send_quick_keyboard(chat_id)
             return
         if command in ("/upload", "/files"):
             self._send_browse(chat_id, "", None)

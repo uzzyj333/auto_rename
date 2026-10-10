@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """Telegram 原生命令菜单（setMyCommands / 「菜单」按钮）的回归测试
 
-除了底部回复键盘，启动 / 绑定 / 测试消息时还会注册 Telegram 原生的「菜单」
-按钮和输入 / 时的命令列表，两者并存：绑定、/help 照常弹出底部快捷键盘，
-/keyboard off 可以收起。
+启动 / 绑定 / 测试消息时都会注册 Telegram 原生的「菜单」按钮和输入 / 时的
+命令列表；只用这套原生菜单，不再显示底部快捷键盘，绑定时顺手把旧键盘收起。
 """
 
 import os
@@ -81,10 +80,10 @@ class TestTelegramCommandMenu(unittest.TestCase):
             self.assertFalse(self.service.sync_command_menu())
         post.assert_not_called()
 
-    def test_bind_registers_menu_and_keeps_keyboard(self):
+    def test_bind_registers_menu_and_hides_bottom_keyboard(self):
         self.service._chat_id = "42"
         shown = []
-        keyboards = []
+        hidden = []
         with patch.object(
             TelegramBotService, "sync_command_menu", lambda self: True
         ), patch.object(
@@ -93,47 +92,18 @@ class TestTelegramCommandMenu(unittest.TestCase):
             lambda self, text, **kwargs: shown.append(text),
         ), patch.object(
             TelegramBotService,
-            "send_quick_keyboard",
-            lambda self, *a, **k: keyboards.append(True),
-        ), patch.object(
-            TelegramBotService,
-            "hide_quick_keyboard",
-            lambda self, *a, **k: self.fail("绑定后不应收起底部快捷键盘"),
-        ):
-            self.service._handle_command("/bind", "42", "1", [])
-
-        self.assertTrue(shown)
-        self.assertEqual(keyboards, [True])
-
-    def test_keyboard_off_hides_bottom_keyboard(self):
-        hidden = []
-        with patch.object(
-            TelegramBotService,
             "hide_quick_keyboard",
             lambda self, *a, **k: hidden.append(True),
         ), patch.object(
             TelegramBotService,
             "send_quick_keyboard",
-            lambda self, *a, **k: self.fail("/keyboard off 不应再显示键盘"),
+            lambda self, *a, **k: self.fail("绑定后不应再弹底部快捷键盘"),
+            create=True,
         ):
-            self.service._handle_command("/keyboard", "42", "1", [], "/keyboard off")
+            self.service._handle_command("/bind", "42", "1", [])
 
+        self.assertTrue(shown)
         self.assertEqual(hidden, [True])
-
-    def test_keyboard_on_shows_bottom_keyboard(self):
-        shown = []
-        with patch.object(
-            TelegramBotService,
-            "send_quick_keyboard",
-            lambda self, *a, **k: shown.append(True),
-        ), patch.object(
-            TelegramBotService,
-            "hide_quick_keyboard",
-            lambda self, *a, **k: self.fail("/keyboard 不应收起键盘"),
-        ):
-            self.service._handle_command("/keyboard", "42", "1", [], "/keyboard")
-
-        self.assertEqual(shown, [True])
 
 
 if __name__ == "__main__":
