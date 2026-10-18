@@ -1096,8 +1096,18 @@ class VideoFileHandler:
             # 下面的逻辑原本是: media_type = "tv" if media_type == "电视剧" else "movie"
             # 现在 renamer 直接返回标准代码，所以我们只需确保它是 tv 或 movie
             if media_type not in ["tv", "movie"]:
-                # 如果是 anime 或其他，归类为 tv
-                media_type = "tv"
+                # 类型没判定出来时（电影常见的「片名.(年份).1080p.H.265」格式）用
+                # metadata 里的原始季/集号判断：show_name 几乎总是有值，按它判断会把
+                # 电影当电视剧，拿 tmdb_type=tv 去查 Emos 会 404。
+                # 注意上面的 season/episode 已被兜底成 1/1，这里要用 metadata 的值。
+                media_type = (
+                    "tv"
+                    if (
+                        metadata.get("season") is not None
+                        or metadata.get("episode") is not None
+                    )
+                    else "movie"
+                )
 
             # 初始化匹配结果
             matched_item_id = None

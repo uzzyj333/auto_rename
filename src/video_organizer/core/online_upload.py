@@ -575,6 +575,15 @@ class OnlineUploadService:
         episode = _to_int(metadata.get("episode"))
         year = _to_int(metadata.get("year"))
 
+        if not media_type and metadata:
+            # renamer 没判定出类型时（电影常见的「片名.(年份).1080p.H.265」格式，
+            # 没有 SxxExx 也没有 WEB-DL/BluRay 这类片源标签）用「有没有季/集号」判断：
+            # show_name 几乎总是有值（电影格式里也有），按它判断会把电影当成电视剧，
+            # 接着用 tmdb_type=tv 去查 Emos（getVideoId 返回 404），
+            # 报错回复里选作品级条目时又会被当成「电视剧没选到具体某一集」卡住。
+            has_episode_info = season is not None or episode is not None
+            media_type = "tv" if has_episode_info else "movie"
+
         match: Optional[Dict[str, Any]] = None
         candidates: List[Dict[str, Any]] = []
         mapping_matched = False
@@ -642,9 +651,6 @@ class OnlineUploadService:
                 errors.append(str(exc))
             except Exception as exc:
                 errors.append(f"查询 Emos 失败: {exc}")
-
-        if not media_type and metadata:
-            media_type = "tv" if metadata.get("show_name") else "movie"
 
         return {
             "success": True,

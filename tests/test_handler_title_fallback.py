@@ -203,5 +203,70 @@ class TestTitleSearchFallback(_TempDbMixin, unittest.TestCase):
         self.assertEqual(notified, [])
 
 
+class TestMovieMediaTypeFallback(_TempDbMixin, unittest.TestCase):
+    """renamer 判不出类型（media_type=None）时电影不能按电视剧查询
+
+    以前 media_type 为空一律归类为 tv：电影文件（如
+    「梁祝.(1994).1080p.H.265.10-bit.Dolby.Digital.mkv」）会拿 tmdb_type=tv
+    去查 Emos（getVideoId 404），选中作品级条目时又会被当成
+    「电视剧必须选到具体某一集（ve）」，永远传不上去。
+    """
+
+    def setUp(self):
+        self._setup_temp_db()
+        self.handler = VideoFileHandler(
+            output_dir=self._db_tmp.name,
+            supported_extensions=[".mkv"],
+            emos_config={"auth_token": "t"},
+            processing_config={"max_upload_workers": 1},
+            config={
+                "processing": {"max_upload_workers": 1},
+                "emos": {"auth_token": "t"},
+            },
+        )
+        self.handler.probe_enabled = False
+
+    def tearDown(self):
+        self.handler.stop_upload_queue()
+        self._teardown_temp_db()
+
+    def test_movie_without_episode_uses_movie_type(self):
+        self.handler.renamer = _FakeRenamer(
+            {
+                "show_name": "梁祝",
+                "media_type": None,
+                "year": 1994,
+                "tmdb_id": "123",
+            }
+        )
+        self.handler.emos_client = _RaisingEmosClient()
+        searched = []
+
+        def fake_search(
+            self, title, media_type, season, episode, year=None, worker_id=0
+        ):
+            searched.append((title, media_type, season, episode))
+            return {"item_type": "vl", "item_id": "vl-1", "label": "梁祝"}
+
+        uploaded = []
+        with patch.object(
+            VideoFileHandler, "_search_emos_by_title", fake_search
+        ), patch.object(
+            VideoFileHandler,
+            "_execute_upload",
+            lambda self, *a, **k: uploaded.append(a),
+        ):
+            result = self.handler._process_file_internal(
+                "/media/梁祝.(1994).1080p.H.265.10-bit.Dolby.Digital.mkv", 0
+            )
+
+        self.assertTrue(result)
+        # 标题搜索兜底必须收到 movie，而不是 tv
+        self.assertEqual(searched[0][1], "movie")
+        self.assertEqual(len(uploaded), 1)
+        self.assertEqual(uploaded[0][1], "vl")
+        self.assertEqual(uploaded[0][5], "movie")
+
+
 if __name__ == "__main__":
     unittest.main()
