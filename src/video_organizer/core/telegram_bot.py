@@ -1999,9 +1999,13 @@ class TelegramBotService:
         if not media_type:
             media_type = expr.kind if expr.kind != "unknown" else ""
         video_type = "movie" if media_type == "movie" else ("tv" if media_type == "tv" else None)
+        # 回复里没写季/集时只是「按片名搜候选」：不带类型过滤。Emos 的 type 过滤
+        # 不可靠（电影被存成剧集、特别篇等都很常见），带上报错上下文里的类型会
+        # 把真实条目滤掉，用户看到的就是「电影搜不到」。写了季/集才按类型精确定位。
+        search_type = video_type if (expr.season is not None or expr.episode is not None) else None
 
         try:
-            candidates, matched_title = self._search_by_title(service, expr.title, video_type)
+            candidates, matched_title = self._search_by_title(service, expr.title, search_type)
         except Exception as exc:
             self.send_text(f"查询 Emos 失败：{exc}", reply_to=reply_to, chat_id=chat_id)
             return
@@ -2017,7 +2021,7 @@ class TelegramBotService:
             if fallback_title and fallback_title != expr.title:
                 try:
                     candidates, fallback_matched = self._search_by_title(
-                        service, fallback_title, video_type
+                        service, fallback_title, search_type
                     )
                 except Exception as exc:
                     logger.debug("用报错标题兜底搜索失败: %s", exc)

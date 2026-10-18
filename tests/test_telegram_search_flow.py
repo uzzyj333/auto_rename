@@ -132,6 +132,7 @@ class _FakeUploadService:
         self._titles = set(titles) if titles is not None else None
         self.created = []
         self.searched = []
+        self.video_types = []
 
     @classmethod
     def instance(cls):
@@ -139,6 +140,7 @@ class _FakeUploadService:
 
     def search_targets(self, video_type=None, title=None, todb_id=None):
         self.searched.append(str(title or ""))
+        self.video_types.append(video_type)
         if self._titles is not None and str(title or "") not in self._titles:
             return []
         return list(self._candidates)
@@ -298,6 +300,34 @@ class TestSearchFlow(_BotHarness):
         ]
         self.assertEqual(len(work_buttons), 1)
         self.assertIn("2024", work_buttons[0]["text"])
+
+    def test_title_only_reply_searches_without_type_filter(self):
+        """只回复片名（不带季/集）时按片名搜，不带 Emos 的 type 过滤
+
+        Emos 的 type 过滤不可靠（电影被存成剧集、特别篇…），带上报错上下文里的
+        类型会把真实条目滤掉，用户看到的就是「电影搜不到」。
+        """
+        context = dict(
+            self._context(), media_type="tv", season_number=None, episode_number=None
+        )
+        with patch(
+            "src.video_organizer.core.online_upload.OnlineUploadService",
+            _FakeUploadService,
+        ):
+            self.service._handle_correction(context, "流浪地球2", "1", 55)
+
+        self.assertEqual(self.fake.video_types, [None])
+        self._find_button("fx:work:")
+
+    def test_episode_reply_keeps_type_filter(self):
+        """回复里写了季/集时仍按报错上下文里的类型精确搜索"""
+        with patch(
+            "src.video_organizer.core.online_upload.OnlineUploadService",
+            _FakeUploadService,
+        ):
+            self.service._handle_correction(self._context(), "狂王 S02E04", "1", 55)
+
+        self.assertEqual(self.fake.video_types[0], "tv")
 
     def test_dotted_title_falls_back_to_keyword(self):
         """粘贴「狂王.Asura.S02E04」：标题搜不到时依次换关键词，最终用「狂王」搜到"""

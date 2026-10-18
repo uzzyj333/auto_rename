@@ -77,6 +77,39 @@ class TestVideoRenamer(unittest.TestCase):
         self.assertIsNotNone(metadata)
         self.assertEqual(metadata.get("extension"), ".mp4")
 
+    def test_single_letter_roman_in_title_is_not_a_season(self):
+        """
+        片名里的单字母 X / I 不能当成季号（Doctor X → S10E04 回归）
+
+        「Doctor.X.Mafia.in.White.S01E04」曾把片名里的 X 当成罗马数字第 10 季，
+        变成 S10E04 去 Emos 找上传目标，导致上传到错误条目 / 一直报错。
+        """
+        cases = {
+            "Doctor.X.Mafia.in.White.S01E04.1080p.NF.WEB-DL.DUAL.AAC2.0.H.264-RAWR.mkv": (
+                "01",
+                "04",
+            ),
+            "Spy.x.Family.S01E04.1080p.mkv": ("01", "04"),
+            "Hunter.x.Hunter.S01E04.1080p.mkv": ("01", "04"),
+        }
+        for name, (season, episode) in cases.items():
+            metadata = self.renamer._extract_with_regex(name)
+            self.assertEqual(metadata.get("season"), season, name)
+            self.assertEqual(metadata.get("episode"), episode, name)
+
+    def test_single_letter_roman_followed_by_episode_is_a_season(self):
+        """紧跟集号的单字母罗马数字（X_01）仍然当季号"""
+        metadata = self.renamer._extract_with_regex("Show.Name.X_01.1080p.mkv")
+        self.assertEqual(metadata.get("season"), "10")
+        self.assertEqual(metadata.get("episode"), "01")
+
+    def test_title_with_x_without_episode_is_not_tv_season(self):
+        """「Doctor.X.Mafia.in.White.1080p」不能变成「第 10 季剧集」"""
+        metadata = self.renamer._extract_with_regex(
+            "Doctor.X.Mafia.in.White.1080p.BluRay.x264.mkv"
+        )
+        self.assertIsNone(metadata.get("season"))
+
     def test_extract_tv_show_pattern(self):
         """
         测试从文件名提取电视剧信息的模式匹配

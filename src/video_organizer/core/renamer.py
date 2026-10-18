@@ -1536,8 +1536,9 @@ class VideoRenamer:
             # 模式 B: 极其高频误触的单字母罗马数字 (X, I) 要求后随必须是行尾或元数据标记 (防止切断 Spy x Family)
             # 修改: 前面必须是非字母数字字符，避免误识别如 IQIYI 中的 I
             r"(?P<show_name>.*?)(?<![a-zA-Z0-9])(?P<roman_season>X|I)(?=[_.:\-\[\(]|$)",
-            # 模式 C: 罗马数字季号 + 下划线 + 集号 (如 "On Call 36小時II_01")
-            r"(?P<show_name>.*?)(?P<roman_season>VIII|VII|VI|III|II|IX|IV|V)_(?P<episode>\d{1,3})",
+            # 模式 C: 罗马数字季号 + 下划线 + 集号 (如 "On Call 36小時II_01"、"Show X_01")
+            # 罗马数字必须是独立的一段（前面不能再接字母数字），避免 IQIYI_01 之类被当成季号
+            r"(?P<show_name>.*?)(?<![A-Za-z0-9])(?P<roman_season>VIII|VII|VI|III|II|IX|IV|V|X|I)_(?P<episode>\d{1,3})",
             # 2.5 匹配 "Show Name S2 - 01" 格式（季号在集号前面，用空格分隔）- 必须在 "Show Name - 09" 之前
             r"^(?P<show_name>(?!^\d+$)[A-Za-z][A-Za-z0-9\s\-\'\.]+?)\s+S(?P<season>\d+)\s*-\s*(?P<episode>\d{2,3})",
             # 2.6 匹配 "[Release Group] Show Name S2 - 01" 格式（带字幕组前缀的 S2 - 01 格式）
@@ -1701,15 +1702,19 @@ class VideoRenamer:
             if "show_name" in metadata:
                 # 1. 优先处理罗马数字转换
                 if "roman_season" in metadata and metadata["roman_season"]:
-                    digit = self._roman_to_digit(metadata["roman_season"])
-                    if digit:
-                        metadata["season"] = str(digit)
-                        # 从剧名中剔除罗马数字后缀
-                        metadata["show_name"] = re.sub(
-                            rf"\s*{metadata['roman_season']}\s*$",
-                            "",
-                            metadata["show_name"],
-                        ).strip()
+                    if self._is_roman_season(metadata, name_only):
+                        digit = self._roman_to_digit(metadata["roman_season"])
+                        if digit:
+                            metadata["season"] = str(digit)
+                            # 从剧名中剔除罗马数字后缀
+                            metadata["show_name"] = re.sub(
+                                rf"\s*{metadata['roman_season']}\s*$",
+                                "",
+                                metadata["show_name"],
+                            ).strip()
+                    else:
+                        # 片名里的 X / I（Doctor X、Spy x Family…）不是季号
+                        metadata.pop("roman_season", None)
 
                 # 接下来执行常规清理
                 show_name = metadata["show_name"]
@@ -2417,6 +2422,36 @@ class VideoRenamer:
 
         # Ensure we always return a dict (fallback when show_name not in metadata)
         return metadata or {}
+
+    @staticmethod
+    def _is_roman_season(metadata: Dict, name_only: str) -> bool:
+        """判断匹配到的罗马数字到底是季号还是片名的一部分
+
+        片名里带单字母 X / I 的情况很常见（Doctor X、Spy x Family、
+        Hunter x Hunter、Project I…），把它们当成第 10 / 第 1 季会把
+        「Doctor.X.Mafia.in.White.S01E04」识别成 S10E04，再按错误的季号去
+        Emos 里找上传目标。所以：
+
+        - 文件名里已经有明确季号（S01E04 / 第2季 …）时，罗马数字不再覆盖它；
+        - 单字母罗马数字只有紧跟集号（X_01 / X.03）时才当季号；
+        - 多字母罗马数字（II / IV / VIII…）保持原来的行为。
+        """
+        roman = str((metadata or {}).get("roman_season") or "").strip()
+        if not roman:
+            return False
+        if metadata.get("season"):
+            return False
+        if len(roman) > 1:
+            return True
+        # 单字母要按它在片名里第一次出现的位置判断，不能用「文件名里任意位置」：
+        # Doctor.X.Mafia.in.White.1080p.x264 里的 x264 会把片名中的 X「救」回来。
+        name = str(name_only or "")
+        match = re.search(
+            r"(?<![A-Za-z0-9])(?P<roman>X|I)(?=[_.:\-\[\(]|$)", name, re.IGNORECASE
+        )
+        if not match or match.group("roman").upper() != roman.upper():
+            return False
+        return bool(re.match(r"[_.:\-\[\(]?\s*\d{1,3}(?!\d)", name[match.end():]))
 
     def _roman_to_digit(self, roman: str) -> Optional[int]:
         """将罗马数字转换为阿拉伯数字 (I-X)"""
