@@ -1448,6 +1448,12 @@ class VideoRenamer:
             r"^(?P<show_name>[\u4e00-\u9fff\w\s]+?)\s*第(?P<season_cn>[一二三四五六七八九十\d]+)季\s*\((?P<year>\d{4})\)",
             # 0.13 匹配中文目录格式 "剧名(年份)" - 如 "仙武传(2024)"
             r"^(?P<show_name>[\u4e00-\u9fff\w\s]+?)\s*\((?P<year>\d{4})\)",
+            # 0.14 匹配「片名.(年份).技术信息」电影格式
+            # 如 "梁祝.(1994).1080p.H.265.10-bit.Dolby Digital.mkv"
+            # 年份带括号且用点分隔，是电影最常见的命名方式；没有这条时片名解析不出来，
+            # 会退回用父目录名当片名（如 /media/xxx.mkv → show_name=media），
+            # 再拿错误的片名去查 TMDB，结果匹配到完全不相干的条目。
+            r"^(?P<show_name>[^\[\]\(\)\{\}]+?)\s*[\(\[](?P<year>\d{4})[\)\]]",
             # 0.10 匹配 "数字-数字 剧名(年份)/SxxExx" 格式（如 6-2神国之上(2025)/S01E05）- 最高优先级
             r"^(?P<prefix>\d+-\d+)?(?P<show_name>[\u4e00-\u9fff\w\s\.\-]+?)\s*\((?P<year>\d{4})\)[\/\\]S(?P<season>\d+)E(?P<episode>\d+)",
             # 0.11 匹配 "数字-数字 剧名(年份)SxxExx" 格式（无分隔符）
@@ -1571,10 +1577,13 @@ class VideoRenamer:
             # 匹配 Show Name [12][...] (严格限制show_name不能只含数字)
             r"^(?P<show_name>(?!^\d+$).*?)\s*\[(?P<episode>\d{1,4}(?:-\d{1,4})?)\]",
             # 匹配纯中文标题 + 空格 + 集号（如 "大正偽婚～替身新娘與軍服的猛愛 8"）
-            r"^(?P<show_name>[\u4e00-\u9fff\u3000-\u303f\w\s～]+?)\s+(?P<episode>\d{1,4})(?:\s|$|\.)",
+            # 注意：集号前面不能是 "H "/"x "（编码标签 H.265 / x264 会被误当成集号，
+            # 如「梁祝.(1994).1080p.H.265.10-bit...」被识别成第 265 集）
+            r"^(?P<show_name>[\u4e00-\u9fff\u3000-\u303f\w\s～]+?)\s+(?<![HhXx]\s)(?P<episode>\d{1,4})(?:\s|$|\.)",
             # 匹配 剧名 22 [GB] (空格集号，严格限制show_name不能只含数字且不含年份，且集号必须小于1000)
             # 添加年份前向否定断言，避免将年份误识别为集号
-            r"^(?:\[[^\]]+\]\s+)?(?P<show_name>(?!^\d+$)[\u4e00-\u9fff\w\s]+?(?<!\d{4}))\s+(?P<episode>\d{1,3}(?:-\d{1,3})?)(?<!\d{4})(?:\s|$)",
+            # 同样排除 "H.265"/"x264" 这类编码标签（H.265 -> H 265 -> 第 265 集）
+            r"^(?:\[[^\]]+\]\s+)?(?P<show_name>(?!^\d+$)[\u4e00-\u9fff\w\s]+?(?<!\d{4}))\s+(?<![HhXx]\s)(?P<episode>\d{1,3}(?:-\d{1,3})?)(?<!\d{4})(?:\s|$)",
             # 匹配 [Nekomoe kissaten][Watashi wo Tabetai, Hitodenashi][12][1080p][JPSC] 格式
             r"^\[[^\]]+\]\s*\[(?P<show_name>[^\]]+)\]\s*\[(?P<episode>\d{1,4}(?:-\d{1,4})?)\]",
             # 基础降级模式 (只抓集号，添加年份排除)
@@ -2555,6 +2564,16 @@ class VideoRenamer:
         # 2. 预处理：移除括号内的技术参数和发布组
         # 质量标记正则表达式
         quality_patterns = r"HD|FHD|UHD|4K|1080p|720p|480p|360p|240p|2160p|2160|HDR|SDR|HDR10|Dolby\s*Vision|DV|dv|Dv|x264|x265|h264|h265|HEVC|AVC|MPEG4|10bit|AAC|DTS|DDP|TrueHD|Atmos|FLAC|AC3|DTS-HD|OPUS|BD|BDRip|BluRay|DVD|DVDRip|WEB|WEBRip|WEB-DL|REPACK|PROPER|INTERNAL|CHS|ENG|双语|字幕|中字|英字|简日内嵌|繁体|简体|日语版|国语版|粤语版|MP4|MKV|AVI|GB|BIG5|CHT|CHS|TC|SC|JAP|CN|JP|Dub|JP\s*Dub|TV|Web|AAC5|5\.1|7\.1|DTS"
+
+        # 2.2 移除编码标签（H.265 / H 265 / x264 / 10-bit 等）
+        # 这些标签会被「剧名 + 空格 + 数字」的集号模式误判成集号：
+        # 「梁祝.(1994).1080p.H.265.10-bit.Dolby Digital.mkv」清理后变成
+        # 「梁祝 H 265 10-bit ...」，于是 265 被当成第 265 集（S1E265），
+        # 文件被当成电视剧去查 Emos，报「电视剧必须选到具体某一集」。
+        codec_pattern = r"\b[HX]\.?\s?26[456]\b"
+        bit_depth_pattern = r"\b(?:8|10|12)\s*-?\s*bit\b"
+        cleaned = re.sub(codec_pattern, " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(bit_depth_pattern, " ", cleaned, flags=re.IGNORECASE)
 
         # 3. 移除发布组信息（方括号或末尾格式）
         cleaned = re.sub(r"\[YTS\.?LT?\]", "", cleaned, flags=re.IGNORECASE)

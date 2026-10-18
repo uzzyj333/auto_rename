@@ -110,6 +110,36 @@ class TestVideoRenamer(unittest.TestCase):
         )
         self.assertIsNone(metadata.get("season"))
 
+    def test_h265_codec_is_not_an_episode_number(self):
+        """
+        「H.265」不能被当成第 265 集（梁祝.(1994).1080p.H.265... 回归）
+
+        清理后的名字是「梁祝 H 265 10-bit ...」，会被「剧名 + 空格 + 数字」的
+        集号模式匹配成 S1E265，文件于是被当成电视剧去查 Emos，报
+        「电视剧必须选到具体某一集（ve）」。
+        """
+        metadata = self.renamer._extract_with_regex(
+            "梁祝.(1994).1080p.H.265.10-bit.Dolby Digital.mkv"
+        )
+        self.assertIsNone(metadata.get("season"))
+        self.assertIsNone(metadata.get("episode"))
+        self.assertEqual(metadata.get("show_name"), "梁祝")
+        self.assertEqual(metadata.get("year"), "1994")
+
+    def test_movie_uses_filename_not_parent_dir_as_title(self):
+        """「片名.(年份).技术信息」的电影用文件名当片名，而不是退回父目录名"""
+        movie_dir = Path(self.temp_dir) / "media"
+        movie_dir.mkdir(exist_ok=True)
+        file_name = "梁祝.(1994).1080p.H.265.10-bit.Dolby Digital.mkv"
+        test_file = movie_dir / file_name
+        test_file.write_text("dummy content")
+
+        metadata = self.renamer.extract_metadata(test_file)
+
+        self.assertEqual(metadata.get("show_name"), "梁祝")
+        self.assertIsNone(metadata.get("season"))
+        self.assertIsNone(metadata.get("episode"))
+
     def test_extract_tv_show_pattern(self):
         """
         测试从文件名提取电视剧信息的模式匹配
