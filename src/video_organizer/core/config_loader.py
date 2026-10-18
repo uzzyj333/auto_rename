@@ -203,6 +203,18 @@ DEFAULT_CONFIG = {
         "ffprobe_path": "",  # ffprobe 可执行文件路径，留空则使用 PATH
         "path_type": "local_emos_1",  # saveInternal 使用的 path_type
     },
+    "webdav": {
+        "enabled": False,  # 是否开启 Telegram「WebDAV 网盘」入口（选中文件即推送给 aria2 下载）
+        "base_url": "",  # WebDAV 服务地址，例如 https://dav.example.com
+        "root_path": "",  # 浏览根目录（相对 WebDAV 根，留空为根目录），例如 /tv
+        "username": "",
+        "password": "",
+        "verify_ssl": True,  # 自签证书的 WebDAV 可关掉校验
+        "show_all_files": False,  # 默认只列视频/字幕，开启后列出全部文件
+        "downloader": "",  # 交给哪个 aria2 实例下载（填下载器标识，如 aria2 / aria2_2），留空用第一个
+        "save_dir": "",  # aria2 下载保存目录，留空使用 aria2 默认目录
+        "timeout": 30,  # WebDAV 请求超时（秒）
+    },
     "naming": {
         "tv_show_format": "{show_name}/Season {season:02d}/{show_name} {season_episode} {quality_tags}",
         "movie_format": "{movie_name}{year_suffix}/{movie_name}{year_suffix} {quality_tags}",
@@ -238,6 +250,9 @@ DEFAULT_CONFIG = {
         "reply_enabled": True,  # 是否启用机器人回复修正（长轮询接收消息）
         "allowed_user_ids": "",  # 允许操作的用户 ID，逗号分隔，留空表示不限制
         "poll_timeout": 30,  # getUpdates 长轮询超时（秒）
+        "url_download_enabled": True,  # 机器人收到的 http/https/magnet 链接直接推给 aria2
+        "url_download_downloader": "",  # 推给哪个 aria2 实例（标识），留空用第一个
+        "url_download_save_dir": "",  # aria2 保存目录，留空用 aria2 默认目录
     },
     "llm_fallback": {"enabled": False, "max_concurrent": 2},
     "llm_provider_1": {"name": "", "api_url": "", "api_key": "", "model": "", "enabled": False, "weight": 1, "timeout": 30, "max_retries": 2},

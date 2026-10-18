@@ -20,6 +20,7 @@
 | **Web 管理后台** | FastAPI + SPA，实时仪表盘、配置管理、手动处理、日志查看 |
 | **Emos 上传** | 官方 API 上传 + 在线识别上传（浏览服务器视频、识别条目、手动选择目标），支持 TS/M2TS/ISO 视频、同目录同名字幕自动上传，以及在线上传页单独补传字幕 |
 | **Telegram 报错修正** | 上传失败推送报错到 TG，回复片名关键词搜索候选并点选作品 / 季 / 集，或直接回复「剧名SxxExx」，可用年份区分同名剧集 |
+| **TG 网盘下载** | 在 TG 里浏览 WebDAV 网盘目录，点选文件即自动推送给 aria2 下载，下载完成后照常识别上传 |
 | **下载器监控** | 自动监控 aria2 / qBittorrent 下载完成事件 |
 | **文件监控** | 目录轮询 + 文件稳定性检测，自动整理归档 |
 | **LLM 兜底** | 多 Provider 负载均衡（OpenAI / DeepSeek / 智谱等）|
@@ -160,7 +161,8 @@ python -m src.video_organizer.main --process "D:\video.mkv"
 | `[online_upload]` | 在线识别上传：视频根目录、ffprobe 开关与路径、path_type |
 | `[downloader.aria2]` | aria2 RPC 地址、密钥、监控模式（轮询/WebSocket/Webhook）|
 | `[downloader.qbittorrent]` | qBittorrent 地址、用户名、密码 |
-| `[telegram]` | Telegram Bot Token / Chat ID、通知开关、回复修正开关、允许的用户 ID、长轮询超时 |
+| `[telegram]` | Telegram Bot Token / Chat ID、通知开关、回复修正开关、允许的用户 ID、长轮询超时、链接直推 aria2（开关 / 实例 / 保存目录）|
+| `[webdav]` | WebDAV 网盘：地址 / 账号、浏览根目录、目标 aria2 实例与保存目录（TG `/webdav` 用）|
 | `[manual_rules]` | 手动规则列表（DSL 语法）|
 | `[logging]` | 日志级别、文件、控制台开关 |
 
@@ -253,9 +255,29 @@ when: 包含"1080p" => block: 4K
 - **删除任务** — 回复报错信息发送「删除」，会一并删除该文件的上传任务、
    aria2 / qBittorrent 下载任务并停止提醒
 - **失效文件不打扰** — 推送报错与定时提醒前会检查本地文件，已被移动 / 删除则不再提醒
-- **可用指令** — `/bind` 绑定会话、`/upload` 浏览本地上传、`/config` 快捷配置、
+- **可用指令** — `/bind` 绑定会话、`/upload` 浏览本地上传、`/webdav` 浏览网盘下载、`/dl` 推链接下载、
+   `/config` 快捷配置、
    `/status` 查看状态、`/keyboard` 显示快捷键盘、`/help` 查看用法
 - **在线页面** — 「在线识别上传」页面底部有机器人状态与测试消息按钮
+
+#### WebDAV 网盘 → aria2 下载
+
+在「配置管理 → WebDAV 网盘」（或 TG `/config` → WebDAV）填好地址与账号，
+可限定浏览根目录、要交给哪个 aria2 实例、以及 aria2 的保存目录，然后把 `enabled` 打开，
+之后在 Telegram 里发送 `/webdav`：
+
+- 逐层点目录进入子目录，「⬆️ 上一级 / 🏠 浏览根目录 / 🔄 刷新」用来切换位置；
+- 点某个文件就会自动用 aria2 的 `addUri` 下载（带上 WebDAV 认证头与保存目录），
+  默认只列视频 / 字幕，要连压缩包等一起列可打开 `show_all_files`；
+- 「📥 下载本目录 / 📥 含子目录」可批量推送（含子目录会递归，先弹确认再推送，单次上限 200 个）；
+- 下载完成后走原有流程：下载器监控识别 → 刮削 → 上传 Emos，无需再手动操作。
+
+#### 直接发链接下载
+
+把 http/https 直链或磁力链直接发给机器人（或写成 `/dl 链接1 链接2`），就会推给 aria2 下载，
+单条消息最多 5 个链接；交给哪个 aria2 实例、存到哪个目录由
+`[telegram]` 的 `url_download_downloader` / `url_download_save_dir` 决定，
+不想要这个自动识别可以在 `/config` 里关掉「消息里的链接推给 aria2」。
 
 ### 下载器集成
 

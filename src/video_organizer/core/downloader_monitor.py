@@ -271,6 +271,113 @@ def remove_downloader_tasks(
     return removed
 
 
+def find_downloader_instance(
+    config: Optional[Dict[str, Any]],
+    identifier: str = "",
+    downloader_type: str = "aria2",
+) -> Optional[Dict[str, Any]]:
+    """从配置里挑一个下载器实例（优先按标识精确匹配，其次同类型的第一个）
+
+    供「把下载直链推送给 aria2」使用：``downloaders`` 里的每个实例由
+    ``[downloader.<标识>]`` 配置节生成；``identifier`` 为空时退化为同类型第一个。
+    """
+    items = (config or {}).get("downloaders") or []
+    wanted = str(identifier or "").strip().lower()
+    wanted_type = str(downloader_type or "").strip().lower()
+    fallback: Optional[Dict[str, Any]] = None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").strip().lower()
+        if wanted_type and item_type and item_type != wanted_type:
+            continue
+        item_id = str(item.get("id") or "").strip().lower()
+        if wanted and item_id == wanted:
+            return item
+        if fallback is None:
+            fallback = item
+    return fallback
+
+
+def aria2_rpc_url(instance: Optional[Dict[str, Any]]) -> str:
+    """取 aria2 实例的 RPC 地址（没写 rpc_url 时用 host / port 拼）"""
+    instance = instance or {}
+    url = str(instance.get("rpc_url") or "").strip()
+    if url:
+        return url
+    host = str(instance.get("host") or "localhost").strip()
+    port = str(instance.get("port") or "6800").strip()
+    return f"http://{host}:{port}/jsonrpc"
+
+
+def aria2_add_uri(
+    instance: Optional[Dict[str, Any]],
+    uris: List[str],
+    options: Optional[Dict[str, Any]] = None,
+    timeout: int = 30,
+) -> str:
+    """调用 ``aria2.addUri`` 添加下载任务，返回 gid（失败抛 RuntimeError）"""
+    instance = instance or {}
+    rpc_url = aria2_rpc_url(instance)
+    secret = str(instance.get("secret") or instance.get("password") or "").strip()
+    params: List[Any] = []
+    if secret:
+        params.append(f"token:{secret}")
+    params.append([str(uri) for uri in uris])
+    params.append(dict(options or {}))
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "video-organizer",
+        "method": "aria2.addUri",
+        "params": params,
+    }
+    try:
+        response = requests.post(
+            rpc_url,
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        body = response.json()
+    except requests.RequestException as exc:
+        raise RuntimeError(f"连接 aria2 失败：{exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError("aria2 返回了无法解析的数据") from exc
+    error = body.get("error") if isinstance(body, dict) else None
+    if error:
+        message = error.get("message") if isinstance(error, dict) else str(error)
+        raise RuntimeError(f"aria2 拒绝任务：{message}")
+    gid = body.get("result") if isinstance(body, dict) else None
+    if not gid:
+        raise RuntimeError("aria2 未返回任务 ID")
+    return str(gid)
+
+
+def push_uri_to_aria2(
+    config: Optional[Dict[str, Any]],
+    uri: str,
+    downloader_id: str = "",
+    options: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """把一条下载直链推送给配置里的 aria2 实例，返回 ``{gid, downloader, uri}``
+
+    找不到 aria2 实例或推送失败时抛 ``RuntimeError``，由调用方（Telegram
+    机器人）把原因直接回给用户。
+    """
+    if not uri:
+        raise RuntimeError("下载直链为空")
+    instance = find_downloader_instance(config, downloader_id, "aria2")
+    if not instance:
+        raise RuntimeError("未配置 aria2 下载器，请先在 Web「下载器管理」添加 aria2")
+    gid = aria2_add_uri(instance, [uri], options)
+    return {
+        "gid": gid,
+        "downloader": str(instance.get("name") or instance.get("id") or "aria2"),
+        "uri": uri,
+    }
+
+
 class Aria2Monitor(DownloaderMonitor):
     """
     Monitor for aria2 downloader.

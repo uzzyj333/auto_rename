@@ -58,6 +58,8 @@ _QUICK_REPLY_MAP = {
 # 原生命令菜单（setMyCommands）：输入框左侧「菜单」按钮 + 输入 / 时的命令列表
 _BOT_COMMANDS = [
     {"command": "upload", "description": "浏览本地文件：上传 / 删除文件或文件夹"},
+    {"command": "webdav", "description": "WebDAV 网盘：选中文件推送给 aria2 下载"},
+    {"command": "dl", "description": "把下载链接（http/https/磁力）推给 aria2 下载"},
     {"command": "config", "description": "快捷配置：布尔开关与常用参数"},
     {"command": "status", "description": "查看机器人运行状态"},
     {"command": "help", "description": "查看用法：修正目标 / 删除任务"},
@@ -82,14 +84,45 @@ _CN_DIGITS = {
     "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
 }
 
+# 消息里可以直接推送给 aria2 的下载链接：http(s) 直链 / 磁力
+_URL_PATTERN = re.compile(
+    r"(?:https?://|magnet:\?)[^\s<>\"'（）()【】,，;；]+", re.IGNORECASE
+)
+_URL_TRAILING_CHARS = "）)】」，。.;；;>、"
+_MAX_URLS_PER_MESSAGE = 5  # 单条消息最多推送几个链接，避免一次刷出太多任务
+
+
+def _extract_urls(text: Any, limit: int = _MAX_URLS_PER_MESSAGE) -> List[str]:
+    """从一条消息里挑出可下载的链接（http/https/磁力），去重并去掉尾部标点
+
+    用户常直接粘贴带中文标点的链接（``https://x/y.mkv。``）或把链接混在说明文字里，
+    这里统一清洗，避免把标点当成 URL 的一部分推给 aria2。
+    """
+    urls: List[str] = []
+    for match in _URL_PATTERN.findall(str(text or "")):
+        url = match.strip().rstrip(_URL_TRAILING_CHARS)
+        if url and url not in urls:
+            urls.append(url)
+        if len(urls) >= max(1, int(limit)):
+            break
+    return urls
+
+
 _HELP_TEXT = (
     "可用指令：\n"
     "/bind  绑定当前会话（把 chat_id 写回配置）\n"
     "/upload  浏览本地文件：上传 / 删除文件或文件夹\n"
-    "/config  快捷配置（开关）+「处理配置」/「Emos API」\n"
+    "/webdav  浏览 WebDAV 网盘：选中文件即推送给 aria2 下载\n"
+    "/dl  把下载链接（http/https/磁力）直接推给 aria2 下载\n"
+    "/config  快捷配置（开关）+「处理配置」/「Emos API」/「WebDAV 网盘」\n"
     "/status  查看机器人状态\n"
     "/help  查看本帮助\n\n"
     "点输入框左侧「菜单」或输入「/」查看全部指令\n\n"
+    "WebDAV 网盘下载：先在 Web「配置管理 → WebDAV 网盘」（或 /config → WebDAV）\n"
+    "填好地址 / 账号（可选浏览根目录与保存目录），之后 /webdav 逐层点目录，\n"
+    "点某个文件就会自动交给 aria2 下载，下载完成后照常自动识别上传。\n\n"
+    "直接下载：把链接（http/https/磁力）发给机器人即可推送 aria2；\n"
+    "也可以用 /dl 链接1 链接2 一次推多个（单条最多 5 个）。\n\n"
     "修正上传目标：直接「回复」某条报错信息并发送片名关键词，\n"
     "机器人会搜索 Emos 并列出候选，点选作品后再选季 / 集即可上传；\n"
     "也可以一步到位直接写：\n"
@@ -901,7 +934,7 @@ class TelegramBotService:
             # 底部快捷键盘按钮：把按钮文字映射回对应指令
             command = _QUICK_REPLY_MAP[text]
         if command in ("/bind", "/start", "/help") and not bound_chat:
-            self._handle_command(command, chat_id, user_id, allowed)
+            self._handle_command(command, chat_id, user_id, allowed, text)
             return
         if not bound_chat or bound_chat != chat_id:
             self.send_text(
@@ -913,7 +946,7 @@ class TelegramBotService:
             self.send_text("你没有权限操作此机器人。", chat_id=chat_id)
             return
         if command:
-            self._handle_command(command, chat_id, user_id, allowed)
+            self._handle_command(command, chat_id, user_id, allowed, text)
             return
 
         reply_to = (message.get("reply_to_message") or {}).get("message_id")
@@ -922,6 +955,11 @@ class TelegramBotService:
             with self._lock:
                 context = self._replies.get(str(reply_to))
         if context is None:
+            # 没有回复上下文：消息里若是下载链接，直接推给 aria2
+            urls = _extract_urls(text)
+            if urls and self._url_download_enabled():
+                self._start_url_download(urls, chat_id)
+                return
             self.send_text(
                 "请直接「回复」某条报错信息来修正上传目标，或发送 /help 查看用法。",
                 chat_id=chat_id,
@@ -941,6 +979,7 @@ class TelegramBotService:
         chat_id: str,
         user_id: str,
         allowed: List[str],
+        text: str = "",
     ) -> None:
         if allowed and user_id not in allowed:
             self.send_text("你没有权限操作此机器人。", chat_id=chat_id)
@@ -977,6 +1016,28 @@ class TelegramBotService:
         if command in ("/upload", "/files"):
             self._send_browse(chat_id, "", None)
             return
+        if command in ("/webdav", "/wd", "/netdisk"):
+            # 列目录要访问远端，放到后台线程，避免阻塞长轮询
+            threading.Thread(
+                target=self._send_webdav_browse,
+                args=(chat_id, "", None, 0),
+                name="telegram-webdav-browse",
+                daemon=True,
+            ).start()
+            return
+        if command in ("/dl", "/url", "/download", "/push"):
+            urls = _extract_urls(text)
+            if not urls:
+                self.send_text(
+                    "用法：/dl <下载链接>，可以一次写多个，例如：\n"
+                    "/dl https://example.com/a.mkv\n"
+                    "/dl magnet:?xt=urn:btih:xxxx\n"
+                    "（也可以直接把链接发给机器人，效果相同）",
+                    chat_id=chat_id,
+                )
+                return
+            self._start_url_download(urls, chat_id)
+            return
         if command in ("/config", "/设置"):
             self._send_config_menu(chat_id)
             return
@@ -984,6 +1045,69 @@ class TelegramBotService:
             self.send_text(self._status_text(), chat_id=chat_id)
             return
         self.send_text("未知指令，发送 /help 查看用法。", chat_id=chat_id)
+
+    # ------------------------------------------------------------------
+    # 直接推送下载链接（/dl + 消息里的 http/https/magnet）
+    # ------------------------------------------------------------------
+
+    def _telegram_section(self) -> Dict[str, Any]:
+        """当前 [telegram] 配置节（没有该节时返回空字典）"""
+        config = self._current_config()
+        section = config.get("telegram") if isinstance(config, dict) else None
+        return section if isinstance(section, dict) else {}
+
+    def _url_download_enabled(self) -> bool:
+        """是否允许把消息里的链接直接推给 aria2（默认开启）"""
+        return bool(self._telegram_section().get("url_download_enabled", True))
+
+    def _start_url_download(self, urls: List[str], chat_id: str) -> None:
+        """把链接交给后台线程推送（推送要走网络，别阻塞长轮询）"""
+        self.send_text(
+            f"⏳ 收到 {len(urls)} 个下载链接，正在推送给 aria2…", chat_id=chat_id
+        )
+        threading.Thread(
+            target=self._push_urls,
+            args=(urls, chat_id),
+            name="telegram-url-download",
+            daemon=True,
+        ).start()
+
+    def _push_urls(self, urls: List[str], chat_id: str) -> None:
+        """把链接逐个推给 aria2，并把结果（任务 ID / 失败原因）回给用户"""
+        from .downloader_monitor import find_downloader_instance, push_uri_to_aria2
+
+        config = self._current_config()
+        telegram = self._telegram_section()
+        downloader_id = str(telegram.get("url_download_downloader") or "").strip()
+        options: Dict[str, Any] = {}
+        save_dir = str(telegram.get("url_download_save_dir") or "").strip()
+        if save_dir:
+            options["dir"] = save_dir
+        done: List[Tuple[str, str]] = []
+        failed: List[Tuple[str, str]] = []
+        for url in urls[:_MAX_URLS_PER_MESSAGE]:
+            try:
+                result = push_uri_to_aria2(config, url, downloader_id, options or None)
+                done.append((url, str(result.get("gid") or "")))
+            except RuntimeError as exc:
+                failed.append((url, str(exc)))
+        instance = find_downloader_instance(config, downloader_id, "aria2")
+        label = str(
+            (instance or {}).get("name") or (instance or {}).get("id") or "aria2"
+        )
+        lines: List[str] = []
+        if done:
+            lines.append(f"⬇️ 已加入 {label} 下载：{len(done)} 个")
+            for url, gid in done:
+                lines.append(f"· {_shorten_text(url, 60)}\n  任务：{gid}")
+        if failed:
+            lines.append(f"❌ 推送失败：{len(failed)} 个")
+            for url, reason in failed:
+                lines.append(f"· {_shorten_text(url, 60)}\n  {reason}")
+        if save_dir and done:
+            lines.append(f"保存目录：{save_dir}")
+        lines.append("下载完成后会自动识别并上传。")
+        self.send_text("\n".join(lines)[:_MAX_MESSAGE_CHARS], chat_id=chat_id)
 
     # ------------------------------------------------------------------
     # 选择本地上传文件（/upload + 内联按钮）
@@ -1239,6 +1363,408 @@ class TelegramBotService:
                 lines.append(f"…… 其余 {omitted} 个（名称过长已省略，可翻页查看）")
         self._send_keyboard(chat_id, "\n".join(lines), rows, edit_message_id)
 
+    # ------------------------------------------------------------------
+    # WebDAV 网盘（/webdav + 内联按钮）：选中文件即交给 aria2 下载
+    # ------------------------------------------------------------------
+
+    _WEBDAV_ROOT_LABEL = "🏠 浏览根目录"
+    _MAX_WEBDAV_BATCH = 200  # 单次批量推送最多多少个文件
+    _MAX_WEBDAV_DEPTH = 6  # 「含子目录」最多递归几层
+
+    def _webdav_section(self) -> Dict[str, Any]:
+        """当前 [webdav] 配置节（没有该节时返回空字典）"""
+        config = self._current_config()
+        section = config.get("webdav") if isinstance(config, dict) else None
+        return section if isinstance(section, dict) else {}
+
+    def _send_webdav_browse(
+        self,
+        chat_id: str,
+        path: str = "",
+        edit_message_id: Optional[int] = None,
+        page: int = 0,
+    ) -> None:
+        """展示 WebDAV 目录键盘：点目录进去，点文件直接推送给 aria2 下载"""
+        from .webdav_client import WebDAVError, client_from_config, normalize_path
+
+        section = self._webdav_section()
+        if not section.get("enabled"):
+            self.send_text(
+                "WebDAV 网盘入口未开启：在 /config → WebDAV 打开开关，"
+                "并填好 WebDAV 地址（Web「配置管理 → WebDAV 网盘」里也可修改）。",
+                chat_id=chat_id,
+            )
+            return
+        try:
+            client = client_from_config({"webdav": section})
+        except WebDAVError as exc:
+            self.send_text(f"WebDAV 配置有误：{exc}", chat_id=chat_id)
+            return
+
+        root = normalize_path(section.get("root_path") or "/")
+        target = normalize_path(path) if path else root
+        # 不允许用 ../ 跳出配置的浏览根目录
+        if root != "/" and target != root and not target.startswith(root + "/"):
+            target = root
+        try:
+            entries = client.list_dir(target)
+        except WebDAVError as exc:
+            self.send_text(f"读取 WebDAV 目录失败：{exc}", chat_id=chat_id)
+            return
+
+        show_all = bool(section.get("show_all_files"))
+        dirs = sorted(
+            [item for item in entries if item.get("is_dir")],
+            key=lambda item: str(item.get("name") or "").lower(),
+        )
+        files = self._webdav_files(entries, show_all)
+
+        all_entries: List[Dict[str, Any]] = [dict(item, kind="dir") for item in dirs]
+        all_entries += [dict(item, kind="file") for item in files]
+        total = len(all_entries)
+        total_pages = max(1, (total + _BROWSE_PAGE_SIZE - 1) // _BROWSE_PAGE_SIZE)
+        try:
+            page = int(page)
+        except (TypeError, ValueError):
+            page = 0
+        page = max(0, min(page, total_pages - 1))
+        page_entries = all_entries[
+            page * _BROWSE_PAGE_SIZE : (page + 1) * _BROWSE_PAGE_SIZE
+        ]
+
+        rows: List[List[Dict[str, str]]] = []
+        nav_row: List[Dict[str, str]] = []
+        if target != root:
+            parent = target.rsplit("/", 1)[0] or "/"
+            nav_row.append(
+                {
+                    "text": "⬆️ 上一级",
+                    "callback_data": f"wd:ls:{self._token_for_path(parent)}:0",
+                }
+            )
+        nav_row.append(
+            {
+                "text": self._WEBDAV_ROOT_LABEL,
+                "callback_data": f"wd:ls:{self._token_for_path(root)}:0",
+            }
+        )
+        nav_row.append(
+            {
+                "text": "🔄 刷新",
+                "callback_data": f"wd:ls:{self._token_for_path(target)}:{page}",
+            }
+        )
+        rows.append(nav_row)
+
+        action_row: List[Dict[str, str]] = []
+        if files:
+            action_row.append(
+                {
+                    "text": f"📥 下载本目录（{len(files)}）",
+                    "callback_data": f"wd:push:{self._token_for_path(target)}:dir",
+                }
+            )
+        if dirs:
+            action_row.append(
+                {
+                    "text": "📥 含子目录",
+                    "callback_data": f"wd:push:{self._token_for_path(target)}:tree",
+                }
+            )
+        if action_row:
+            rows.append(action_row)
+
+        listing: List[str] = []
+        for number, entry in enumerate(page_entries, start=1):
+            token = self._token_for_path(str(entry.get("path")))
+            name = str(entry.get("name") or "")
+            if entry["kind"] == "dir":
+                rows.append(
+                    [
+                        {
+                            "text": f"📂 {_shorten_text(name, 40)}",
+                            "callback_data": f"wd:ls:{token}:0",
+                        }
+                    ]
+                )
+                listing.append(f"{number}. 📁 {name}/")
+                continue
+            size_text = _format_size(entry.get("size"))
+            suffix = f"（{size_text}）" if size_text else ""
+            rows.append(
+                [
+                    {
+                        "text": f"⬇️ {_shorten_text(name, 36)}{suffix}",
+                        "callback_data": f"wd:get:{token}",
+                    }
+                ]
+            )
+            listing.append(f"{number}. 🎬 {name}{suffix}")
+
+        if total_pages > 1:
+            nav: List[Dict[str, str]] = []
+            if page > 0:
+                nav.append(
+                    {
+                        "text": "⬅️ 上一页",
+                        "callback_data": (
+                            f"wd:ls:{self._token_for_path(target)}:{page - 1}"
+                        ),
+                    }
+                )
+            nav.append(
+                {"text": f"{page + 1}/{total_pages}", "callback_data": "wd:noop"}
+            )
+            if page < total_pages - 1:
+                nav.append(
+                    {
+                        "text": "下一页 ➡️",
+                        "callback_data": (
+                            f"wd:ls:{self._token_for_path(target)}:{page + 1}"
+                        ),
+                    }
+                )
+            rows.append(nav)
+        if not page_entries:
+            rows.append(
+                [{"text": "（此目录没有可下载文件）", "callback_data": "wd:noop"}]
+            )
+
+        downloader = str(section.get("downloader") or "").strip()
+        if not downloader:
+            from .downloader_monitor import find_downloader_instance
+
+            instance = find_downloader_instance(self._current_config(), "", "aria2")
+            downloader = str(
+                (instance or {}).get("name") or (instance or {}).get("id") or "aria2"
+            )
+        lines = [
+            f"WebDAV：{client.base_url}{'' if target == '/' else target}",
+            f"子目录 {len(dirs)} 个 · 文件 {len(files)} 个"
+            f"（点文件即交给 {downloader} 下载）",
+        ]
+        if not show_all:
+            lines.append(
+                "默认只列视频 / 字幕；要显示全部文件可改 webdav.show_all_files。"
+            )
+        if listing:
+            lines.append("")
+            lines.append("本页完整名称：")
+            lines.extend(listing)
+        self._send_keyboard(chat_id, "\n".join(lines), rows, edit_message_id)
+
+    def _webdav_download(self, path: str, chat_id: str) -> None:
+        """把选中的 WebDAV 文件推送给 aria2 下载（下载完成后照常自动识别上传）"""
+        from .downloader_monitor import push_uri_to_aria2
+        from .webdav_client import WebDAVError, client_from_config, normalize_path
+
+        section = self._webdav_section()
+        try:
+            client = client_from_config({"webdav": section})
+        except WebDAVError as exc:
+            self.send_text(f"WebDAV 配置有误：{exc}", chat_id=chat_id)
+            return
+        norm = normalize_path(path)
+        name = os.path.basename(norm.rstrip("/")) or "download"
+        save_dir = str(section.get("save_dir") or "").strip()
+        options = self._webdav_aria2_options(section, client, name)
+        try:
+            result = push_uri_to_aria2(
+                self._current_config(),
+                client.url_for(norm),
+                str(section.get("downloader") or ""),
+                options,
+            )
+        except RuntimeError as exc:
+            self.send_text(
+                f"❌ 推送到 aria2 失败：{exc}\n文件：{name}", chat_id=chat_id
+            )
+            return
+        lines = [
+            "⬇️ 已加入 aria2 下载",
+            f"文件：{name}",
+            f"下载器：{result.get('downloader')}",
+            f"任务：{result.get('gid')}",
+        ]
+        if save_dir:
+            lines.append(f"保存目录：{save_dir}")
+        lines.append("下载完成后会自动识别并上传。")
+        self.send_text("\n".join(lines), chat_id=chat_id)
+
+    @staticmethod
+    def _webdav_files(
+        entries: List[Dict[str, Any]], show_all: bool
+    ) -> List[Dict[str, Any]]:
+        """从目录条目里挑出可下载的文件（默认只保留视频 / 字幕）"""
+        files: List[Dict[str, Any]] = []
+        for item in entries:
+            if item.get("is_dir"):
+                continue
+            suffix = Path(str(item.get("path") or "")).suffix.lower()
+            if show_all or suffix in _UPLOAD_FILE_EXTENSIONS:
+                files.append(item)
+        files.sort(key=lambda item: str(item.get("name") or "").lower())
+        return files
+
+    @staticmethod
+    def _webdav_aria2_options(
+        section: Dict[str, Any], client: Any, name: str
+    ) -> Dict[str, Any]:
+        """aria2 下载该 WebDAV 文件需要的选项（保存目录 / 认证头 / 证书校验）"""
+        options: Dict[str, Any] = {"out": name}
+        save_dir = str(section.get("save_dir") or "").strip()
+        if save_dir:
+            options["dir"] = save_dir
+        header = client.auth_header()
+        if header:
+            # aria2 直接取 WebDAV 直链时需要带认证头
+            options["header"] = [f"Authorization: {header}"]
+        if not client.verify_ssl:
+            options["check-certificate"] = "false"
+        return options
+
+    def _webdav_collect(
+        self, client: Any, target: str, scope: str, show_all: bool
+    ) -> List[Dict[str, Any]]:
+        """收集要批量下载的文件（dir=仅当前目录，tree=递归子目录，带上限保护）"""
+        from .webdav_client import WebDAVError
+
+        if scope != "tree":
+            return self._webdav_files(client.list_dir(target), show_all)[
+                : self._MAX_WEBDAV_BATCH
+            ]
+        collected: List[Dict[str, Any]] = []
+        seen: set = set()
+        queue = [target]
+        depth = 0
+        while (
+            queue
+            and depth < self._MAX_WEBDAV_DEPTH
+            and len(collected) < self._MAX_WEBDAV_BATCH
+        ):
+            depth += 1
+            next_queue: List[str] = []
+            for folder in queue:
+                try:
+                    entries = client.list_dir(folder)
+                except WebDAVError as exc:
+                    logger.debug("批量下载跳过目录 %s：%s", folder, exc)
+                    continue
+                for entry in entries:
+                    if entry.get("is_dir"):
+                        next_queue.append(str(entry.get("path")))
+                for item in self._webdav_files(entries, show_all):
+                    path = str(item.get("path") or "")
+                    if not path or path in seen:
+                        continue
+                    seen.add(path)
+                    collected.append(item)
+            queue = next_queue
+        return collected[: self._MAX_WEBDAV_BATCH]
+
+    def _webdav_confirm_push(
+        self,
+        chat_id: str,
+        path: str,
+        scope: str,
+        edit_message_id: Optional[int] = None,
+    ) -> None:
+        """批量下载前先统计数量并让用户确认，避免误点把整个网盘拉下来"""
+        from .downloader_monitor import find_downloader_instance
+        from .webdav_client import WebDAVError, client_from_config, normalize_path
+
+        section = self._webdav_section()
+        try:
+            client = client_from_config({"webdav": section})
+            target = normalize_path(path)
+            files = self._webdav_collect(
+                client, target, scope, bool(section.get("show_all_files"))
+            )
+        except WebDAVError as exc:
+            self.send_text(f"读取 WebDAV 目录失败：{exc}", chat_id=chat_id)
+            return
+        if not files:
+            self._send_keyboard(
+                chat_id, "该范围里没有可下载的文件。", [], edit_message_id
+            )
+            return
+        downloader_id = str(section.get("downloader") or "").strip()
+        instance = find_downloader_instance(
+            self._current_config(), downloader_id, "aria2"
+        )
+        label = str(
+            (instance or {}).get("name") or (instance or {}).get("id") or "aria2"
+        )
+        preview = "\n".join(
+            f"· {_shorten_text(str(item.get('name') or ''), 40)}" for item in files[:5]
+        )
+        if len(files) > 5:
+            preview += f"\n…… 共 {len(files)} 个"
+        scope_text = "含子目录" if scope == "tree" else "仅当前目录"
+        rows = [
+            [
+                {
+                    "text": f"✅ 确认推送 {len(files)} 个",
+                    "callback_data": (
+                        f"wd:pushok:{self._token_for_path(target)}:{scope}"
+                    ),
+                },
+                {"text": "↩️ 取消", "callback_data": "wd:pushcancel"},
+            ]
+        ]
+        self._send_keyboard(
+            chat_id,
+            f"确认把{scope_text}的 {len(files)} 个文件交给 {label} 下载？\n{preview}",
+            rows,
+            edit_message_id,
+        )
+
+    def _webdav_push_batch(self, path: str, scope: str, chat_id: str) -> None:
+        """批量把目录里的文件推给 aria2 下载（tree 会递归子目录）"""
+        from .downloader_monitor import find_downloader_instance, push_uri_to_aria2
+        from .webdav_client import WebDAVError, client_from_config, normalize_path
+
+        section = self._webdav_section()
+        try:
+            client = client_from_config({"webdav": section})
+            target = normalize_path(path)
+            files = self._webdav_collect(
+                client, target, scope, bool(section.get("show_all_files"))
+            )
+        except WebDAVError as exc:
+            self.send_text(f"读取 WebDAV 目录失败：{exc}", chat_id=chat_id)
+            return
+        if not files:
+            self.send_text("该范围里没有可下载的文件。", chat_id=chat_id)
+            return
+        config = self._current_config()
+        downloader_id = str(section.get("downloader") or "").strip()
+        done = 0
+        failed: List[Tuple[str, str]] = []
+        for item in files:
+            name = str(item.get("name") or "")
+            try:
+                push_uri_to_aria2(
+                    config,
+                    client.url_for(str(item.get("path"))),
+                    downloader_id,
+                    self._webdav_aria2_options(section, client, name),
+                )
+                done += 1
+            except RuntimeError as exc:
+                failed.append((name, str(exc)))
+        instance = find_downloader_instance(config, downloader_id, "aria2")
+        label = str(
+            (instance or {}).get("name") or (instance or {}).get("id") or "aria2"
+        )
+        lines = [f"⬇️ 已交给 {label} 批量下载：成功 {done} 个"]
+        if failed:
+            lines[0] += f"，失败 {len(failed)} 个"
+            for name, reason in failed[:3]:
+                lines.append(f"· {_shorten_text(name, 40)}：{reason}")
+        lines.append("下载完成后会自动识别并上传。")
+        self.send_text("\n".join(lines), chat_id=chat_id)
+
     def _send_delete_confirm(self, chat_id: str, path: str) -> None:
         """发送删除确认（文件/目录），避免误删"""
         from .online_upload import OnlineUploadService
@@ -1406,6 +1932,77 @@ class TelegramBotService:
             if data == "up:delcancel":
                 self._answer_callback(query_id, "已取消")
                 self._send_keyboard(chat_id, "已取消删除。", [], message_id)
+                return
+            if data == "wd:noop":
+                self._answer_callback(query_id, "")
+                return
+            if data.startswith("wd:ls:"):
+                payload = data[len("wd:ls:") :]
+                token, _, page_text = payload.partition(":")
+                path = self._path_for_token(token)
+                self._answer_callback(query_id, "")
+                if path is None:
+                    self.send_text("目录已过期，请重新发送 /webdav", chat_id=chat_id)
+                    return
+                try:
+                    page = int(page_text) if page_text else 0
+                except ValueError:
+                    page = 0
+                # 列远端目录要走网络，放到后台线程，避免阻塞长轮询
+                threading.Thread(
+                    target=self._send_webdav_browse,
+                    args=(chat_id, path, message_id, page),
+                    name="telegram-webdav-browse",
+                    daemon=True,
+                ).start()
+                return
+            if data.startswith("wd:get:"):
+                path = self._path_for_token(data[len("wd:get:") :])
+                self._answer_callback(query_id, "已推送给 aria2…")
+                if path is None:
+                    self.send_text("条目已过期，请重新发送 /webdav", chat_id=chat_id)
+                    return
+                threading.Thread(
+                    target=self._webdav_download,
+                    args=(path, chat_id),
+                    name="telegram-webdav-download",
+                    daemon=True,
+                ).start()
+                return
+            if data.startswith("wd:push:"):
+                payload = data[len("wd:push:") :]
+                token, _, scope = payload.partition(":")
+                path = self._path_for_token(token)
+                self._answer_callback(query_id, "")
+                if path is None:
+                    self.send_text("目录已过期，请重新发送 /webdav", chat_id=chat_id)
+                    return
+                # 递归统计可能要多次 PROPFIND，放到后台线程
+                threading.Thread(
+                    target=self._webdav_confirm_push,
+                    args=(chat_id, path, scope or "dir", message_id),
+                    name="telegram-webdav-batch",
+                    daemon=True,
+                ).start()
+                return
+            if data.startswith("wd:pushok:"):
+                payload = data[len("wd:pushok:") :]
+                token, _, scope = payload.partition(":")
+                path = self._path_for_token(token)
+                self._answer_callback(query_id, "开始推送…")
+                if path is None:
+                    self.send_text("目录已过期，请重新发送 /webdav", chat_id=chat_id)
+                    return
+                threading.Thread(
+                    target=self._webdav_push_batch,
+                    args=(path, scope or "dir", chat_id),
+                    name="telegram-webdav-batch",
+                    daemon=True,
+                ).start()
+                return
+            if data == "wd:pushcancel":
+                self._answer_callback(query_id, "已取消")
+                self._send_keyboard(chat_id, "已取消批量下载。", [], message_id)
                 return
             if data == "cfg:root":
                 self._answer_callback(query_id, "")
@@ -1676,6 +2273,7 @@ class TelegramBotService:
     _CONFIG_SECTIONS = {
         "processing": "处理配置",
         "emos": "Emos API",
+        "webdav": "WebDAV 网盘",
     }
 
     # 快捷配置：布尔项以开关呈现，点按即切换
@@ -1686,6 +2284,8 @@ class TelegramBotService:
         ("guessit", "enabled", "GuessIt 增强识别"),
         ("llm_fallback", "enabled", "LLM 兜底识别"),
         ("monitoring", "enable_directory_monitor", "目录监控"),
+        ("webdav", "enabled", "WebDAV 网盘下载"),
+        ("telegram", "url_download_enabled", "消息里的链接推给 aria2"),
     ]
     # 快捷配置：需要输入数值/文本的项
     _QUICK_INPUTS = [
