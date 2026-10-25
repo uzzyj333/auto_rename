@@ -147,6 +147,9 @@ class VideoFileHandler:
         self._queued_files = set()  # 追踪队列中的文件，防止重复添加
         self._queue_lock = threading.Lock()  # 队列操作锁，防止竞态条件
         self._file_downloader_map = {}  # 文件到下载器的映射，用于删除下载任务
+        # 用户明确「删除该任务」后取消的文件：自动重试 / 回调不再处理，
+        # 直到用户重新手动上传或强制处理（避免删了通知又被重试重新推回来）
+        self._cancelled_files = set()
 
         # 上传队列配置
         self._upload_queue = Queue()  # 上传队列
@@ -504,6 +507,9 @@ class VideoFileHandler:
 
         同一文件的同类报错 5 分钟内只推一次，用户可回复该消息修正目标后重传。
         """
+        if self.is_cancelled(file_path):
+            self.logger.debug(f"文件已被用户取消，跳过报错通知: {file_path}")
+            return
         try:
             from .telegram_bot import TelegramBotService
 
@@ -809,6 +815,9 @@ class VideoFileHandler:
         if not os.path.exists(file_path):
             self.logger.warning(f"文件不存在: {file_path}")
             return False
+        if self.is_cancelled(file_path):
+            self.logger.debug(f"文件已被用户取消，跳过处理: {file_path}")
+            return False
 
         # 检查文件类型
         is_subtitle = self._is_subtitle_file(file_path)
@@ -896,6 +905,10 @@ class VideoFileHandler:
         内部文件处理逻辑（包含元数据获取、API调用、上传）
         """
         console_log(f"\n🔍 [线程#{worker_id}] 开始深入处理文件: {file_path}")
+
+        if self.is_cancelled(file_path):
+            console_log(f"⏭️ [线程#{worker_id}] 文件已被用户取消，跳过: {os.path.basename(file_path)}")
+            return False
 
         try:
             # 第一步：获取视频的tmdbid和media_type (使用本地 Renamer + TMDB Client)
@@ -1531,6 +1544,7 @@ class VideoFileHandler:
         Returns:
             是否处理成功
         """
+        self.resume_file(file_path)
         try:
             if not os.path.exists(file_path):
                 log_failure(self.logger, f"文件不存在: {file_path}")
@@ -1594,6 +1608,51 @@ class VideoFileHandler:
         else:
             # 同步直接处理
             return self._process_file_internal(file_path)
+
+    @staticmethod
+    def _cancel_key(file_path: Any) -> str:
+        """取消标记使用的路径键（统一分隔符与大小写）"""
+        text = str(file_path or "").strip()
+        if not text:
+            return ""
+        return os.path.normcase(os.path.normpath(text))
+
+    def is_cancelled(self, file_path: Any) -> bool:
+        """文件是否已被用户取消（不再自动重试 / 推送通知）"""
+        key = self._cancel_key(file_path)
+        return bool(key and key in self._cancelled_files)
+
+    def resume_file(self, file_path: Any) -> None:
+        """解除取消标记（用户重新手动上传 / 强制处理时调用）"""
+        key = self._cancel_key(file_path)
+        if key:
+            self._cancelled_files.discard(key)
+
+    def cancel_file(self, file_path: Any) -> None:
+        """取消文件：停止队列处理、清失败记录，并阻止后续自动重试"""
+        raw = str(file_path or "").strip()
+        if not raw:
+            return
+        key = self._cancel_key(raw)
+        with self._queue_lock:
+            self._cancelled_files.add(key)
+            for bucket in (self._queued_files, self._processing_files):
+                bucket.discard(raw)
+            self._failed_files.pop(raw, None)
+            for candidate in list(self._file_downloader_map):
+                if self._cancel_key(candidate) == key:
+                    self._file_downloader_map.pop(candidate, None)
+        while True:
+            try:
+                queued = self._upload_queue.get_nowait()
+            except Empty:
+                break
+            if queued is None:
+                self._upload_queue.put(None)
+                break
+            if self._cancel_key(queued) != key:
+                self._upload_queue.put(queued)
+        self.logger.info(f"已取消文件的所有自动处理与重试: {raw}")
 
     def stop_upload_queue(self):
         """停止上传队列处理线程"""

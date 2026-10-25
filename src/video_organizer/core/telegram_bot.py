@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 _API_BASE = "https://api.telegram.org"   # 可通过该常量替换为自建反代地址
 _MAX_REPLY_MAP = 200          # 最多记住多少条报错信息（供回复修正）
+_MAX_FILE_CONTEXTS = 500      # 按文件保留最近上下文，避免旧报错消息被挤出后无法回复
 _MAX_MESSAGE_CHARS = 3500     # Telegram 单条消息上限约 4096，留出余量
 _SEND_TIMEOUT = 15
 _ERROR_NOTIFY_INTERVAL = 300  # 同一文件的同类报错 5 分钟只推一次
@@ -402,6 +403,11 @@ class TelegramBotService:
         self._stop_event = threading.Event()
         self._offset = 0
         self._replies: Dict[str, Dict[str, Any]] = {}
+        # 按归一化文件路径保留最新上下文。_replies 只记最近 200 条消息，
+        # 同一任务多次报错时旧消息可能被挤出；这份索引用于回复旧消息时兜底。
+        self._file_contexts: Dict[str, Dict[str, Any]] = {}
+        self._suppressed_paths: set = set()
+        self._last_error_context: Dict[str, Any] = {}
         self._error_notified_at: Dict[str, float] = {}
         self._active_errors: Dict[str, Dict[str, Any]] = {}
         self._reminder_thread: Optional[threading.Thread] = None
@@ -568,6 +574,313 @@ class TelegramBotService:
         logger.warning("Telegram 发送失败: %s", body.get("description"))
         return None
 
+    # ------------------------------------------------------------------
+    # 回复上下文
+    # ------------------------------------------------------------------
+
+    def _remember_reply_context(
+        self,
+        message_id: Optional[int],
+        context: Optional[Dict[str, Any]],
+        error: str = "",
+        remember_last: bool = False,
+    ) -> None:
+        """把一条机器人消息登记为「可回复」的上下文
+
+        同一文件会同步更新所有旧消息，这样即便用户回复的是较早的一条报错，
+        也能拿到最新的任务号 / 目标，而不是落到笼统的「请回复」提示。
+        """
+        if not message_id:
+            return
+        item = dict(context or {})
+        if error:
+            item["_error"] = str(error)
+        item["_at"] = _now_text()
+        item["_ts"] = time.time()
+        with self._lock:
+            self._replies[str(message_id)] = item
+            target = self._norm_path(item.get("file_path"))
+            if target:
+                merged = self._merge_file_context_locked(target, item)
+                self._update_file_replies_locked(target, merged)
+            if remember_last:
+                self._last_error_context = dict(
+                    self._file_contexts.get(target, item) if target else item
+                )
+            while len(self._replies) > _MAX_REPLY_MAP:
+                self._replies.pop(next(iter(self._replies)), None)
+
+    def _merge_file_context_locked(
+        self,
+        target: str,
+        context: Dict[str, Any],
+        deleted: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """更新按文件保存的最新上下文（调用方必须已持有锁）"""
+        merged = dict(self._file_contexts.get(target) or {})
+        merged.update(dict(context or {}))
+        if deleted is True:
+            merged["_deleted"] = True
+            merged.setdefault("_deleted_at", _now_text())
+        elif deleted is False:
+            merged.pop("_deleted", None)
+            merged.pop("_deleted_at", None)
+        elif not merged.get("_deleted"):
+            merged.pop("_deleted", None)
+            merged.pop("_deleted_at", None)
+        merged["_at"] = _now_text()
+        merged["_ts"] = time.time()
+        # 重新插入到末尾，保证容量上限淘汰的是最久未更新的文件
+        self._file_contexts.pop(target, None)
+        self._file_contexts[target] = merged
+        while len(self._file_contexts) > _MAX_FILE_CONTEXTS:
+            self._file_contexts.pop(next(iter(self._file_contexts)), None)
+        return merged
+
+    def _update_file_replies_locked(
+        self, target: str, context: Dict[str, Any]
+    ) -> None:
+        """把最新上下文同步到该文件的所有旧消息（调用方必须已持有锁）"""
+        for item in self._replies.values():
+            if self._norm_path((item or {}).get("file_path")) != target:
+                continue
+            item.update(dict(context or {}))
+            if not context.get("_deleted"):
+                item.pop("_deleted", None)
+                item.pop("_deleted_at", None)
+
+    def _forget_file_replies(self, file_path: str, keep: Optional[int] = None) -> None:
+        """清掉某个文件的全部可回复上下文（keep 指定的消息除外）
+
+        用户回复「删除」时不要调用本方法：删除只应标记墓碑，旧消息仍要能
+        识别出「该任务已停止提醒」，否则再次回复就会变成「请回复」。
+        """
+        target = self._norm_path(file_path)
+        if not target:
+            return
+        with self._lock:
+            for key, item in list(self._replies.items()):
+                if keep is not None and key == str(keep):
+                    continue
+                if self._norm_path((item or {}).get("file_path")) == target:
+                    self._replies.pop(key, None)
+            if keep is None:
+                self._file_contexts.pop(target, None)
+                if self._norm_path(self._last_error_context.get("file_path")) == target:
+                    self._last_error_context = {}
+
+    def _refresh_file_replies(
+        self, file_path: str, context: Dict[str, Any], error: str
+    ) -> None:
+        """同一文件再次报错时，让旧报错消息也指向最新上下文"""
+        target = self._norm_path(file_path)
+        if not target:
+            return
+        item = dict(context or {})
+        item.setdefault("file_path", str(file_path or ""))
+        item["_error"] = str(error or "")
+        item["_at"] = _now_text()
+        item["_ts"] = time.time()
+        with self._lock:
+            merged = self._merge_file_context_locked(target, item, deleted=False)
+            self._update_file_replies_locked(target, merged)
+            if self._norm_path(self._last_error_context.get("file_path")) == target:
+                self._last_error_context = dict(merged)
+
+    def _mark_file_deleted(
+        self,
+        file_path: str,
+        context: Optional[Dict[str, Any]] = None,
+        error: str = "",
+    ) -> None:
+        """把文件标记为「已删除 / 已停止提醒」，但保留旧消息的可回复能力"""
+        target = self._norm_path(file_path)
+        if not target:
+            return
+        item = dict(context or {})
+        item.setdefault("file_path", str(file_path or ""))
+        if error:
+            item["_error"] = str(error)
+        item["_deleted"] = True
+        item["_deleted_at"] = _now_text()
+        item["_at"] = _now_text()
+        item["_ts"] = time.time()
+        with self._lock:
+            merged = self._merge_file_context_locked(target, item, deleted=True)
+            self._update_file_replies_locked(target, merged)
+            if self._norm_path(self._last_error_context.get("file_path")) == target:
+                self._last_error_context = dict(merged)
+
+    def _suppress_error(self, file_path: str) -> None:
+        """用户明确删除后抑制该文件的后续报错（即使后台任务仍在跑）"""
+        target = self._norm_path(file_path)
+        if target:
+            with self._lock:
+                self._suppressed_paths.add(target)
+
+    def _unsuppress_error(self, file_path: str) -> None:
+        """用户重新指定目标 / 重新上传时恢复报错通知"""
+        target = self._norm_path(file_path)
+        if target:
+            with self._lock:
+                self._suppressed_paths.discard(target)
+
+    def _is_error_suppressed(self, file_path: str) -> bool:
+        target = self._norm_path(file_path)
+        if not target:
+            return False
+        with self._lock:
+            return target in self._suppressed_paths
+
+    def _clear_error_throttle(self, file_path: str, header: Optional[str] = None) -> None:
+        """删除 / 修正后清掉节流记录，避免恢复后新的报错被 5 分钟窗口吞掉"""
+        target = self._norm_path(file_path)
+        if not target:
+            return
+        with self._lock:
+            for key in list(self._error_notified_at):
+                raw_path, _, raw_header = str(key).rpartition("|")
+                if header is not None and raw_header != header:
+                    continue
+                if self._norm_path(raw_path) == target:
+                    self._error_notified_at.pop(key, None)
+
+    @staticmethod
+    def _context_matches_text(context: Dict[str, Any], text: str) -> bool:
+        """报错上下文是否与用户回复的那条消息文本对得上"""
+        raw = str(text or "")
+        if not raw:
+            return False
+        lowered = raw.lower()
+        names = [
+            str((context or {}).get("file_name") or ""),
+            os.path.basename(str((context or {}).get("file_path") or "")),
+        ]
+        for name in names:
+            if len(name) >= 4 and name.lower() in lowered:
+                return True
+        task_id = str((context or {}).get("task_id") or "")
+        if task_id and f"#{task_id}" in lowered:
+            return True
+        title = str((context or {}).get("title") or "").strip()
+        return bool(len(title) >= 3 and title.lower() in lowered)
+
+    def _resolve_reply_context(
+        self, reply_to: Optional[int], reply_text: str = ""
+    ) -> Optional[Dict[str, Any]]:
+        """找出回复消息对应的报错上下文
+
+        Telegram 的回复映射只存在内存里，机器人重启 / 消息过多被裁剪 / 修正后
+        上下文被清理时，旧的报错消息会「失去身份」。这里按回复消息正文里的
+        文件名 / 任务号从仍活跃的报错中反查，避免用户只收到笼统的「请回复」提示。
+        """
+        if reply_to is None:
+            return None
+        with self._lock:
+            direct = self._replies.get(str(reply_to))
+            active = []
+            for item in self._active_errors.values():
+                context = item.get("context") or {}
+                active.append(
+                    dict(
+                        context,
+                        _error=str(item.get("error") or ""),
+                        _last_sent=float(item.get("last_sent") or 0.0),
+                        _ts=float(item.get("last_sent") or 0.0),
+                    )
+                )
+            known = [dict(item) for item in self._replies.values()]
+            file_contexts = [dict(item) for item in self._file_contexts.values()]
+            latest_by_file = {
+                key: dict(value) for key, value in self._file_contexts.items()
+            }
+            last_context = dict(self._last_error_context or {})
+        if direct is not None:
+            merged = dict(direct)
+            target = self._norm_path(merged.get("file_path"))
+            latest = latest_by_file.get(target) if target else None
+            if latest:
+                merged.update(dict(latest))
+                if not latest.get("_deleted"):
+                    merged.pop("_deleted", None)
+                    merged.pop("_deleted_at", None)
+            return merged
+        matched: List[Dict[str, Any]] = []
+        for context in active + known + file_contexts:
+            if self._context_matches_text(context, reply_text):
+                matched.append(context)
+        if matched:
+            paths = {self._norm_path(item.get("file_path")) for item in matched}
+            paths.discard("")
+            if len(paths) == 1:
+                # 同一文件的多条报错：取最新一条，但仍归属同一文件
+                matched.sort(
+                    key=lambda item: float(
+                        item.get("_ts") or item.get("_last_sent") or 0.0
+                    ),
+                    reverse=True,
+                )
+                return matched[0]
+            return None
+        if last_context and self._context_matches_text(last_context, reply_text):
+            return last_context
+        # 旧消息正文被截断 / 文件已改名时：仅有一个活跃报错就沿用它的上下文
+        if len(active) == 1:
+            return dict(active[0])
+        # 删除后 active_errors 已被清空，但文件上下文仍然保留，便于旧消息继续操作
+        if len(file_contexts) == 1:
+            return dict(file_contexts[0])
+        return None
+
+    def _cancel_file_processing(self, file_path: str) -> bool:
+        """让文件监控 / 处理器不再重试该文件（供回复「删除」使用）"""
+        cancelled = False
+        try:
+            from ..web.services.state import get_state_manager
+
+            handler = get_state_manager().get_video_handler()
+        except Exception:
+            handler = None
+        if handler is not None:
+            try:
+                if hasattr(handler, "cancel_file"):
+                    handler.cancel_file(file_path)
+                    cancelled = True
+            except Exception as exc:
+                logger.debug("取消失败文件处理失败: %s", exc)
+            monitor = getattr(handler, "_parent_monitor", None)
+            if monitor is not None and hasattr(monitor, "cancel_file"):
+                try:
+                    cancelled = bool(monitor.cancel_file(file_path)) or cancelled
+                except Exception as exc:
+                    logger.debug("取消监控重试失败: %s", exc)
+        return cancelled
+
+    def _resume_file_processing(self, file_path: str) -> None:
+        """用户重新指定目标时解除删除状态，恢复后续自动重试 / 报错通知"""
+        if not file_path:
+            return
+        self._unsuppress_error(file_path)
+        try:
+            from ..web.services.state import get_state_manager
+
+            handler = get_state_manager().get_video_handler()
+        except Exception:
+            handler = None
+        if handler is None:
+            return
+        try:
+            if hasattr(handler, "resume_file"):
+                handler.resume_file(file_path)
+        except Exception as exc:
+            logger.debug("恢复文件处理失败: %s", exc)
+        monitor = getattr(handler, "_parent_monitor", None)
+        if monitor is not None and hasattr(monitor, "resume_file"):
+            try:
+                monitor.resume_file(file_path)
+            except Exception as exc:
+                logger.debug("恢复监控重试失败: %s", exc)
+
     def test_message(self, chat_id: Optional[str] = None) -> Dict[str, Any]:
         """发送一条测试消息，用于验证绑定是否可用"""
         # 顺手注册原生命令菜单，用户不必等下一次重启 / 绑定
@@ -653,8 +966,11 @@ class TelegramBotService:
             if not (self._token and self._chat_id and self._enabled):
                 return False
             task_id = str((context or {}).get("task_id") or "")
-        # 本地文件已经不存在（被移动 / 删除 / 已成功上传后清理）就不再打扰用户
         local_path = str((context or {}).get("file_path") or "").strip()
+        if local_path and self._is_error_suppressed(local_path):
+            logger.debug("用户已删除该任务，跳过报错通知: %s", local_path)
+            return False
+        # 本地文件已经不存在（被移动 / 删除 / 已成功上传后清理）就不再打扰用户
         if local_path and not os.path.exists(local_path):
             logger.debug("本地文件已不存在，跳过报错通知: %s", local_path)
             return False
@@ -665,6 +981,7 @@ class TelegramBotService:
         )
         notify_key = f"{str((context or {}).get('file_path') or name)}|{header}"
         now = time.time()
+        throttled = False
         with self._lock:
             last = self._error_notified_at.get(notify_key, 0.0)
             if now - last < _ERROR_NOTIFY_INTERVAL:
@@ -675,10 +992,15 @@ class TelegramBotService:
                     existing["error"] = str(error or "")
                     existing["header"] = header
                 logger.debug("同类报错 5 分钟内已推送过，跳过: %s", notify_key)
-                return False
-            self._error_notified_at[notify_key] = now
-            while len(self._error_notified_at) > _MAX_REPLY_MAP:
-                self._error_notified_at.pop(next(iter(self._error_notified_at)), None)
+                throttled = True
+            else:
+                self._error_notified_at[notify_key] = now
+                while len(self._error_notified_at) > _MAX_REPLY_MAP:
+                    self._error_notified_at.pop(next(iter(self._error_notified_at)), None)
+        if throttled:
+            if local_path:
+                self._refresh_file_replies(local_path, context or {}, str(error or ""))
+            return False
         lines = [f"❌ {header}" + (f" #{task_id}" if task_id else "")]
         lines.append(f"文件：{name}")
         target = self._describe_context(context)
@@ -693,10 +1015,10 @@ class TelegramBotService:
             with self._lock:
                 self._error_notified_at.pop(notify_key, None)
             return False
+        self._remember_reply_context(
+            message_id, context or {}, str(error or ""), remember_last=True
+        )
         with self._lock:
-            self._replies[str(message_id)] = dict(context or {}, _error=str(error or ""), _at=_now_text())
-            while len(self._replies) > _MAX_REPLY_MAP:
-                self._replies.pop(next(iter(self._replies)), None)
             self._active_errors[notify_key] = {
                 "context": dict(context or {}),
                 "error": str(error or ""),
@@ -745,6 +1067,7 @@ class TelegramBotService:
                     keys.append(key)
             for key in keys:
                 self._active_errors.pop(key, None)
+        self._clear_error_throttle(file_path, header)
 
     def clear_errors_under(self, path: str) -> int:
         """删除文件 / 目录后清掉该路径（含子文件）的所有报错提醒"""
@@ -762,6 +1085,11 @@ class TelegramBotService:
                 if candidate == base or candidate.startswith(base + sep):
                     self._active_errors.pop(key, None)
                     removed += 1
+            for key in list(self._error_notified_at):
+                raw_path, _, _ = str(key).rpartition("|")
+                candidate = self._norm_path(raw_path)
+                if candidate == base or candidate.startswith(base + sep):
+                    self._error_notified_at.pop(key, None)
         return removed
 
     def clear_all_errors(self) -> int:
@@ -795,6 +1123,11 @@ class TelegramBotService:
         for key, item in due:
             context = item.get("context") or {}
             local_path = str(context.get("file_path") or "").strip()
+            if local_path and self._is_error_suppressed(local_path):
+                logger.debug("用户已删除该任务，停止定时提醒: %s", local_path)
+                with self._lock:
+                    self._active_errors.pop(key, None)
+                continue
             if local_path and not os.path.exists(local_path):
                 # 本地文件已经不存在（被移动 / 删除），不再提醒，直接清掉这条报错
                 logger.debug("本地文件已不存在，停止报错提醒: %s", local_path)
@@ -818,6 +1151,13 @@ class TelegramBotService:
             else:
                 lines.append("（未解决前每 5 分钟提醒一次）")
             message_id = self.send_text("\n".join(lines))
+            if message_id:
+                self._remember_reply_context(
+                    message_id,
+                    context,
+                    str(item.get("error") or ""),
+                    remember_last=True,
+                )
             with self._lock:
                 current = self._active_errors.get(key)
                 if current is None:
@@ -825,11 +1165,6 @@ class TelegramBotService:
                 current["last_sent"] = time.time()
                 if message_id:
                     current["message_id"] = message_id
-                    self._replies[str(message_id)] = dict(
-                        context, _error=str(item.get("error") or ""), _at=_now_text()
-                    )
-                    while len(self._replies) > _MAX_REPLY_MAP:
-                        self._replies.pop(next(iter(self._replies)), None)
 
     @staticmethod
     def _describe_context(context: Optional[Dict[str, Any]]) -> str:
@@ -950,10 +1285,10 @@ class TelegramBotService:
             return
 
         reply_to = (message.get("reply_to_message") or {}).get("message_id")
+        reply_text = str((message.get("reply_to_message") or {}).get("text") or "")
         context: Optional[Dict[str, Any]] = None
         if reply_to is not None:
-            with self._lock:
-                context = self._replies.get(str(reply_to))
+            context = self._resolve_reply_context(reply_to, reply_text)
         if context is None:
             # 没有回复上下文：消息里若是下载链接，直接推给 aria2
             urls = _extract_urls(text)
@@ -1149,7 +1484,8 @@ class TelegramBotService:
         text: str,
         rows: List[List[Dict[str, str]]],
         edit_message_id: Optional[int] = None,
-    ) -> None:
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
         with self._lock:
             token = self._token
         if not token:
@@ -1169,16 +1505,27 @@ class TelegramBotService:
                 )
                 body = response.json() if response.content else {}
                 if body.get("ok"):
-                    return
+                    message_id = (body.get("result") or {}).get("message_id")
+                    if message_id:
+                        self._remember_reply_context(message_id, context)
+                    return message_id
             except Exception as exc:
                 logger.debug("编辑 Telegram 消息失败: %s", exc)
             payload.pop("message_id", None)
         try:
-            requests.post(
+            response = requests.post(
                 f"{_API_BASE}/bot{token}/sendMessage", json=payload, timeout=_SEND_TIMEOUT
             )
+            body = response.json() if response.content else {}
         except Exception as exc:
             logger.debug("发送 Telegram 按钮消息失败: %s", exc)
+            return None
+        if body.get("ok"):
+            message_id = (body.get("result") or {}).get("message_id")
+            if message_id:
+                self._remember_reply_context(message_id, context)
+            return message_id
+        return None
 
     def _send_browse(
         self,
@@ -2039,6 +2386,13 @@ class TelegramBotService:
         """选择本地文件后：自动识别并上传，识别不到则请用户回复指定目标"""
         from .online_upload import OnlineUploadService
 
+        if self._is_error_suppressed(path):
+            self._resume_file_processing(path)
+            self._refresh_file_replies(
+                path,
+                {"file_path": str(path), "file_name": os.path.basename(str(path))},
+                "",
+            )
         service = OnlineUploadService.instance()
         name = os.path.basename(path)
         self.send_text(f"正在识别：{name} …", chat_id=chat_id)
@@ -2104,11 +2458,9 @@ class TelegramBotService:
         if result.get("error"):
             lines.append(f"识别信息：{str(result.get('error'))[:300]}")
         message_id = self.send_text("\n".join(lines), chat_id=chat_id)
-        if message_id:
-            with self._lock:
-                self._replies[str(message_id)] = dict(
-                    context, _error=str(result.get("error") or ""), _at=_now_text()
-                )
+        self._remember_reply_context(
+            message_id, context, str(result.get("error") or ""), remember_last=True
+        )
 
     def _start_upload_from_folder(self, path: str, chat_id: str) -> None:
         """选择文件夹后：递归识别并上传其中所有视频/字幕
@@ -2229,36 +2581,37 @@ class TelegramBotService:
             return
         first = failed[0]
         first_meta = first.get("meta") or {}
-        if message_id:
-            with self._lock:
-                self._replies[str(message_id)] = dict(
-                    {
-                        "file_path": first["path"],
-                        "file_name": os.path.basename(first["path"]),
-                        "title": first_meta.get("title") or "",
-                        "media_type": first_meta.get("media_type") or "",
-                        "season_number": first_meta.get("season"),
-                        "episode_number": first_meta.get("episode"),
-                        "storage": "",
-                    },
-                    _error=first.get("error") or "",
-                    _at=_now_text(),
-                )
+        first_context = {
+            "file_path": first["path"],
+            "file_name": os.path.basename(first["path"]),
+            "title": first_meta.get("title") or "",
+            "media_type": first_meta.get("media_type") or "",
+            "season_number": first_meta.get("season"),
+            "episode_number": first_meta.get("episode"),
+            "storage": "",
+        }
+        self._remember_reply_context(
+            message_id, first_context, first.get("error") or "", remember_last=True
+        )
         # 其余待处理文件登记为报错（quiet，不逐条提醒），修正一次后一起重传
         now = time.time()
         for item in failed:
             meta = item.get("meta") or {}
+            failed_context = {
+                "file_path": item["path"],
+                "file_name": os.path.basename(item["path"]),
+                "title": meta.get("title") or "",
+                "media_type": meta.get("media_type") or "",
+                "season_number": meta.get("season"),
+                "episode_number": meta.get("episode"),
+                "storage": "",
+            }
+            self._refresh_file_replies(
+                item["path"], failed_context, str(item.get("error") or "")
+            )
             with self._lock:
                 self._active_errors[f"{item['path']}|未找到 Emos 上传目标"] = {
-                    "context": {
-                        "file_path": item["path"],
-                        "file_name": os.path.basename(item["path"]),
-                        "title": meta.get("title") or "",
-                        "media_type": meta.get("media_type") or "",
-                        "season_number": meta.get("season"),
-                        "episode_number": meta.get("episode"),
-                        "storage": "",
-                    },
+                    "context": failed_context,
                     "error": item.get("error") or "未找到上传目标",
                     "header": "未找到 Emos 上传目标",
                     "last_sent": now,
@@ -2544,9 +2897,16 @@ class TelegramBotService:
         """回复「删除」：删除该文件的任务记录并停止所有后续提醒"""
         file_path = str(context.get("file_path") or "")
         name = context.get("file_name") or os.path.basename(file_path) or "-"
+        already_deleted = bool(context.get("_deleted"))
         removed = 0
         removed_downloads: List[str] = []
+        was_cancelled = False
+        deleted_context = dict(context)
         if file_path:
+            # 先取消自动重试：否则上传任务删掉后，监控器一分钟后又把文件推回来，
+            # 表现就是「回复删除后仍然一直报错」。
+            was_cancelled = self._cancel_file_processing(file_path)
+            self._suppress_error(file_path)
             try:
                 from .online_upload import OnlineUploadService
 
@@ -2561,19 +2921,38 @@ class TelegramBotService:
             except Exception as exc:
                 logger.debug("删除下载器任务失败: %s", exc)
             self.clear_error(file_path)
-        with self._lock:
-            if reply_to is not None:
+            self._clear_error_throttle(file_path)
+            deleted_context.update(
+                {
+                    "_deleted": True,
+                    "_deleted_at": _now_text(),
+                    "_error": str(context.get("_error") or ""),
+                }
+            )
+            # 保留旧消息的可回复能力：后续再回复旧报错时要提示「已停止」，
+            # 而不是落进「请回复报错消息」的兜底提示。
+            self._mark_file_deleted(file_path, deleted_context)
+        elif reply_to is not None:
+            with self._lock:
                 self._replies.pop(str(reply_to), None)
-        if removed:
+        if already_deleted:
+            message = f"✅ 该文件的提醒此前已停止\n文件：{name}"
+            if removed or removed_downloads:
+                message += "\n已再次清理残留任务"
+        elif removed:
             message = f"🗑️ 已删除该文件的任务并停止提醒\n文件：{name}\n（共移除 {removed} 个任务）"
         else:
             message = f"🗑️ 已停止该文件的提醒\n文件：{name}\n（未找到对应任务，可能已删除）"
+        if was_cancelled:
+            message += "\n已同时取消自动重试，后续不会再重新上报"
         if removed_downloads:
             message += (
                 f"\n已同步删除下载器任务：{'、'.join(removed_downloads)}"
                 "（本地文件未删除，需要删文件用 /upload 里的删除键）"
             )
-        self.send_text(message, chat_id=chat_id, reply_to=reply_to)
+        message_id = self.send_text(message, chat_id=chat_id, reply_to=reply_to)
+        if file_path:
+            self._remember_reply_context(message_id, deleted_context)
 
     def _handle_correction(self, context: Dict[str, Any], text: str, chat_id: str, reply_to: Optional[int]) -> None:
         expr = parse_target_expression(text)
@@ -2591,6 +2970,10 @@ class TelegramBotService:
         if not file_path:
             self.send_text("这条报错信息没有关联到文件，无法重传。", reply_to=reply_to, chat_id=chat_id)
             return
+        was_deleted = bool(context.get("_deleted"))
+        if was_deleted:
+            # 用户对已停止的旧报错重新指定目标，视为显式恢复该文件
+            self._resume_file_processing(file_path)
 
         from .online_upload import OnlineUploadService
 
@@ -2683,11 +3066,6 @@ class TelegramBotService:
             self.send_text(message, reply_to=reply_to, chat_id=chat_id)
             return
 
-        # 命中后这条报错信息不再需要回复
-        with self._lock:
-            if reply_to is not None:
-                self._replies.pop(str(reply_to), None)
-
         season_number = match.get("season_number")
         if season_number is None:
             season_number = expr.season
@@ -2708,7 +3086,28 @@ class TelegramBotService:
                 }
             )
         except Exception as exc:
-            self.send_text(f"创建上传任务失败：{exc}", reply_to=reply_to, chat_id=chat_id)
+            message_id = self.send_text(
+                f"创建上传任务失败：{exc}", reply_to=reply_to, chat_id=chat_id
+            )
+            self._remember_reply_context(message_id, context, str(exc))
+            return
+        if task.get("duplicate"):
+            duplicate_context = dict(
+                context, task_id=task.get("id"), title=expr.title or context.get("title")
+            )
+            duplicate_context.pop("_deleted", None)
+            duplicate_context.pop("_deleted_at", None)
+            message_id = self.send_text(
+                f"未重复提交：{task.get('duplicate_reason')}\n"
+                f"文件：{os.path.basename(file_path)}",
+                reply_to=reply_to,
+                chat_id=chat_id,
+            )
+            self._unsuppress_error(file_path)
+            self._remember_reply_context(message_id, duplicate_context)
+            self._refresh_file_replies(
+                file_path, duplicate_context, str(context.get("_error") or "")
+            )
             return
 
         # 记住这次手动指定的目标，并自动重传同剧集其他报错文件
@@ -2722,6 +3121,7 @@ class TelegramBotService:
                 media_type,
                 exclude_file=file_path,
             )
+        self._unsuppress_error(file_path)
         self.clear_error(file_path)
 
         note = ""
@@ -2736,7 +3136,9 @@ class TelegramBotService:
             extra = "\n已记住映射，之后同名文件可直接上传"
         else:
             extra = ""
-        self.send_text(
+        if was_deleted:
+            extra += "\n已重新启用该文件的提醒"
+        message_id = self.send_text(
             "✅ 已按修正目标重新上传\n"
             f"文件：{os.path.basename(file_path)}\n"
             f"目标：{match.get('label') or expr.describe()}\n"
@@ -2744,6 +3146,22 @@ class TelegramBotService:
             reply_to=reply_to,
             chat_id=chat_id,
         )
+        reply_context = dict(context)
+        reply_context.pop("_deleted", None)
+        reply_context.pop("_deleted_at", None)
+        reply_context.update(
+            {
+                "task_id": task.get("id"),
+                "title": expr.title or str(context.get("title") or ""),
+                "media_type": media_type,
+                "season_number": season_number,
+                "episode_number": episode_number,
+                "item_type": match.get("item_type"),
+                "item_id": match.get("item_id"),
+            }
+        )
+        self._remember_reply_context(message_id, reply_context)
+        self._refresh_file_replies(file_path, reply_context, "")
         logger.info("Telegram 修正目标成功: %s -> %s", expr.describe(), match.get("label"))
 
     @staticmethod
@@ -2946,7 +3364,11 @@ class TelegramBotService:
                 continue
             if task.get("duplicate"):
                 continue
+            self._unsuppress_error(path)
             self.clear_error(path)
+            self._refresh_file_replies(
+                path, dict(ctx, task_id=task.get("id")), ""
+            )
             count += 1
         return count
 
@@ -3187,9 +3609,10 @@ class TelegramBotService:
                 "请换几个关键词（例如片名简写 / 原名）后重新回复本条报错消息。"
             )
             if edit_message_id:
-                self._send_keyboard(chat_id, text, [], edit_message_id)
+                self._send_keyboard(chat_id, text, [], edit_message_id, context=context)
             else:
-                self.send_text(text, reply_to=reply_to, chat_id=chat_id)
+                message_id = self.send_text(text, reply_to=reply_to, chat_id=chat_id)
+                self._remember_reply_context(message_id, context)
             return
         rows: List[List[Dict[str, str]]] = []
         for video in candidates[:8]:
@@ -3216,9 +3639,9 @@ class TelegramBotService:
         if note:
             text = f"{note}\n\n{text}"
         if edit_message_id:
-            self._send_keyboard(chat_id, text, rows, edit_message_id)
+            self._send_keyboard(chat_id, text, rows, edit_message_id, context=context)
         else:
-            self._send_keyboard(chat_id, text, rows)
+            self._send_keyboard(chat_id, text, rows, context=context)
 
     def _send_work_choices(
         self, chat_id: str, payload: Dict[str, Any], edit_message_id: Optional[int] = None
@@ -3271,7 +3694,11 @@ class TelegramBotService:
         )
         rows.append([{"text": "↩️ 返回搜索结果", "callback_data": f"fx:search:{back_token}"}])
         self._send_keyboard(
-            chat_id, f"{self._work_label(video)} 请选择要上传的季：", rows, edit_message_id
+            chat_id,
+            f"{self._work_label(video)} 请选择要上传的季：",
+            rows,
+            edit_message_id,
+            context=context,
         )
 
     def _send_season_choices(
@@ -3329,7 +3756,13 @@ class TelegramBotService:
             rows.append([{"text": "（该季没有可上传的集）", "callback_data": "up:noop"}])
         number = season.get("season_number")
         head = f"S{int(number):02d}" if number is not None else "该季"
-        self._send_keyboard(chat_id, f"{title} {head} 请选择要上传的集：", rows, edit_message_id)
+        self._send_keyboard(
+            chat_id,
+            f"{title} {head} 请选择要上传的集：",
+            rows,
+            edit_message_id,
+            context=context,
+        )
 
     def _apply_target_selection(
         self,
@@ -3345,6 +3778,8 @@ class TelegramBotService:
         if not file_path:
             self._send_keyboard(chat_id, "这条报错信息没有关联到文件，无法重传。", [], edit_message_id)
             return
+        if context.get("_deleted"):
+            self._resume_file_processing(file_path)
         from .online_upload import OnlineUploadService
 
         service = OnlineUploadService.instance()
@@ -3371,14 +3806,24 @@ class TelegramBotService:
                 }
             )
         except Exception as exc:
-            self._send_keyboard(chat_id, f"创建上传任务失败：{exc}", [], edit_message_id)
+            self._send_keyboard(
+                chat_id, f"创建上传任务失败：{exc}", [], edit_message_id, context=context
+            )
             return
         if task.get("duplicate"):
+            duplicate_context = dict(context, task_id=task.get("id"), title=title)
+            duplicate_context.pop("_deleted", None)
+            duplicate_context.pop("_deleted_at", None)
             self._send_keyboard(
                 chat_id,
                 f"未重复提交：{task.get('duplicate_reason')}\n文件：{os.path.basename(file_path)}",
                 [],
                 edit_message_id,
+                context=duplicate_context,
+            )
+            self._unsuppress_error(file_path)
+            self._refresh_file_replies(
+                file_path, duplicate_context, str(context.get("_error") or "")
             )
             return
 
@@ -3400,11 +3845,8 @@ class TelegramBotService:
         retried = 0
         if mapping_info.get("show_level"):
             retried = self._retry_pending_same_title(title, media_type, exclude_file=file_path)
+        self._unsuppress_error(file_path)
         self.clear_error(file_path)
-        with self._lock:
-            for key, item in list(self._replies.items()):
-                if str((item or {}).get("file_path") or "") == file_path:
-                    self._replies.pop(key, None)
         note = ""
         try:
             if service.delete_after_upload_enabled():
@@ -3423,10 +3865,26 @@ class TelegramBotService:
             f"目标：{selection.get('label') or title}\n"
             f"任务：{task.get('id')}{note}{extra}"
         )
+        reply_context = dict(
+            context,
+            task_id=task.get("id"),
+            title=title,
+            media_type=media_type,
+            season_number=selection.get("season_number"),
+            episode_number=selection.get("episode_number"),
+            item_type=selection.get("item_type"),
+            item_id=selection.get("item_id"),
+        )
+        reply_context.pop("_deleted", None)
+        reply_context.pop("_deleted_at", None)
         if edit_message_id:
-            self._send_keyboard(chat_id, text, [], edit_message_id)
+            self._send_keyboard(
+                chat_id, text, [], edit_message_id, context=reply_context
+            )
         else:
-            self.send_text(text, chat_id=chat_id)
+            message_id = self.send_text(text, chat_id=chat_id)
+            self._remember_reply_context(message_id, reply_context)
+        self._refresh_file_replies(file_path, reply_context, "")
         logger.info("Telegram 手动锁定目标成功: %s -> %s", title, selection.get("label"))
 
     def _handle_flow_callback(

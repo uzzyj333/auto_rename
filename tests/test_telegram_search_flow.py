@@ -186,7 +186,7 @@ class _BotHarness(unittest.TestCase):
         self.sent.append(text)
         return len(self.sent)
 
-    def _fake_keyboard(self, chat_id, text, rows, edit_message_id=None):
+    def _fake_keyboard(self, chat_id, text, rows, edit_message_id=None, context=None):
         self.keyboards.append((text, rows))
 
     def _buttons(self, index=-1):
@@ -226,6 +226,41 @@ class TestSearchFlow(_BotHarness):
         button = self._find_button("fx:work:")
         self.assertIn("狂王", button["text"])
         self.assertIn("S02", button["text"])
+
+    def test_selected_target_keeps_old_error_reply_context(self):
+        """点选目标上传成功后，旧报错消息仍应能删除刚创建的任务"""
+        context = self._context()
+        self.service._replies["55"] = dict(context, _error="未找到上传目标")
+        self.service._active_errors[
+            f"{context['file_path']}|未找到 Emos 上传目标"
+        ] = {
+            "context": dict(context),
+            "error": "未找到上传目标",
+            "header": "未找到 Emos 上传目标",
+            "last_sent": 0.0,
+        }
+        selection = {
+            "item_type": "ve",
+            "item_id": "ve24",
+            "label": "第四集",
+            "season_number": 2,
+            "episode_number": 4,
+        }
+        with patch(
+            "src.video_organizer.core.online_upload.OnlineUploadService",
+            _FakeUploadService,
+        ):
+            self.service._apply_target_selection(
+                "1", context, selection, [_video_candidate()], "狂王", 55
+            )
+
+        resolved = self.service._resolve_reply_context(
+            55, "❌ 未找到 Emos 上传目标\n文件：狂王.Asura.S02E04.mkv"
+        )
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["task_id"], "task-1")
+        self.assertNotIn("_deleted", resolved)
+        self.assertIn("55", self.service._replies)
 
     def test_work_then_season_then_episode_creates_task(self):
         with patch(

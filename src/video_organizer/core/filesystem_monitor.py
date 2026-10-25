@@ -48,6 +48,8 @@ class FileSystemMonitor:
         self._processing_lock = threading.Lock()  # 线程锁，保护文件处理逻辑
         self._retry_files = set()  # 需要重试的文件
         self._pending_files = set()  # 待处理的文件
+        # 用户明确删除任务后取消的文件；重试循环 / 目录扫描 / 下载完成回调都跳过
+        self._cancelled_files = set()
 
         if supported_extensions is None:
             self.supported_extensions = [
@@ -1067,6 +1069,10 @@ class FileSystemMonitor:
                     pending_files = list(self._pending_files)
                     for file_path in pending_files:
                         try:
+                            if self.event_handler.is_cancelled(file_path):
+                                self._pending_files.discard(file_path)
+                                self.event_handler._failed_files.pop(file_path, None)
+                                continue
                             if not os.path.exists(file_path):
                                 logger.debug(f"重试: 文件不存在，从队列移除: {file_path}")
                                 self._pending_files.discard(file_path)
@@ -1090,6 +1096,10 @@ class FileSystemMonitor:
                     retry_files = list(self._retry_files)
                     for file_path in retry_files:
                         try:
+                            if self.event_handler.is_cancelled(file_path):
+                                self._retry_files.discard(file_path)
+                                self.event_handler._failed_files.pop(file_path, None)
+                                continue
                             if not os.path.exists(file_path):
                                 logger.debug(f"重试: 文件不存在，从队列移除: {file_path}")
                                 self._retry_files.discard(file_path)
@@ -1155,8 +1165,46 @@ class FileSystemMonitor:
         """
         file_path = Path(file_path)
         if file_path.exists() and file_path.suffix.lower() in self.supported_extensions:
+            self.resume_file(str(file_path))
             logger.info(f"Force processing file: {file_path}")
             self.event_handler.force_process_file(str(file_path))
             self.processed_files.add(str(file_path))
             return True
         return False
+
+    def resume_file(self, file_path) -> None:
+        """解除「删除任务」的取消标记，允许重新处理"""
+        text = str(file_path or "").strip()
+        if not text:
+            return
+        self._cancelled_files.discard(text)
+        self.processed_files.discard(text)
+        self._directory_processed_files.discard(text)
+        handler = getattr(self, "event_handler", None)
+        if handler is not None and hasattr(handler, "resume_file"):
+            handler.resume_file(text)
+
+    def cancel_file(self, file_path) -> bool:
+        """用户删除任务：停止重试 / 待处理状态，并阻止后续自动重新处理
+
+        返回该路径是否原本在重试 / 待处理队列中（供 Telegram 文案区分）。
+        """
+        raw = str(file_path or "").strip()
+        if not raw:
+            return False
+        queued = raw in self._retry_files or raw in self._pending_files
+        self._retry_files.discard(raw)
+        self._pending_files.discard(raw)
+        self._cancelled_files.add(raw)
+        self._directory_processed_files.add(raw)
+        handler = getattr(self, "event_handler", None)
+        if handler is not None:
+            if hasattr(handler, "cancel_file"):
+                handler.cancel_file(raw)
+            else:
+                try:
+                    handler._failed_files.pop(raw, None)
+                except Exception:
+                    pass
+        logger.info("已取消文件的重试并停止后续自动处理: %s", raw)
+        return queued

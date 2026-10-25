@@ -58,7 +58,7 @@ class _BotHarness(unittest.TestCase):
         self.sent.append(text)
         return len(self.sent)
 
-    def _fake_keyboard(self, chat_id, text, rows, edit_message_id=None):
+    def _fake_keyboard(self, chat_id, text, rows, edit_message_id=None, context=None):
         self.keyboards.append((text, rows))
 
 
@@ -85,8 +85,23 @@ class TestReplyDelete(_BotHarness):
 
         self.assertEqual(fake.deleted_paths, [file_path])
         self.assertNotIn(f"{file_path}|未识别到条目", self.service._active_errors)
-        self.assertNotIn("55", self.service._replies)
+        # 旧报错消息必须保留“已删除”上下文，回复它不能变成“请回复”
+        self.assertIn("55", self.service._replies)
+        self.assertTrue(self.service._replies["55"].get("_deleted"))
+        resolved = self.service._resolve_reply_context(55, "❌ 未识别到条目\n文件：a.mkv")
+        self.assertIsNotNone(resolved)
+        self.assertTrue(resolved.get("_deleted"))
         self.assertIn("已删除该文件的任务并停止提醒", self.sent[-1])
+
+    def test_repeated_delete_on_old_message_is_idempotent(self):
+        file_path = "/media/a.mkv"
+        context = {"file_path": file_path, "file_name": "a.mkv"}
+        self.service._handle_delete_reply(context, "1", 55)
+        deleted_context = self.service._resolve_reply_context(55, "文件：a.mkv")
+
+        self.service._handle_delete_reply(deleted_context, "1", 55)
+
+        self.assertIn("此前已停止", self.sent[-1])
 
     def test_clear_all_errors(self):
         self.service._active_errors["a|未识别到条目"] = {"context": {}}

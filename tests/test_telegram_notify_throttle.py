@@ -93,6 +93,26 @@ class TestNotifyErrorThrottle(unittest.TestCase):
         self.assertFalse(self.service.notify_error(context, "boom"))
         self.assertEqual(self.sent, [])
 
+    def test_old_error_still_resolves_after_repeated_errors(self):
+        """同一文件多次报错后，回复较早的消息仍要能定位到文件"""
+        context = dict(self._context(), task_id="task-1")
+        self.assertTrue(self.service.notify_error(context, "第一次失败"))
+        first_text = self.sent[0]
+        second_context = dict(context, task_id="task-2")
+        self.assertTrue(
+            self.service.notify_error(
+                second_context, "第二次失败", header="未找到 Emos 上传目标"
+            )
+        )
+
+        # 模拟消息映射超过上限被裁掉，旧消息只剩正文可依赖
+        self.service._replies.pop("1", None)
+        resolved = self.service._resolve_reply_context(1, first_text)
+
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["file_path"], context["file_path"])
+        self.assertEqual(resolved["task_id"], "task-2")
+
 
 if __name__ == "__main__":
     unittest.main()
