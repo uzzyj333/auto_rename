@@ -35,6 +35,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+from .guessit_parser import strip_leading_bracket_prefix
+
 logger = logging.getLogger(__name__)
 
 _API_BASE = "https://api.telegram.org"   # 可通过该常量替换为自建反代地址
@@ -333,6 +335,7 @@ def parse_target_expression(raw: str) -> TargetExpression:
     text = re.sub(r"^[/＠@]\w+\s*", "", text)          # 去掉开头的指令
     text = re.sub(r"^(?:正确的?应该是|其实?是|应该?是|正确的?|修正|改为|应该)\s*[:：]?\s*", "", text).strip()
     text = _RE_MEDIA_EXT.sub("", text).strip()          # 去掉粘贴文件名带的后缀
+    text = strip_leading_bracket_prefix(text)           # [别班 第二季].VIVANT... -> VIVANT...
 
     def cut(match: re.Match) -> None:
         nonlocal text

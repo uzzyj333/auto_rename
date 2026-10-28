@@ -13,6 +13,34 @@ from typing import Dict, Any, Optional, List
 
 logger = logging.getLogger(__name__)
 
+# 文件名开头“方括号译名 / 字幕组 + 句点”的前缀，例如：
+#   [别班 第二季].VIVANT.2026.S02E07.1080p... -> VIVANT.2026.S02E07.1080p...
+# 只认后面紧跟句点的写法，避免误伤 [SubsPlease] Show - 01 这类字幕组格式。
+_RE_LEADING_BRACKET_PREFIX = re.compile(
+    r"^(?:\[[^\]]*\]|【[^】]*】)+(?:\s*[.．]\s*)+"
+)
+
+
+def strip_leading_bracket_prefix(filename: str) -> str:
+    """去掉文件名开头“[...].”形式的译名 / 分组前缀
+
+    括号里的中文译名或字幕组不应参与片名搜索，否则
+    ``[别班 第二季].VIVANT.2026.S02E07...`` 会被搜成「别班 第二季 VIVANT」。
+    仅当括号后紧跟句点、且后面还有实际标题内容时才剥离。
+    """
+    path = Path(filename)
+    name = path.name
+    match = _RE_LEADING_BRACKET_PREFIX.match(name)
+    if not match:
+        return filename
+    remainder = name[match.end():].strip()
+    if not remainder or not re.search(
+        r"[0-9A-Za-z\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", remainder
+    ):
+        return filename
+    return str(path.with_name(remainder))
+
+
 # 尝试导入 guessit，如果不可用则使用 None
 try:
     from guessit import guessit
@@ -272,6 +300,14 @@ class GuessItParser:
             filename_only = Path(preprocessed_filename).name
             pt_pattern = r'^\[(?P<cn_title>[\u4e00-\u9fff]+)\]\.(?P<en_title>[A-Za-z0-9\'"\.\s]+)\.(?P<year>\d{4})\.(?:[^\.]+\.)*?(?P<resolution>2160p|4K|UHD|FHD|1080p|720p|480p|360p|240p)'
             pt_match = re.search(pt_pattern, filename_only)
+            if pt_match and re.search(
+                r"(?:第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾廿]+\s*季|Season\s*\d+|^S\d{1,2}$)",
+                pt_match.group('cn_title'),
+                re.IGNORECASE,
+            ):
+                # 「[别班第二季].VIVANT.2026...」括号里是剧名+季数，不是电影中文名，
+                # 不能走「中文名 + 英文名」的电影分支，交给下面的前缀剥离逻辑。
+                pt_match = None
             if pt_match:
                 cn_title = pt_match.group('cn_title')
                 en_title = pt_match.group('en_title').strip()
@@ -322,6 +358,15 @@ class GuessItParser:
                 }
                 logger.debug(f"PT 命名法直接构造结果: {metadata}")
                 return metadata
+
+            # 开头方括号前缀（[别班 第二季]. / 【字幕组】. 等）直接跳过，
+            # 从后面的 VIVANT 开始识别，避免括号里的中文译名混进搜索词。
+            bracketless_filename = strip_leading_bracket_prefix(preprocessed_filename)
+            if bracketless_filename != preprocessed_filename:
+                logger.debug(
+                    f"跳过开头方括号前缀: '{preprocessed_filename}' -> '{bracketless_filename}'"
+                )
+                preprocessed_filename = bracketless_filename
 
             # PT 命名法预处理：处理 "英文标题.数字" 模式（如 "Article.20"）
             # GuessIt 会把这种格式错误拆分为 title='Article', episode=20

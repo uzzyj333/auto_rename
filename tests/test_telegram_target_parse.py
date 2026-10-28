@@ -71,6 +71,17 @@ class TestParseTargetExpression(unittest.TestCase):
             self.assertEqual(expr.episode, 1, raw)
             self.assertEqual(expr.year, 2024, raw)
 
+    def test_bracket_translated_name_prefix_is_skipped(self):
+        """粘贴「[别班 第二季].VIVANT.2026.S02E07」时只保留 VIVANT"""
+        expr = parse_target_expression(
+            "[别班 第二季].VIVANT.2026.S02E07.1080p.friDay.WEB-DL.H264.AAC-UBWEB.mkv"
+        )
+        self.assertTrue(expr.title.startswith("VIVANT"), expr.title)
+        self.assertNotIn("别班", expr.title)
+        self.assertEqual(expr.season, 2)
+        self.assertEqual(expr.episode, 7)
+        self.assertEqual(expr.year, 2026)
+
     def test_dotted_title_keeps_inner_dots(self):
         """标题内部的点号要保留（狂王.Asura），交给搜索时再换关键词兜底"""
         expr = parse_target_expression("狂王.Asura.S02E04")

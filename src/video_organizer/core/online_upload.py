@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .emos_client import EmosApiError, EmosClient
+from .guessit_parser import strip_leading_bracket_prefix
 from .incomplete_downloads import collect_incomplete_paths, is_incomplete
 from .probe import probe_summary_for_upload, probe_video
 from ..upload.upload_emos import (
@@ -73,6 +74,34 @@ def _title_matches(candidate: Any, query: Any) -> bool:
     if not left or not right:
         return False
     return left == right or left in right or right in left
+
+
+def _search_title_candidates(metadata: Dict[str, Any], file_name: str) -> List[str]:
+    """Emos 搜索标题：优先 TMDB 标题，再退回文件名里的原始标题
+
+    TMDB 的中文译名可能与 Emos 不一致（例如 VIVANT 被译成
+    「成吉思-VIVANT THE ORIGIN STORY-」），只用 TMDB 标题会搜不到。
+    这里同时保留 show_name / original_show_name / 文件名标题作为兜底。
+    """
+    values = [
+        metadata.get("title"),
+        metadata.get("show_name"),
+        metadata.get("original_show_name"),
+    ]
+    stem = Path(file_name or "").stem
+    if stem:
+        values.append(strip_leading_bracket_prefix(stem))
+
+    titles: List[str] = []
+    seen = set()
+    for value in values:
+        text = " ".join(str(value or "").split()).strip()
+        key = _normalize_title(text)
+        if not text or not key or key in seen:
+            continue
+        seen.add(key)
+        titles.append(text)
+    return titles
 
 
 # 播出 / 上映年份可能出现的字段名（Emos 各条目字段不统一）
@@ -574,6 +603,9 @@ class OnlineUploadService:
         season = _to_int(metadata.get("season"))
         episode = _to_int(metadata.get("episode"))
         year = _to_int(metadata.get("year"))
+        search_titles = _search_title_candidates(metadata, path.name)
+        if not title and search_titles:
+            title = search_titles[0]
 
         if not media_type and metadata:
             # renamer 没判定出类型时（电影常见的「片名.(年份).1080p.H.265」格式，
@@ -624,30 +656,38 @@ class OnlineUploadService:
                         match = self.resolve_episode_from_tree(
                             client, payload.get("item_id"), season, episode
                         )
-                if not match and title:
-                    candidates = self.search_targets(
-                        video_type="movie" if media_type == "movie" else ("tv" if media_type else None),
-                        title=title,
-                        todb_id=None,
+                if not match and search_titles:
+                    video_type = (
+                        "movie" if media_type == "movie" else ("tv" if media_type else None)
                     )
-                    # 没有 TMDB ID（或接口未返回具体集）时，用目录树候选自动定位季/集
-                    match = self._pick_from_candidates(
-                        candidates, season, episode, media_type, title=title
-                    )
-                    if not match and episode is not None:
-                        # 搜索结果可能只有作品级信息、没有嵌套季/集，拉完整目录树再定位
-                        match = self.resolve_episode_from_candidates(
-                            candidates, season, episode, media_type, title=title
+                    for search_title in search_titles:
+                        found = self.search_targets(
+                            video_type=video_type,
+                            title=search_title,
+                            todb_id=None,
                         )
-                    if match and match.get("title_matched") is False:
-                        # 自动匹配不能拿标题不相关的候选硬凑：Emos 搜索「Brothers」
-                        # 可能返回 Ang Probinsyano 等其他剧，再按同号集就传错片了。
-                        logger.info(
-                            "跳过标题不匹配的 Emos 候选: %s（搜索词: %s）",
-                            match.get("video_title") or match.get("label") or "",
-                            title,
+                        if found:
+                            candidates = found
+                        # 没有 TMDB ID（或接口未返回具体集）时，用目录树候选自动定位季/集
+                        match = self._pick_from_candidates(
+                            found, season, episode, media_type, title=search_title
                         )
-                        match = None
+                        if not match and episode is not None:
+                            # 搜索结果可能只有作品级信息、没有嵌套季/集，拉完整目录树再定位
+                            match = self.resolve_episode_from_candidates(
+                                found, season, episode, media_type, title=search_title
+                            )
+                        if match and match.get("title_matched") is False:
+                            # 自动匹配不能拿标题不相关的候选硬凑：Emos 搜索「Brothers」
+                            # 可能返回 Ang Probinsyano 等其他剧，再按同号集就传错片了。
+                            logger.info(
+                                "跳过标题不匹配的 Emos 候选: %s（搜索词: %s）",
+                                match.get("video_title") or match.get("label") or "",
+                                search_title,
+                            )
+                            match = None
+                        if match:
+                            break
                 if not match and (media_type == "tv" or (media_type != "movie" and episode is not None)):
                     if episode is None:
                         errors.append("未能从文件名解析出季/集号，无法定位到具体某一集")

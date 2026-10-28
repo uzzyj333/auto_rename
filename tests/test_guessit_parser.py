@@ -48,6 +48,32 @@ class TestChineseTitleWithEnglishName(unittest.TestCase):
         result = self.parser.parse("【字幕组】狂王.Asura.S02E02.mkv")
         self.assertEqual(result.get("show_name"), "狂王")
 
+    def test_bracket_translated_name_prefix_is_skipped(self):
+        """[别班 第二季].VIVANT... 不应把括号里的中文译名当成片名"""
+        result = self.parser.parse(
+            "[别班 第二季].VIVANT.2026.S02E07.1080p.friDay.WEB-DL.H264.AAC-UBWEB.mkv"
+        )
+        self.assertEqual(result.get("show_name"), "VIVANT")
+        self.assertEqual(result.get("season"), 2)
+        self.assertEqual(result.get("episode"), 7)
+        self.assertEqual(result.get("year"), 2026)
+
+    def test_bracket_season_prefix_without_space_is_skipped(self):
+        """无空格写法 [别班第二季].VIVANT... 也不能走“中文电影名”分支"""
+        result = self.parser.parse("[别班第二季].VIVANT.2026.S02E07.1080p.mkv")
+        self.assertEqual(result.get("show_name"), "VIVANT")
+        self.assertEqual(result.get("season"), 2)
+        self.assertEqual(result.get("episode"), 7)
+
+    def test_bracket_chinese_movie_title_still_kept(self):
+        """[第二十条].Article.20.2024... 仍是电影，不能把中文名剥掉"""
+        result = self.parser.parse(
+            "[第二十条].Article.20.2024.60FPS.2160p.WEB-DL.H265.mkv"
+        )
+        self.assertEqual(result.get("show_name"), "第二十条")
+        self.assertEqual(result.get("media_type"), "movie")
+        self.assertEqual(result.get("year"), 2024)
+
     def test_numeric_chinese_title_is_kept(self):
         result = self.parser.parse("唐探1900.Detective.Chinatown.S01E01.mkv")
         self.assertEqual(result.get("show_name"), "唐探1900")

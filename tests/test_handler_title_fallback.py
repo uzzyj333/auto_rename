@@ -68,6 +68,16 @@ class _FakeService:
         return None
 
 
+class _AlternateTitleService(_FakeService):
+    """只认识文件名里的英文原名，模拟 TMDB 中文译名与 Emos 不一致"""
+
+    def search_targets(self, video_type=None, title=None, todb_id=None):
+        self.searched.append(title)
+        if title == "VIVANT":
+            return [{"title": "VIVANT", "item_id": "1", "item_type": "vl", "seasons": []}]
+        return []
+
+
 class _WrongMatchService:
     """模拟 Emos 搜「Brothers」却返回 Ang Probinsyano 的同号集"""
 
@@ -143,6 +153,61 @@ class TestTitleSearchFallback(_TempDbMixin, unittest.TestCase):
         self.assertEqual(match["item_id"], "99")
         self.assertIn("狂王", service.searched)
 
+    def test_alternate_title_tried_when_tmdb_title_misses(self):
+        service = _AlternateTitleService()
+        with patch(
+            "src.video_organizer.core.online_upload.OnlineUploadService.instance",
+            lambda: service,
+        ):
+            match = self.handler._search_emos_by_title(
+                "成吉思-VIVANT THE ORIGIN STORY-",
+                "tv",
+                2,
+                7,
+                2026,
+                0,
+                alt_titles=["VIVANT"],
+            )
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match["item_id"], "99")
+        self.assertIn("VIVANT", service.searched)
+
+    def test_process_passes_filename_title_as_alternate(self):
+        self.handler.renamer = _FakeRenamer(
+            {
+                "title": "成吉思-VIVANT THE ORIGIN STORY-",
+                "show_name": "成吉思-VIVANT THE ORIGIN STORY-",
+                "original_show_name": "VIVANT",
+                "tmdb_id": "12345",
+                "media_type": "tv",
+                "season": 2,
+                "episode": 7,
+                "year": 2026,
+            }
+        )
+        self.handler.emos_client = _RaisingEmosClient()
+        captured = {}
+
+        def fake_search(
+            self, title, media_type, season, episode, year=None, worker_id=0, alt_titles=None
+        ):
+            captured["title"] = title
+            captured["alt_titles"] = list(alt_titles or [])
+            return {"item_type": "ve", "item_id": "ve-7", "label": "VIVANT S2 E7"}
+
+        with patch.object(
+            VideoFileHandler, "_search_emos_by_title", fake_search
+        ), patch.object(
+            VideoFileHandler, "_execute_upload", lambda self, *a, **k: None
+        ):
+            self.handler._process_file_internal(
+                "/media/[别班 第二季].VIVANT.2026.S02E07.1080p.mkv", 0
+            )
+
+        self.assertEqual(captured["title"], "成吉思-VIVANT THE ORIGIN STORY-")
+        self.assertIn("VIVANT", captured["alt_titles"])
+
     def test_no_candidates_returns_none(self):
         service = _FakeService()
         with patch(
@@ -177,7 +242,7 @@ class TestTitleSearchFallback(_TempDbMixin, unittest.TestCase):
         searched = []
 
         def fake_search(
-            self, title, media_type, season, episode, year=None, worker_id=0
+            self, title, media_type, season, episode, year=None, worker_id=0, alt_titles=None
         ):
             searched.append((title, media_type, season, episode, year))
             return {"item_type": "ve", "item_id": "99", "label": "狂王 S2 E2"}
@@ -213,7 +278,7 @@ class TestTitleSearchFallback(_TempDbMixin, unittest.TestCase):
         self.handler.emos_client = _RaisingEmosClient()
 
         def fake_search(
-            self, title, media_type, season, episode, year=None, worker_id=0
+            self, title, media_type, season, episode, year=None, worker_id=0, alt_titles=None
         ):
             return {"item_type": "ve", "item_id": "77", "label": "狂王 S2 E2"}
 
@@ -280,7 +345,7 @@ class TestMovieMediaTypeFallback(_TempDbMixin, unittest.TestCase):
         searched = []
 
         def fake_search(
-            self, title, media_type, season, episode, year=None, worker_id=0
+            self, title, media_type, season, episode, year=None, worker_id=0, alt_titles=None
         ):
             searched.append((title, media_type, season, episode))
             return {"item_type": "vl", "item_id": "vl-1", "label": "梁祝"}

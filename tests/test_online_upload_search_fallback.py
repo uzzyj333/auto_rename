@@ -9,7 +9,9 @@ Emos 的 ``/api/video/tree`` 带上 ``type=tv`` 时可能什么都搜不到，�
 
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -82,6 +84,63 @@ class TestSearchTargetsTypeFallback(unittest.TestCase):
         with patch.object(OnlineUploadService, "get_client", lambda self: client):
             self.assertEqual(self.service.search_targets(title=None), [])
         self.assertEqual(client.calls, [])
+
+
+class _TitleAwareClient:
+    """只认识 VIVANT，模拟 Emos 与 TMDB 中文译名不一致"""
+
+    def __init__(self):
+        self.titles = []
+
+    def get_video_tree(self, video_type=None, title=None, todb_id=None):
+        self.titles.append(title)
+        if title == "VIVANT":
+            return [_tv("202974", "VIVANT", "ve-7", season=2, episode=7)]
+        return []
+
+
+class _FakeRenamer:
+    def __init__(self, metadata):
+        self.metadata = metadata
+
+    def extract_metadata(self, file_path):
+        return dict(self.metadata)
+
+
+class TestRecognizeTitleFallback(unittest.TestCase):
+    """TMDB 中文译名搜不到时，在线识别要退回文件名里的原始标题"""
+
+    def test_original_show_name_is_used_as_search_fallback(self):
+        metadata = {
+            "title": "成吉思-VIVANT THE ORIGIN STORY-",
+            "show_name": "成吉思-VIVANT THE ORIGIN STORY-",
+            "original_show_name": "VIVANT",
+            "media_type": "tv",
+            "season": 2,
+            "episode": 7,
+            "year": 2026,
+        }
+        client = _TitleAwareClient()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "[别班 第二季].VIVANT.2026.S02E07.1080p.mkv"
+            path.write_bytes(b"0")
+            service = OnlineUploadService()
+            service.configure(
+                {
+                    "emos": {"auth_token": "t", "base_url": "https://emos.best"},
+                    "online_upload": {"video_root": tmp},
+                }
+            )
+            service.get_renamer = lambda: _FakeRenamer(metadata)
+            with patch.object(OnlineUploadService, "get_client", lambda self: client), patch(
+                "src.video_organizer.core.mapping_store.TargetMappingStore.resolve",
+                lambda **kwargs: None,
+            ):
+                result = service.recognize(str(path))
+
+        self.assertIn("VIVANT", client.titles)
+        self.assertIsNotNone(result.get("match"))
+        self.assertEqual(result["match"]["item_id"], "ve-7")
 
 
 def _tv(item_id, title, episode_id, season=1, episode=19):

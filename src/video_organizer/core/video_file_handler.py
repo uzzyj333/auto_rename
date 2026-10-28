@@ -19,6 +19,7 @@ from .tmdb_client import TMDBClient
 from .subtitle_handler import SubtitleHandler
 from .downloader_monitor import decode_file_path
 from .config_loader import normalize_extensions, normalize_path_mappings
+from .guessit_parser import strip_leading_bracket_prefix
 from ..utils.logging_utils import get_logger, log_success, log_failure, log_exception
 from ..database.operations import record_task
 from ..database.session import init_db as init_task_db
@@ -399,6 +400,14 @@ class VideoFileHandler:
         except (ValueError, TypeError):
             return None
 
+    @staticmethod
+    def _filename_title(file_path: str) -> str:
+        """从文件名取搜索标题，跳过开头「[别班 第二季].」这类前缀"""
+        try:
+            return strip_leading_bracket_prefix(Path(file_path).stem).strip()
+        except Exception:
+            return Path(file_path).stem
+
     def _search_emos_by_title(
         self,
         title: str,
@@ -407,6 +416,7 @@ class VideoFileHandler:
         episode: Optional[int],
         year: Optional[int] = None,
         worker_id: int = 0,
+        alt_titles: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """TMDB ID 识别失败或未命中时，按标题在 Emos 里搜索兜底定位目标
 
@@ -414,8 +424,12 @@ class VideoFileHandler:
         先按标题的多个变体搜索候选，命中后定位到具体某一集（ve）。
         全部搜不到时返回 None，由调用方提示用户手动修正。
         """
-        text = str(title or "").strip()
-        if not text:
+        texts: List[str] = []
+        for value in [title, *(alt_titles or [])]:
+            text = " ".join(str(value or "").split()).strip()
+            if text and text not in texts:
+                texts.append(text)
+        if not texts:
             return None
         try:
             from .online_upload import OnlineUploadService
@@ -429,52 +443,60 @@ class VideoFileHandler:
             video_type = "movie"
         try:
             from .telegram_bot import TelegramBotService
-
-            variants = TelegramBotService._title_variants(text)
         except Exception:
-            variants = [text]
-        for variant in variants:
+            TelegramBotService = None  # type: ignore[assignment]
+
+        for text in texts:
             try:
-                candidates = service.search_targets(
-                    video_type=video_type, title=variant
+                variants = (
+                    TelegramBotService._title_variants(text)
+                    if TelegramBotService is not None
+                    else [text]
                 )
-            except Exception as exc:
-                self.logger.debug("Emos 标题搜索失败(%s): %s", variant, exc)
-                continue
-            if not candidates:
-                continue
-            match = service.pick_target(
-                candidates,
-                season,
-                episode,
-                media_type,
-                year=year,
-                title=variant,
-            )
-            if not match and episode is not None:
+            except Exception:
+                variants = [text]
+            for variant in variants:
                 try:
-                    match = service.resolve_episode_from_candidates(
-                        candidates, season, episode, media_type, title=variant
+                    candidates = service.search_targets(
+                        video_type=video_type, title=variant
                     )
                 except Exception as exc:
-                    self.logger.debug("按候选定位剧集失败(%s): %s", variant, exc)
-            if match and match.get("title_matched") is False:
-                # 自动上传必须要求标题相关：Emos 搜「Brothers」时可能返回
-                # Ang Probinsyano 等其他剧，如果照着同号集上传就会传错片。
-                # 这里宁可判失败让用户在 Telegram 里手动选，也不自动传错。
-                console_log(
-                    f"⚠ [线程#{worker_id}] 跳过标题不匹配的 Emos 候选："
-                    f"{match.get('video_title') or match.get('label') or ''}"
-                    f"（搜索词：{variant}）"
+                    self.logger.debug("Emos 标题搜索失败(%s): %s", variant, exc)
+                    continue
+                if not candidates:
+                    continue
+                match = service.pick_target(
+                    candidates,
+                    season,
+                    episode,
+                    media_type,
+                    year=year,
+                    title=variant,
                 )
-                match = None
-            if match and match.get("item_id"):
-                console_log(
-                    f"✓ [线程#{worker_id}] Emos 标题搜索命中「{variant}」: "
-                    f"{match.get('item_type')}/{match.get('item_id')} "
-                    f"{match.get('label') or ''}"
-                )
-                return match
+                if not match and episode is not None:
+                    try:
+                        match = service.resolve_episode_from_candidates(
+                            candidates, season, episode, media_type, title=variant
+                        )
+                    except Exception as exc:
+                        self.logger.debug("按候选定位剧集失败(%s): %s", variant, exc)
+                if match and match.get("title_matched") is False:
+                    # 自动上传必须要求标题相关：Emos 搜「Brothers」时可能返回
+                    # Ang Probinsyano 等其他剧，如果照着同号集上传就会传错片。
+                    # 这里宁可判失败让用户在 Telegram 里手动选，也不自动传错。
+                    console_log(
+                        f"⚠ [线程#{worker_id}] 跳过标题不匹配的 Emos 候选："
+                        f"{match.get('video_title') or match.get('label') or ''}"
+                        f"（搜索词：{variant}）"
+                    )
+                    match = None
+                if match and match.get("item_id"):
+                    console_log(
+                        f"✓ [线程#{worker_id}] Emos 标题搜索命中「{variant}」: "
+                        f"{match.get('item_type')}/{match.get('item_id')} "
+                        f"{match.get('label') or ''}"
+                    )
+                    return match
         return None
 
     def _notify_match_error(
@@ -973,6 +995,11 @@ class VideoFileHandler:
                     self._safe_int(metadata.get("episode")),
                     self._safe_int(metadata.get("year")),
                     worker_id,
+                    alt_titles=[
+                        metadata.get("original_show_name"),
+                        metadata.get("title"),
+                        self._filename_title(file_path),
+                    ],
                 )
                 if fallback_match and fallback_match.get("item_id"):
                     fallback_season = self._safe_int(metadata.get("season"))
@@ -1226,6 +1253,11 @@ class VideoFileHandler:
                         episode_num,
                         year_num,
                         worker_id,
+                        alt_titles=[
+                            metadata.get("original_show_name"),
+                            metadata.get("show_name"),
+                            self._filename_title(file_path),
+                        ],
                     )
 
                 if match and match.get("item_id"):
