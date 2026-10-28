@@ -68,6 +68,32 @@ class _FakeService:
         return None
 
 
+class _WrongMatchService:
+    """模拟 Emos 搜「Brothers」却返回 Ang Probinsyano 的同号集"""
+
+    def search_targets(self, video_type=None, title=None, todb_id=None):
+        return [
+            {
+                "title": "Ang Probinsyano",
+                "item_id": "222",
+                "item_type": "vl",
+                "seasons": [],
+            }
+        ]
+
+    def pick_target(self, candidates, season, episode, media_type, year=None, title=None):
+        return {
+            "item_type": "ve",
+            "item_id": "ve-ang-7",
+            "label": "第 7 集",
+            "title_matched": False,
+            "video_title": "Ang Probinsyano",
+        }
+
+    def resolve_episode_from_candidates(self, *args, **kwargs):
+        return None
+
+
 class _FakeRenamer:
     def __init__(self, metadata, tmdb_client=None):
         self._metadata = metadata
@@ -124,6 +150,17 @@ class TestTitleSearchFallback(_TempDbMixin, unittest.TestCase):
             lambda: service,
         ):
             match = self.handler._search_emos_by_title("查无此剧", "tv", 1, 1, None, 0)
+
+        self.assertIsNone(match)
+
+    def test_title_mismatch_is_not_auto_uploaded(self):
+        """自动匹配拒绝标题不相关的候选，交给用户在 Telegram 手动选"""
+        service = _WrongMatchService()
+        with patch(
+            "src.video_organizer.core.online_upload.OnlineUploadService.instance",
+            lambda: service,
+        ):
+            match = self.handler._search_emos_by_title("Brothers", "tv", 1, 7, None, 0)
 
         self.assertIsNone(match)
 

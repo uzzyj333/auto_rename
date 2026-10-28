@@ -458,6 +458,16 @@ class VideoFileHandler:
                     )
                 except Exception as exc:
                     self.logger.debug("按候选定位剧集失败(%s): %s", variant, exc)
+            if match and match.get("title_matched") is False:
+                # 自动上传必须要求标题相关：Emos 搜「Brothers」时可能返回
+                # Ang Probinsyano 等其他剧，如果照着同号集上传就会传错片。
+                # 这里宁可判失败让用户在 Telegram 里手动选，也不自动传错。
+                console_log(
+                    f"⚠ [线程#{worker_id}] 跳过标题不匹配的 Emos 候选："
+                    f"{match.get('video_title') or match.get('label') or ''}"
+                    f"（搜索词：{variant}）"
+                )
+                match = None
             if match and match.get("item_id"):
                 console_log(
                     f"✓ [线程#{worker_id}] Emos 标题搜索命中「{variant}」: "

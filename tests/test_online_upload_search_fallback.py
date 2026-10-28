@@ -134,6 +134,23 @@ class TestPickTargetTitlePreference(unittest.TestCase):
         match = self.service.pick_target([first, second], 1, 19, "tv", title="Jade Cause Of Death")
         self.assertEqual(match["item_id"], "ve-first")
 
+    def test_does_not_pick_unrelated_show_when_matched_show_lacks_episode(self):
+        """标题已匹配到「Brothers」，它没有 E07 时不能改选 Ang Probinsyano 的 E07"""
+        matched = _tv("111", "Brothers", "ve-brothers-1", season=1, episode=1)
+        unrelated = _tv("222", "Ang Probinsyano", "ve-ang-7", season=1, episode=7)
+        match = self.service.pick_target(
+            [matched, unrelated], 1, 7, "tv", title="Brothers"
+        )
+        self.assertIsNone(match)
+
+    def test_fallback_match_is_marked_as_title_mismatch(self):
+        """没有任何标题相关候选时保留别名兜底，但标记出来供自动上传拒绝"""
+        unrelated = _tv("222", "Ang Probinsyano", "ve-ang-7", season=1, episode=7)
+        match = self.service.pick_target([unrelated], 1, 7, "tv", title="Brothers")
+        self.assertEqual(match["item_id"], "ve-ang-7")
+        self.assertFalse(match["title_matched"])
+        self.assertEqual(match["video_title"], "Ang Probinsyano")
+
 
 class _FlatThenFullTreeClient:
     """搜索结果只有作品级信息，按 video_id 查才带完整季/集"""
@@ -209,6 +226,41 @@ class TestResolveEpisodeFromCandidates(unittest.TestCase):
             self.assertIsNone(
                 self.service.resolve_episode_from_candidates(self.flat, 1, None, "tv", title="死有对证")
             )
+
+    def test_resolve_does_not_fall_through_to_unrelated_show(self):
+        """标题匹配的剧没有 E07 时，不能拿另一部剧的完整目录树硬凑"""
+        matched_flat = [
+            {
+                "title": "Brothers",
+                "video_type": "tv",
+                "item_type": "vl",
+                "item_id": "111",
+                "seasons": [],
+            }
+        ]
+        unrelated_flat = [
+            {
+                "title": "Ang Probinsyano",
+                "video_type": "tv",
+                "item_type": "vl",
+                "item_id": "222",
+                "seasons": [],
+            }
+        ]
+        matched_tree = _tv("111", "Brothers", "ve-brothers-1", season=1, episode=1)
+        unrelated_tree = _tv("222", "Ang Probinsyano", "ve-ang-7")
+
+        class _TreeByIdClient:
+            def get_video_tree(self, video_type=None, title=None, todb_id=None, video_id=None):
+                trees = {"111": [matched_tree], "222": [unrelated_tree]}
+                return list(trees.get(str(video_id), []))
+
+        client = _TreeByIdClient()
+        with patch.object(OnlineUploadService, "get_client", lambda self: client):
+            match = self.service.resolve_episode_from_candidates(
+                matched_flat + unrelated_flat, 1, 7, "tv", title="Brothers"
+            )
+        self.assertIsNone(match)
 
 
 class _LocateServiceStub:

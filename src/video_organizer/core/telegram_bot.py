@@ -1485,6 +1485,7 @@ class TelegramBotService:
         rows: List[List[Dict[str, str]]],
         edit_message_id: Optional[int] = None,
         context: Optional[Dict[str, Any]] = None,
+        reply_to: Optional[int] = None,
     ) -> Optional[int]:
         with self._lock:
             token = self._token
@@ -1512,6 +1513,8 @@ class TelegramBotService:
             except Exception as exc:
                 logger.debug("编辑 Telegram 消息失败: %s", exc)
             payload.pop("message_id", None)
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
         try:
             response = requests.post(
                 f"{_API_BASE}/bot{token}/sendMessage", json=payload, timeout=_SEND_TIMEOUT
@@ -2978,56 +2981,30 @@ class TelegramBotService:
         from .online_upload import OnlineUploadService
 
         service = OnlineUploadService.instance()
-        media_type = str(context.get("media_type") or "").strip().lower()
-        if not media_type:
-            media_type = expr.kind if expr.kind != "unknown" else ""
-        video_type = "movie" if media_type == "movie" else ("tv" if media_type == "tv" else None)
-        # 回复里没写季/集时只是「按片名搜候选」：不带类型过滤。Emos 的 type 过滤
-        # 不可靠（电影被存成剧集、特别篇等都很常见），带上报错上下文里的类型会
-        # 把真实条目滤掉，用户看到的就是「电影搜不到」。写了季/集才按类型精确定位。
-        search_type = video_type if (expr.season is not None or expr.episode is not None) else None
+        has_episode_info = expr.season is not None or expr.episode is not None
 
-        try:
-            candidates, matched_title = self._search_by_title(service, expr.title, search_type)
-        except Exception as exc:
-            self.send_text(f"查询 Emos 失败：{exc}", reply_to=reply_to, chat_id=chat_id)
-            return
-        if matched_title:
-            expr.title = matched_title
-        raw_candidates = candidates
-        candidates = self._filter_by_year(raw_candidates, expr.year)
-        year_note = self._year_filter_note(expr.year, raw_candidates, candidates)
-
-        if not candidates:
-            # 回复里的关键词搜不到时，退回报错文件本身的标题再搜一次兜底
-            fallback_title = str(context.get("title") or "").strip()
-            if fallback_title and fallback_title != expr.title:
-                try:
-                    candidates, fallback_matched = self._search_by_title(
-                        service, fallback_title, search_type
-                    )
-                except Exception as exc:
-                    logger.debug("用报错标题兜底搜索失败: %s", exc)
-                    candidates, fallback_matched = [], ""
-                if candidates:
-                    if fallback_matched:
-                        expr.title = fallback_matched
-                    raw_candidates = candidates
-                    candidates = self._filter_by_year(raw_candidates, expr.year)
-                    year_note = self._year_filter_note(
-                        expr.year, raw_candidates, candidates
-                    )
-
-        # 没写季 / 集时不做一次性匹配，直接列出候选让用户点选作品 / 季 / 集
-        if expr.season is None and expr.episode is None:
-            self._send_search_results(
+        # 只回复片名时不猜类型，先让用户选电影 / 电视剧，再按类型搜候选。
+        # Emos 的 type 过滤不稳定，所以额外保留「不限类型」作为兜底。
+        if not has_episode_info:
+            self._send_type_choices(
                 chat_id,
                 context,
-                candidates,
                 expr.title,
+                year=expr.year,
                 reply_to=reply_to,
-                note=year_note,
             )
+            return
+
+        # 写了 SxxExx 就是电视剧；不能被报错上下文里的错误类型带偏。
+        media_type = "tv"
+        video_type = "tv"
+
+        try:
+            candidates, expr.title, year_note = self._search_candidates_for_reply(
+                service, expr.title, "tv", expr.year, context
+            )
+        except Exception as exc:
+            self.send_text(f"查询 Emos 失败：{exc}", reply_to=reply_to, chat_id=chat_id)
             return
 
         match = self._locate_target(service, candidates, expr, media_type)
@@ -3056,7 +3033,14 @@ class TelegramBotService:
                 if hint:
                     note += f"\n\n搜索到：\n{hint}"
                 self._send_search_results(
-                    chat_id, context, candidates, expr.title, reply_to=reply_to, note=note
+                    chat_id,
+                    context,
+                    candidates,
+                    expr.title,
+                    reply_to=reply_to,
+                    note=note,
+                    media_type="tv",
+                    year=expr.year,
                 )
                 return
             message = (
@@ -3500,6 +3484,71 @@ class TelegramBotService:
         return [], title
 
     @staticmethod
+    def _filter_by_media_type(
+        candidates: List[Dict[str, Any]], media_type: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        """按用户选择的电影 / 电视剧过滤候选，去掉明确属于另一类型的条目"""
+        if media_type not in {"movie", "tv"}:
+            return list(candidates or [])
+        kept: List[Dict[str, Any]] = []
+        for video in candidates or []:
+            if not isinstance(video, dict):
+                continue
+            raw = str(video.get("video_type") or "").strip().lower()
+            is_movie = any(key in raw for key in ("movie", "film", "电影"))
+            is_tv = any(key in raw for key in ("tv", "series", "电视剧"))
+            if media_type == "movie" and is_tv and not is_movie:
+                continue
+            if media_type == "tv" and is_movie and not is_tv:
+                continue
+            kept.append(video)
+        return kept
+
+    @staticmethod
+    def _media_type_label(media_type: Optional[str]) -> str:
+        return {"movie": "电影", "tv": "电视剧"}.get(str(media_type or ""), "")
+
+    def _search_candidates_for_reply(
+        self,
+        service: Any,
+        title: str,
+        video_type: Optional[str],
+        year: Optional[int],
+        context: Dict[str, Any],
+    ) -> Tuple[List[Dict[str, Any]], str, str]:
+        """按片名搜索候选：类型过滤 + 年份筛选 + 报错标题兜底"""
+        candidates, matched_title = self._search_by_title(service, title, video_type)
+        if matched_title:
+            title = matched_title
+        if video_type:
+            candidates = self._filter_by_media_type(candidates, video_type)
+        raw_candidates = candidates
+        candidates = self._filter_by_year(raw_candidates, year)
+        year_note = self._year_filter_note(year, raw_candidates, candidates)
+
+        if not candidates:
+            # 回复里的关键词搜不到时，退回报错文件本身的标题再搜一次兜底
+            fallback_title = str((context or {}).get("title") or "").strip()
+            if fallback_title and fallback_title != title:
+                try:
+                    candidates, fallback_matched = self._search_by_title(
+                        service, fallback_title, video_type
+                    )
+                except Exception as exc:
+                    logger.debug("用报错标题兜底搜索失败: %s", exc)
+                    candidates, fallback_matched = [], ""
+                if candidates:
+                    title = fallback_matched or fallback_title
+                    if video_type:
+                        candidates = self._filter_by_media_type(candidates, video_type)
+                    raw_candidates = candidates
+                    candidates = self._filter_by_year(raw_candidates, year)
+                    year_note = self._year_filter_note(
+                        year, raw_candidates, candidates
+                    )
+        return candidates, title, year_note
+
+    @staticmethod
     def _fetch_tree(video: Dict[str, Any]) -> List[Dict[str, Any]]:
         """按作品 id 拉 Emos 完整目录树（失败时返回空列表）"""
         vl_id = video.get("item_id")
@@ -3591,6 +3640,68 @@ class TelegramBotService:
             return []
         return [item for item in (episodes or []) if isinstance(item, dict)]
 
+    def _send_type_choices(
+        self,
+        chat_id: str,
+        context: Dict[str, Any],
+        title: str,
+        year: Optional[int] = None,
+        reply_to: Optional[int] = None,
+    ) -> None:
+        """只回复片名时，先让用户选择电影 / 电视剧，再按类型搜索"""
+        title = str(title or "").strip() or "?"
+        token = self._flow_token(
+            {"context": dict(context or {}), "title": title, "year": year}
+        )
+        rows: List[List[Dict[str, str]]] = [
+            [
+                {"text": "🎬 电影", "callback_data": f"fx:media_movie:{token}"},
+                {"text": "📺 电视剧", "callback_data": f"fx:media_tv:{token}"},
+            ],
+            [{"text": "🔍 不限类型", "callback_data": f"fx:media_any:{token}"}],
+            [{"text": "✖️ 取消", "callback_data": "fx:cancel"}],
+        ]
+        text = f"🔍 搜索「{title}」\n请选择是电影还是电视剧："
+        self._send_keyboard(chat_id, text, rows, context=context, reply_to=reply_to)
+
+    def _search_for_media_type(
+        self,
+        chat_id: str,
+        payload: Dict[str, Any],
+        media_type: str,
+        edit_message_id: Optional[int] = None,
+    ) -> None:
+        """按用户选定的电影 / 电视剧重新搜索并展示候选"""
+        from .online_upload import OnlineUploadService
+
+        context = payload.get("context") or {}
+        title = str(payload.get("title") or "").strip()
+        year = payload.get("year")
+        video_type = media_type or None
+        try:
+            candidates, title, note = self._search_candidates_for_reply(
+                OnlineUploadService.instance(),
+                title,
+                video_type,
+                year,
+                context,
+            )
+        except Exception as exc:
+            self._send_keyboard(
+                chat_id, f"查询 Emos 失败：{exc}", [], edit_message_id, context=context
+            )
+            return
+        self._send_search_results(
+            chat_id,
+            context,
+            candidates,
+            title,
+            edit_message_id=edit_message_id,
+            note=note,
+            media_type=video_type,
+            year=year,
+        )
+
     def _send_search_results(
         self,
         chat_id: str,
@@ -3600,19 +3711,50 @@ class TelegramBotService:
         edit_message_id: Optional[int] = None,
         reply_to: Optional[int] = None,
         note: str = "",
+        media_type: Optional[str] = None,
+        year: Optional[int] = None,
     ) -> None:
         """列出搜索结果按钮，供用户点选作品"""
         title = str(title or "").strip()
+        media_type = str(media_type or "").strip().lower() or None
+        type_label = self._media_type_label(media_type)
+        type_scope = f"（{type_label}）" if type_label else ""
+        switch_token = self._flow_token(
+            {
+                "context": dict(context or {}),
+                "title": title,
+                "year": year,
+            }
+        )
+        switch_row = [
+            {
+                "text": "✅ 电影" if media_type == "movie" else "🎬 电影",
+                "callback_data": f"fx:media_movie:{switch_token}",
+            },
+            {
+                "text": "✅ 电视剧" if media_type == "tv" else "📺 电视剧",
+                "callback_data": f"fx:media_tv:{switch_token}",
+            },
+            {
+                "text": "✅ 不限" if not media_type else "🔍 不限",
+                "callback_data": f"fx:media_any:{switch_token}",
+            },
+        ]
         if not candidates:
             text = (
-                f"🔍 没有搜到与「{title}」相关的条目。\n"
-                "请换几个关键词（例如片名简写 / 原名）后重新回复本条报错消息。"
+                f"🔍 没有搜到与「{title}」相关的{type_label or ''}条目。\n"
+                "请换几个关键词（例如片名简写 / 原名）后重新回复本条报错消息，"
+                "或切换类型再试。"
             )
-            if edit_message_id:
-                self._send_keyboard(chat_id, text, [], edit_message_id, context=context)
-            else:
-                message_id = self.send_text(text, reply_to=reply_to, chat_id=chat_id)
-                self._remember_reply_context(message_id, context)
+            rows = [switch_row, [{"text": "✖️ 取消", "callback_data": "fx:cancel"}]]
+            self._send_keyboard(
+                chat_id,
+                text,
+                rows,
+                edit_message_id,
+                context=context,
+                reply_to=reply_to,
+            )
             return
         rows: List[List[Dict[str, str]]] = []
         for video in candidates[:8]:
@@ -3624,6 +3766,8 @@ class TelegramBotService:
                     "video": video,
                     "candidates": candidates,
                     "title": title or str(video.get("title") or ""),
+                    "media_type": media_type,
+                    "year": year,
                 }
             )
             rows.append(
@@ -3634,14 +3778,18 @@ class TelegramBotService:
                     }
                 ]
             )
+        rows.append(switch_row)
         rows.append([{"text": "✖️ 取消", "callback_data": "fx:cancel"}])
-        text = f"🔍 搜索「{title}」找到 {len(candidates)} 个结果，请点选作品："
+        text = (
+            f"🔍 搜索「{title}」{type_scope}找到 {len(candidates)} 个结果，"
+            "请点选作品："
+        )
         if note:
             text = f"{note}\n\n{text}"
         if edit_message_id:
             self._send_keyboard(chat_id, text, rows, edit_message_id, context=context)
         else:
-            self._send_keyboard(chat_id, text, rows, context=context)
+            self._send_keyboard(chat_id, text, rows, context=context, reply_to=reply_to)
 
     def _send_work_choices(
         self, chat_id: str, payload: Dict[str, Any], edit_message_id: Optional[int] = None
@@ -3651,11 +3799,21 @@ class TelegramBotService:
         context = payload.get("context") or {}
         candidates = payload.get("candidates") or []
         title = str(payload.get("title") or video.get("title") or "")
-        seasons = self._load_video_seasons(video)
-        if not seasons:
-            item_id = video.get("item_id")
+        media_type = str(payload.get("media_type") or "").strip().lower()
+        year = payload.get("year")
+        if not media_type:
+            raw_type = str(video.get("video_type") or "").strip().lower()
+            if "movie" in raw_type or "电影" in raw_type:
+                media_type = "movie"
+            elif "tv" in raw_type or "series" in raw_type or "电视剧" in raw_type:
+                media_type = "tv"
+
+        item_id = video.get("item_id")
+        if media_type == "movie":
+            # 用户明确选了电影：不再看季 / 集（有些电影在 Emos 里被误挂了季），
+            # 直接按作品级条目上传，media_type 也固定成 movie。
             if not item_id:
-                self._send_keyboard(chat_id, "该条目没有可上传的季 / 集。", [], edit_message_id)
+                self._send_keyboard(chat_id, "该条目没有可上传的目标。", [], edit_message_id)
                 return
             self._apply_target_selection(
                 chat_id,
@@ -3666,6 +3824,48 @@ class TelegramBotService:
                     "label": video.get("title") or title,
                     "season_number": None,
                     "episode_number": None,
+                    "media_type": "movie",
+                },
+                candidates,
+                title,
+                edit_message_id,
+            )
+            return
+
+        seasons = self._load_video_seasons(video)
+        if not seasons:
+            if not item_id:
+                self._send_keyboard(chat_id, "该条目没有可上传的季 / 集。", [], edit_message_id)
+                return
+            if media_type == "tv":
+                back_token = self._flow_token(
+                    {
+                        "context": context,
+                        "candidates": candidates,
+                        "title": title,
+                        "media_type": media_type,
+                        "year": year,
+                    }
+                )
+                self._send_keyboard(
+                    chat_id,
+                    f"{self._work_label(video)} 没有可上传的季 / 集，可能不是电视剧。\n"
+                    "可以返回重选电影，或换关键词重新搜索。",
+                    [[{"text": "↩️ 返回搜索结果", "callback_data": f"fx:search:{back_token}"}]],
+                    edit_message_id,
+                    context=context,
+                )
+                return
+            self._apply_target_selection(
+                chat_id,
+                context,
+                {
+                    "item_type": video.get("item_type") or "vl",
+                    "item_id": str(item_id),
+                    "label": video.get("title") or title,
+                    "season_number": None,
+                    "episode_number": None,
+                    "media_type": media_type,
                 },
                 candidates,
                 title,
@@ -3686,11 +3886,19 @@ class TelegramBotService:
                     "season": season,
                     "candidates": candidates,
                     "title": title,
+                    "media_type": media_type,
+                    "year": year,
                 }
             )
             rows.append([{"text": label, "callback_data": f"fx:season:{token}"}])
         back_token = self._flow_token(
-            {"context": context, "candidates": candidates, "title": title}
+            {
+                "context": context,
+                "candidates": candidates,
+                "title": title,
+                "media_type": media_type,
+                "year": year,
+            }
         )
         rows.append([{"text": "↩️ 返回搜索结果", "callback_data": f"fx:search:{back_token}"}])
         self._send_keyboard(
@@ -3710,6 +3918,8 @@ class TelegramBotService:
         context = payload.get("context") or {}
         candidates = payload.get("candidates") or []
         title = str(payload.get("title") or video.get("title") or "")
+        media_type = str(payload.get("media_type") or "").strip().lower()
+        year = payload.get("year")
         episodes = [e for e in (season.get("episodes") or []) if isinstance(e, dict)]
         if not episodes:
             episodes = self._load_season_episodes(video, season)
@@ -3729,6 +3939,8 @@ class TelegramBotService:
                     "episode": episode,
                     "candidates": candidates,
                     "title": title,
+                    "media_type": media_type,
+                    "year": year,
                 }
             )
             row.append({"text": label, "callback_data": f"fx:ep:{token}"})
@@ -3745,11 +3957,20 @@ class TelegramBotService:
                     "season": season,
                     "candidates": candidates,
                     "title": title,
+                    "media_type": media_type,
+                    "year": year,
                 }
             )
             rows.append([{"text": "📦 上传整季", "callback_data": f"fx:season_all:{all_token}"}])
         back_token = self._flow_token(
-            {"context": context, "video": video, "candidates": candidates, "title": title}
+            {
+                "context": context,
+                "video": video,
+                "candidates": candidates,
+                "title": title,
+                "media_type": media_type,
+                "year": year,
+            }
         )
         rows.append([{"text": "↩️ 返回季列表", "callback_data": f"fx:work:{back_token}"}])
         if not episodes:
@@ -3784,14 +4005,21 @@ class TelegramBotService:
 
         service = OnlineUploadService.instance()
         title = str(title or context.get("title") or "")
-        media_type = str(context.get("media_type") or "").strip().lower()
-        if not media_type:
-            media_type = (
-                "tv"
-                if selection.get("season_number") is not None
-                or selection.get("episode_number") is not None
-                else ""
-            )
+        # 用户在搜索里明确选的电影 / 电视剧优先于报错上下文里的旧类型
+        selected_type = str(selection.get("media_type") or "").strip().lower()
+        has_episode_info = (
+            selection.get("season_number") is not None
+            or selection.get("episode_number") is not None
+        )
+        if selected_type in {"movie", "tv"}:
+            media_type = selected_type
+        elif has_episode_info:
+            # 选到具体季 / 集时必然是电视剧，不能用报错上下文里可能错误的 movie
+            media_type = "tv"
+        else:
+            media_type = str(context.get("media_type") or "").strip().lower()
+            if media_type not in {"movie", "tv"}:
+                media_type = ""
         try:
             task = service.create_task(
                 {
@@ -3901,8 +4129,24 @@ class TelegramBotService:
         context = payload.get("context") or {}
         candidates = payload.get("candidates") or []
         title = str(payload.get("title") or "")
+        if action in {"media_movie", "media_tv", "media_any"}:
+            media_type = {
+                "media_movie": "movie",
+                "media_tv": "tv",
+                "media_any": "",
+            }[action]
+            self._search_for_media_type(chat_id, payload, media_type, message_id)
+            return
         if action == "search":
-            self._send_search_results(chat_id, context, candidates, title, message_id)
+            self._send_search_results(
+                chat_id,
+                context,
+                candidates,
+                title,
+                message_id,
+                media_type=payload.get("media_type"),
+                year=payload.get("year"),
+            )
             return
         if action == "work":
             self._send_work_choices(chat_id, payload, message_id)
@@ -3924,6 +4168,7 @@ class TelegramBotService:
                     or "",
                     "season_number": season.get("season_number"),
                     "episode_number": episode.get("episode_number"),
+                    "media_type": payload.get("media_type"),
                 },
                 candidates,
                 title,
@@ -3943,6 +4188,7 @@ class TelegramBotService:
                     or "",
                     "season_number": season.get("season_number"),
                     "episode_number": None,
+                    "media_type": payload.get("media_type"),
                 },
                 candidates,
                 title,
@@ -3962,14 +4208,17 @@ class TelegramBotService:
         match = service.pick_target(
             candidates, expr.season, expr.episode, media_type, year=expr.year, title=expr.title
         )
-        if match:
+        if match and match.get("title_matched") is not False:
             return match
         if expr.episode is None:
             return None
         try:
-            return service.resolve_episode_from_candidates(
+            resolved = service.resolve_episode_from_candidates(
                 candidates, expr.season, expr.episode, media_type, title=expr.title
             )
+            if resolved and resolved.get("title_matched") is not False:
+                return resolved
+            return None
         except Exception as exc:
             logger.debug("按候选定位剧集失败: %s", exc)
             return None

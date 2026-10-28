@@ -27,6 +27,7 @@ def _video_candidate():
     """一部带 S02（含 E03 / E04）的作品候选"""
     return {
         "title": "狂王",
+        "video_type": "tv",
         "item_type": "vl",
         "item_id": "vl1",
         "seasons": [
@@ -58,6 +59,7 @@ def _video_candidate_season_years():
     """多季剧按季标年份：第一季 2024、第二季 2026（作品级仍是 2024）"""
     return {
         "title": "狂王",
+        "video_type": "tv",
         "item_type": "vl",
         "item_id": "vl1",
         "date_air": "2024-05-01",
@@ -106,6 +108,7 @@ def _other_show_2026():
     """另一部 2026 年的同名剧（作品级 2026，只有第一季）"""
     return {
         "title": "狂王",
+        "video_type": "tv",
         "item_type": "vl",
         "item_id": "vl9",
         "date_air": "2026-03-01",
@@ -118,6 +121,17 @@ def _other_show_2026():
                 "episodes": [],
             }
         ],
+    }
+
+
+def _movie_candidate():
+    """电影候选（没有季 / 集，video_type=movie）"""
+    return {
+        "title": "Brothers",
+        "video_type": "movie",
+        "item_type": "vl",
+        "item_id": "vl-brothers",
+        "seasons": [],
     }
 
 
@@ -186,7 +200,9 @@ class _BotHarness(unittest.TestCase):
         self.sent.append(text)
         return len(self.sent)
 
-    def _fake_keyboard(self, chat_id, text, rows, edit_message_id=None, context=None):
+    def _fake_keyboard(
+        self, chat_id, text, rows, edit_message_id=None, context=None, reply_to=None
+    ):
         self.keyboards.append((text, rows))
 
     def _buttons(self, index=-1):
@@ -197,6 +213,11 @@ class _BotHarness(unittest.TestCase):
             if str(button.get("callback_data") or "").startswith(prefix):
                 return button
         self.fail(f"没有找到 {prefix} 按钮：{self._buttons(index)}")
+
+    def _choose_type(self, media_type="tv"):
+        action = "media_tv" if media_type == "tv" else "media_movie"
+        token = self._find_button(f"fx:{action}:")["callback_data"].split(":")[-1]
+        self.service._handle_flow_callback("1", action, token, None)
 
     def _context(self):
         return {
@@ -221,8 +242,16 @@ class TestSearchFlow(_BotHarness):
             _FakeUploadService,
         ):
             self.service._handle_correction(self._context(), "狂王", "1", 55)
+            # 只回复片名时先给电影 / 电视剧选项，不直接搜索
+            self.assertEqual(self.fake.searched, [])
+            self._find_button("fx:media_movie:")
+            self._find_button("fx:media_tv:")
+            self._find_button("fx:media_any:")
+            self._choose_type("tv")
 
         self.assertEqual(self.fake.created, [])  # 只搜索，不直接建任务
+        # 选择电视剧后必须带 tv 类型搜索
+        self.assertEqual(self.fake.video_types, ["tv"])
         button = self._find_button("fx:work:")
         self.assertIn("狂王", button["text"])
         self.assertIn("S02", button["text"])
@@ -268,6 +297,7 @@ class TestSearchFlow(_BotHarness):
             _FakeUploadService,
         ):
             self.service._handle_correction(self._context(), "狂王", "1", 55)
+            self._choose_type("tv")
             work_token = self._find_button("fx:work:")["callback_data"].split(":")[-1]
             self.service._handle_flow_callback("1", "work", work_token, None)
 
@@ -300,6 +330,7 @@ class TestSearchFlow(_BotHarness):
             _FakeUploadService,
         ):
             self.service._handle_correction(self._context(), "狂王", "1", 55)
+            self._choose_type("tv")
             work_token = self._find_button("fx:work:")["callback_data"].split(":")[-1]
             self.service._handle_flow_callback("1", "work", work_token, None)
             season_token = self._find_button("fx:season:")["callback_data"].split(":")[-1]
@@ -327,6 +358,7 @@ class TestSearchFlow(_BotHarness):
             _FakeUploadService,
         ):
             self.service._handle_correction(self._context(), "狂王 2024", "1", 55)
+            self._choose_type("tv")
 
         work_buttons = [
             button
@@ -336,11 +368,11 @@ class TestSearchFlow(_BotHarness):
         self.assertEqual(len(work_buttons), 1)
         self.assertIn("2024", work_buttons[0]["text"])
 
-    def test_title_only_reply_searches_without_type_filter(self):
-        """只回复片名（不带季/集）时按片名搜，不带 Emos 的 type 过滤
+    def test_unlimited_type_choice_searches_without_type_filter(self):
+        """选「不限类型」时按片名搜，不带 Emos 的 type 过滤
 
-        Emos 的 type 过滤不可靠（电影被存成剧集、特别篇…），带上报错上下文里的
-        类型会把真实条目滤掉，用户看到的就是「电影搜不到」。
+        Emos 的 type 过滤不可靠（电影被存成剧集、特别篇…），用户明确选
+        「不限类型」时不能把真实条目滤掉。
         """
         context = dict(
             self._context(), media_type="tv", season_number=None, episode_number=None
@@ -350,6 +382,8 @@ class TestSearchFlow(_BotHarness):
             _FakeUploadService,
         ):
             self.service._handle_correction(context, "流浪地球2", "1", 55)
+            any_token = self._find_button("fx:media_any:")["callback_data"].split(":")[-1]
+            self.service._handle_flow_callback("1", "media_any", any_token, None)
 
         self.assertEqual(self.fake.video_types, [None])
         self._find_button("fx:work:")
@@ -411,6 +445,106 @@ class TestSearchFlow(_BotHarness):
         )
 
 
+class TestMediaTypeChoice(_BotHarness):
+    """回复片名后先选电影 / 电视剧，再按类型搜候选"""
+
+    def setUp(self):
+        super().setUp()
+        self.tv = _video_candidate()
+        self.movie = _movie_candidate()
+        self.fake = _FakeUploadService([self.tv, self.movie])
+        _FakeUploadService._current = self.fake
+
+    def test_movie_choice_filters_tv_candidates(self):
+        with patch(
+            "src.video_organizer.core.online_upload.OnlineUploadService",
+            _FakeUploadService,
+        ):
+            self.service._handle_correction(self._context(), "Brothers", "1", 55)
+            self._choose_type("movie")
+
+        self.assertEqual(self.fake.video_types, ["movie"])
+        work_buttons = [
+            button
+            for button in self._buttons()
+            if str(button.get("callback_data") or "").startswith("fx:work:")
+        ]
+        self.assertEqual(len(work_buttons), 1)
+        self.assertIn("Brothers", work_buttons[0]["text"])
+        self.assertNotIn("狂王", work_buttons[0]["text"])
+
+    def test_movie_upload_uses_movie_media_type(self):
+        with patch(
+            "src.video_organizer.core.online_upload.OnlineUploadService",
+            _FakeUploadService,
+        ):
+            self.service._handle_correction(self._context(), "Brothers", "1", 55)
+            self._choose_type("movie")
+            work_token = self._find_button("fx:work:")["callback_data"].split(":")[-1]
+            self.service._handle_flow_callback("1", "work", work_token, None)
+
+        self.assertEqual(len(self.fake.created), 1)
+        created = self.fake.created[0]
+        self.assertEqual(created["media_type"], "movie")
+        self.assertEqual(created["item_type"], "vl")
+        self.assertEqual(created["item_id"], "vl-brothers")
+        self.assertIsNone(created["season_number"])
+
+    def test_switch_type_from_results_researches(self):
+        with patch(
+            "src.video_organizer.core.online_upload.OnlineUploadService",
+            _FakeUploadService,
+        ):
+            self.service._handle_correction(self._context(), "Brothers", "1", 55)
+            self._choose_type("tv")
+            self.assertEqual(self.fake.video_types, ["tv"])
+            self._choose_type("movie")
+
+        self.assertEqual(self.fake.video_types, ["tv", "movie"])
+        work_buttons = [
+            button
+            for button in self._buttons()
+            if str(button.get("callback_data") or "").startswith("fx:work:")
+        ]
+        self.assertEqual(len(work_buttons), 1)
+        self.assertIn("Brothers", work_buttons[0]["text"])
+
+    def test_episode_reply_forces_tv_even_if_context_says_movie(self):
+        context = dict(self._context(), media_type="movie")
+        with patch(
+            "src.video_organizer.core.online_upload.OnlineUploadService",
+            _FakeUploadService,
+        ):
+            self.service._handle_correction(context, "狂王 S02E04", "1", 55)
+
+        # 第一次必须按 tv 搜；定位不到时会去掉类型再兜底一次（兼容 Emos 类型标错）
+        self.assertEqual(self.fake.video_types[0], "tv")
+
+    def test_selected_episode_forces_tv_media_type(self):
+        context = dict(self._context(), media_type="movie")
+        selection = {
+            "item_type": "ve",
+            "item_id": "ve24",
+            "label": "第四集",
+            "season_number": 2,
+            "episode_number": 4,
+        }
+        with patch(
+            "src.video_organizer.core.online_upload.OnlineUploadService",
+            _FakeUploadService,
+        ):
+            self.service._apply_target_selection(
+                "1", context, selection, [self.tv], "狂王", None
+            )
+
+        self.assertEqual(self.fake.created[0]["media_type"], "tv")
+
+    def test_media_type_filter_keeps_unknown_types(self):
+        unknown = {"title": "未知类型", "item_id": "vl-unknown"}
+        kept = TelegramBotService._filter_by_media_type([self.tv, self.movie, unknown], "movie")
+        self.assertEqual([video["item_id"] for video in kept], ["vl-brothers", "vl-unknown"])
+
+
 class TestSeasonYearMatching(_BotHarness):
     """多季剧按季标年份（第一季 2024、第二季 2026）时的年份匹配回归
 
@@ -460,6 +594,7 @@ class TestSeasonYearMatching(_BotHarness):
             _FakeUploadService,
         ):
             self.service._handle_correction(self._context(), "狂王 2024", "1", 55)
+            self._choose_type("tv")
 
         self.assertIn("已按年份 2024 优先筛选", self.keyboards[-1][0])
 
@@ -471,6 +606,7 @@ class TestSeasonYearMatching(_BotHarness):
             _FakeUploadService,
         ):
             self.service._handle_correction(self._context(), "狂王 2099", "1", 55)
+            self._choose_type("tv")
 
         self.assertIn("没有年份为 2099 的候选", self.keyboards[-1][0])
         self.assertTrue(
@@ -492,6 +628,7 @@ class TestSeasonYearMatching(_BotHarness):
             _FakeUploadService,
         ):
             self.service._handle_correction(context, "查无此剧", "1", 55)
+            self._choose_type("tv")
 
         self.assertTrue(any("狂王" in button["text"] for button in self._buttons()))
 

@@ -639,6 +639,15 @@ class OnlineUploadService:
                         match = self.resolve_episode_from_candidates(
                             candidates, season, episode, media_type, title=title
                         )
+                    if match and match.get("title_matched") is False:
+                        # 自动匹配不能拿标题不相关的候选硬凑：Emos 搜索「Brothers」
+                        # 可能返回 Ang Probinsyano 等其他剧，再按同号集就传错片了。
+                        logger.info(
+                            "跳过标题不匹配的 Emos 候选: %s（搜索词: %s）",
+                            match.get("video_title") or match.get("label") or "",
+                            title,
+                        )
+                        match = None
                 if not match and (media_type == "tv" or (media_type != "movie" and episode is not None)):
                     if episode is None:
                         errors.append("未能从文件名解析出季/集号，无法定位到具体某一集")
@@ -918,13 +927,11 @@ class OnlineUploadService:
                 for video in ordered
                 if isinstance(video, dict) and _title_matches(video.get("title"), title)
             ]
+            # 只要存在标题相关的候选，就只在它们里面找；否则「Brothers」搜不到
+            # 本剧时，会顺着候选列表把另一部剧的同号集（如 Ang Probinsyano）
+            # 当成目标上传。确实一部都对不上时才保留原顺序（兼容中英文别名）。
             if matched:
-                rest = [
-                    video
-                    for video in ordered
-                    if not (isinstance(video, dict) and _title_matches(video.get("title"), title))
-                ]
-                ordered = matched + rest
+                ordered = matched
         for video in ordered:
             if not isinstance(video, dict):
                 continue
@@ -940,6 +947,10 @@ class OnlineUploadService:
                         "item_id": str(item_id),
                         "label": video.get("title") or "",
                         "kind": "movie",
+                        "title_matched": True
+                        if not title
+                        else _title_matches(video.get("title"), title),
+                        "video_title": video.get("title") or "",
                     }
                 continue
             # 年份命中某季时优先选那季（多季剧按季标年份：S01=2024、S02=2026）
@@ -969,6 +980,10 @@ class OnlineUploadService:
                                 "kind": "episode",
                                 "season_number": season_number,
                                 "episode_number": _to_int(episode_item.get("episode_number")),
+                                "title_matched": True
+                                if not title
+                                else _title_matches(video.get("title"), title),
+                                "video_title": video.get("title") or "",
                             }
                 if episode is None and season_item.get("item_id"):
                     return {
@@ -977,6 +992,10 @@ class OnlineUploadService:
                         "label": season_item.get("season_title") or video.get("title") or "",
                         "kind": "season",
                         "season_number": season_number,
+                        "title_matched": True
+                        if not title
+                        else _title_matches(video.get("title"), title),
+                        "video_title": video.get("title") or "",
                     }
         return None
 
@@ -1037,6 +1056,13 @@ class OnlineUploadService:
                 break
             resolved = self.resolve_episode_from_tree(client, vl_id, season, episode)
             if resolved:
+                resolved = dict(resolved)
+                resolved["title_matched"] = (
+                    True
+                    if not title
+                    else _title_matches(video.get("title"), title)
+                )
+                resolved["video_title"] = video.get("title") or ""
                 return resolved
         return None
 

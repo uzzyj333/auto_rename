@@ -27,7 +27,7 @@ curl -s http://127.0.0.1:8080/api/auth/first-run-credentials   # 用户名 admin
 - 配置管理：`emos.auth_token`、`tmdb.api_key`、`online_upload.video_root = /media`、`processing.max_upload_workers`（所有选项都是中文说明）
 - 下载器：在「下载器管理」或「配置管理 → 下载器配置」里在线添加 aria2 / qBittorrent（可多个实例，如 `aria2_2`），保存立即生效；路径不一致时填 `path_mappings = 下载器路径:容器内路径`
 - 日志：只需要选日志等级，日志文件自动维护，在「日志查看」页面直接看，不用填路径
-- Telegram：填 `bot_token`，在 TG 里发 `/bind`；上传失败可直接回复 `剧名S04E09` 修正目标
+- Telegram：填 `bot_token`，在 TG 里发 `/bind`；上传失败可直接回复 `剧名S04E09` 修正目标，或只回复片名后先选电影 / 电视剧再点选条目
 
 其他：
 
