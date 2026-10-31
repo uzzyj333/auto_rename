@@ -192,8 +192,8 @@ DEFAULT_CONFIG = {
         "base_url": "https://emos.best",
         "file_storage": "internal",  # internal / global / default / google_drive / zn_r2_upload
         "file_storages": "internal,default,google_drive,zn_r2_upload",  # 在线上传页面可选的存储列表
-        "chunk_size_mb": 50,
-        "upload_concurrency": 10,  # 分片并发上传数（1-32）
+        "chunk_size_mb": 200,
+        "upload_concurrency": 10,  # 单文件分片并发上限（实际从 4 路自适应升速）
         "upload_subtitles": True,  # 上传视频时顺带上传同目录同名的外挂字幕
         "timeout": 60,
     },

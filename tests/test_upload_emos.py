@@ -17,13 +17,18 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import requests
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.video_organizer.core.emos_client import EmosApiError, EmosClient
 from src.video_organizer.upload.upload_emos import (
     RobustEmosVideoUploader,
+    _AdaptiveUploadWindow,
+    _RangeReader,
+    _retry_delay,
     _recall_tg_message,
     find_subtitle_files,
     format_time,
@@ -73,6 +78,48 @@ class _BarrierSession:
 
     def close(self):
         self.closed = True
+
+
+class _ReadingSession:
+    """真正消费请求体的会话，用于验证分片是流式发送且区间正确"""
+
+    def __init__(self):
+        self.payloads = {}
+        self.max_read = 0
+        self.saw_bytes = False
+        self.closed = False
+
+    def put(self, url, **kwargs):
+        data = kwargs["data"]
+        self.saw_bytes = self.saw_bytes or isinstance(data, (bytes, bytearray))
+        chunks = []
+        while True:
+            chunk = data.read(64 * 1024)
+            if not chunk:
+                break
+            self.max_read = max(self.max_read, len(chunk))
+            chunks.append(chunk)
+        self.payloads[url.rsplit("/", 1)[-1]] = b"".join(chunks)
+        return _FakeResponse(200, {"ETag": '"etag-1"'})
+
+    def close(self):
+        self.closed = True
+
+
+class _FailFirstReadSession(_ReadingSession):
+    """第一次请求读一半就断开，模拟网络中断后的重试"""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def put(self, url, **kwargs):
+        self.calls += 1
+        data = kwargs["data"]
+        if self.calls == 1:
+            data.read(100 * 1024)
+            raise requests.exceptions.ConnectionError("connection reset")
+        return super().put(url, **kwargs)
 
 
 class _RecordingTusSession:
@@ -233,6 +280,7 @@ class TestUploadEmosDirectPut(unittest.TestCase):
 
     def test_upload_concurrency_is_clamped(self):
         self.assertEqual(self._uploader().upload_concurrency, 10)
+        self.assertEqual(self._uploader().chunk_size_mb, 200)
         self.assertEqual(
             RobustEmosVideoUploader(
                 auth_token="t", upload_concurrency=0
@@ -251,6 +299,48 @@ class TestUploadEmosDirectPut(unittest.TestCase):
             ).upload_concurrency,
             8,
         )
+
+    def test_adaptive_upload_window_ramps_up_and_backs_off(self):
+        window = _AdaptiveUploadWindow(10, 20)
+        self.assertEqual(window.snapshot()[0], 4)
+
+        window.success()
+        window.success()
+        self.assertEqual(window.snapshot()[0], 5)
+
+        for _ in range(20):
+            window.success()
+        self.assertEqual(window.snapshot()[0], 10)
+
+        window.throttle(1.0)
+        limit, cooldown = window.snapshot()
+        self.assertEqual(limit, 5)
+        self.assertGreater(cooldown, 0)
+
+    def test_retry_delay_honors_retry_after_and_is_capped(self):
+        self.assertGreaterEqual(_retry_delay(1, 3.0), 3.0)
+        with patch(
+            "src.video_organizer.upload.upload_emos.random.uniform",
+            return_value=1.0,
+        ):
+            self.assertEqual(_retry_delay(10, 120.0), 30.0)
+
+    def test_put_part_honors_server_retry_after(self):
+        uploader = self._uploader(max_retries=2)
+        session = MagicMock()
+        session.put.side_effect = [
+            _FakeResponse(429, {"Retry-After": "2"}),
+            _FakeResponse(200, {"ETag": '"etag-ok"'}),
+        ]
+        uploader.storage_session = session
+
+        with patch("src.video_organizer.upload.upload_emos.time.sleep") as sleep:
+            etag = uploader._put_part(
+                "https://r2.example.com/p1", b"abcd", 4, 1, 1, "video/x-matroska"
+            )
+
+        self.assertEqual(etag, "etag-ok")
+        self.assertGreaterEqual(sleep.call_args_list[0].args[0], 2.0)
 
     def test_storage_session_pool_covers_concurrency(self):
         """连接池必须跟得上并发数，否则连接被反复丢弃会拖慢上传"""
@@ -290,6 +380,71 @@ class TestUploadEmosDirectPut(unittest.TestCase):
             _, parts = uploader.client.multipart_complete.call_args[0]
             self.assertEqual([part["number"] for part in parts], [1, 2, 3, 4])
             self.assertTrue(all(part["etag"] == "etag-1" for part in parts))
+        finally:
+            os.remove(path)
+
+    def test_multipart_streams_each_part_from_disk(self):
+        """分片必须按区间流式读取，不能把整片读进内存"""
+        size = 4 * 1024 * 1024
+        content = bytes(range(256)) * (size // 256)
+        handle, path = tempfile.mkstemp(suffix=".mkv")
+        os.write(handle, content)
+        os.close(handle)
+        try:
+            uploader = self._uploader()
+            uploader.chunk_size_mb = 1  # 1MB/片 -> 4 片
+            uploader.upload_concurrency = 2
+            uploader.client.multipart_presign = MagicMock(
+                return_value=[
+                    {"number": i, "upload_url": f"https://r2.example.com/p{i}"}
+                    for i in range(1, 5)
+                ]
+            )
+            uploader.client.multipart_complete = MagicMock(return_value={})
+            session = _ReadingSession()
+            uploader.storage_session = session
+
+            uploader._upload_multipart(
+                Path(path),
+                {"file_id": "f1", "data": {"multipart_size": {"min": 0, "max": 0}}},
+                size,
+            )
+
+            self.assertFalse(session.saw_bytes)
+            self.assertLessEqual(session.max_read, 64 * 1024)
+            part_size = 1024 * 1024
+            for part_number in range(1, 5):
+                expected = content[
+                    (part_number - 1) * part_size : part_number * part_size
+                ]
+                self.assertEqual(session.payloads[f"p{part_number}"], expected)
+        finally:
+            os.remove(path)
+
+    def test_put_part_retry_reopens_stream_from_part_start(self):
+        size = 300 * 1024
+        content = b"y" * size
+        handle, path = tempfile.mkstemp(suffix=".mkv")
+        os.write(handle, content)
+        os.close(handle)
+        try:
+            uploader = self._uploader(max_retries=2)
+            session = _FailFirstReadSession()
+            uploader.storage_session = session
+
+            with patch("src.video_organizer.upload.upload_emos.time.sleep"):
+                etag = uploader._put_part(
+                    "https://r2.example.com/p1",
+                    lambda: _RangeReader(Path(path), 0, size),
+                    size,
+                    1,
+                    1,
+                    "video/x-matroska",
+                )
+
+            self.assertEqual(etag, "etag-1")
+            self.assertEqual(session.calls, 2)
+            self.assertEqual(session.payloads["p1"], content)
         finally:
             os.remove(path)
 

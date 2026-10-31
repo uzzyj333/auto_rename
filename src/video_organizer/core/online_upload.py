@@ -31,6 +31,7 @@ from .guessit_parser import strip_leading_bracket_prefix
 from .incomplete_downloads import collect_incomplete_paths, is_incomplete
 from .probe import probe_summary_for_upload, probe_video
 from ..upload.upload_emos import (
+    DEFAULT_CHUNK_MB,
     DEFAULT_UPLOAD_CONCURRENCY,
     SUBTITLE_EXTENSIONS,
     RobustEmosVideoUploader,
@@ -401,7 +402,7 @@ class OnlineUploadService:
             "video_root": str(online.get("video_root") or ""),
             "roots": self.roots(),
             "probe_enabled": bool(online.get("probe_enabled", True)),
-            "chunk_size_mb": int(emos.get("chunk_size_mb") or 50),
+            "chunk_size_mb": int(emos.get("chunk_size_mb") or DEFAULT_CHUNK_MB),
         }
 
     # ------------------------------------------------------------------
@@ -1541,7 +1542,7 @@ class OnlineUploadService:
             uploader = RobustEmosVideoUploader(
                 auth_token=self._token(),
                 base_url=self._base_url(),
-                chunk_size_mb=int(emos.get("chunk_size_mb") or 50),
+                chunk_size_mb=int(emos.get("chunk_size_mb") or DEFAULT_CHUNK_MB),
                 upload_concurrency=int(
                     emos.get("upload_concurrency") or DEFAULT_UPLOAD_CONCURRENCY
                 ),

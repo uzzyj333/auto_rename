@@ -600,7 +600,7 @@ const FIELD_LABELS = {
     emos: {
         auth_token: 'Emos 认证令牌', base_url: 'Emos 服务地址',
         file_storage: '默认存储类型', file_storages: '可选存储类型',
-        chunk_size_mb: '分片大小（MB）', upload_concurrency: '分片并发上传数',
+        chunk_size_mb: '分片大小（MB）', upload_concurrency: '分片并发上限（自动升速）',
         upload_subtitles: '上传视频时顺带上传外挂字幕',
         timeout: '请求超时（秒）',
     },

@@ -647,7 +647,7 @@ async def get_config_schema():
                 "file_storage": "默认文件存储类型",
                 "file_storages": "在线上传可选的存储列表",
                 "chunk_size_mb": "分片大小（MB）",
-                "upload_concurrency": "分片并发上传数（1-32）",
+                "upload_concurrency": "单文件分片并发上限（1-32，自动升速）",
                 "upload_subtitles": "上传视频时顺带上传同目录同名的外挂字幕",
                 "timeout": "请求超时（秒）",
             }

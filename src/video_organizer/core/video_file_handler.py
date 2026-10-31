@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
 # 导入项目内部的上传工具
-from ..upload.upload_emos import DEFAULT_UPLOAD_CONCURRENCY, RobustEmosVideoUploader
+from ..upload.upload_emos import (
+    DEFAULT_CHUNK_MB,
+    DEFAULT_UPLOAD_CONCURRENCY,
+    RobustEmosVideoUploader,
+)
 
 from .emos_client import EmosClient
 from .probe import probe_summary_for_upload, probe_video
@@ -202,9 +206,11 @@ class VideoFileHandler:
         self.emos_base_url = self._clean_value(emos.get("base_url", ""), "https://emos.best")
         self.emos_file_storage = self._clean_value(emos.get("file_storage", ""), "internal")
         try:
-            self.emos_chunk_size_mb = int(emos.get("chunk_size_mb", 50))
+            self.emos_chunk_size_mb = int(
+                emos.get("chunk_size_mb", DEFAULT_CHUNK_MB)
+            )
         except (TypeError, ValueError):
-            self.emos_chunk_size_mb = 50
+            self.emos_chunk_size_mb = DEFAULT_CHUNK_MB
         try:
             self.emos_upload_concurrency = int(
                 emos.get("upload_concurrency", DEFAULT_UPLOAD_CONCURRENCY)

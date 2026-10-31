@@ -23,9 +23,12 @@ import base64
 import logging
 import math
 import os
+import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlsplit
@@ -66,13 +69,25 @@ def _recall_tg_message(key: str) -> Optional[int]:
 
 ProgressCallback = Callable[[float, int, int, str], None]
 
-DEFAULT_CHUNK_MB = 50
+DEFAULT_CHUNK_MB = 200
 MIN_CHUNK_MB = 10
 MAX_CHUNK_MB = 200
 MAX_PARTS = 1000
 DEFAULT_UPLOAD_CONCURRENCY = 10
 MIN_UPLOAD_CONCURRENCY = 1
 MAX_UPLOAD_CONCURRENCY = 32
+DEFAULT_MAX_RETRIES = 5
+
+# 分片并发从较小值起步，成功后逐步升到配置上限。这样既能利用多连接
+# 提速，又不会一开始就把站点打满；遇到限流 / 服务端错误时立即减半。
+INITIAL_UPLOAD_CONCURRENCY = 4
+CONCURRENCY_INCREASE_AFTER = 2
+
+# 全局分片请求上限：多个文件同时上传时，避免线程数 / 连接数随
+# 「文件数 × 每文件并发」无限放大（例如 3 个文件 × 10 并发 = 30 条连接）。
+# 参考实现默认 3 个文件 × 3 并发，这里保留少量冗余但远低于此前的 32。
+MAX_GLOBAL_PART_CONCURRENCY = 16
+_PART_UPLOAD_SLOTS = threading.BoundedSemaphore(MAX_GLOBAL_PART_CONCURRENCY)
 
 # tus 单次 PATCH 上限（官方建议不要超过 100MB）
 TUS_MAX_CHUNK_SIZE = 100 * 1024 * 1024
@@ -85,6 +100,76 @@ SUBTITLE_NAME_SEPARATORS = (".", "_", "-", " ")
 
 # 目录内可能出现的视频扩展名，用于判断字幕到底属于同目录中的哪个视频
 VIDEO_FILE_SUFFIXES = {ext.lower() for ext in VIDEO_MIME_TYPES}
+
+
+def _parse_retry_after(value: Any) -> Optional[float]:
+    """解析 Retry-After（秒数或 HTTP 日期），无法解析时返回 None"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return max(0.0, float(text))
+    except (TypeError, ValueError):
+        pass
+    try:
+        moment = parsedate_to_datetime(text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if moment is None:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return max(0.0, (moment - datetime.now(timezone.utc)).total_seconds())
+
+
+def _retry_delay(attempt: int, retry_after: Optional[float] = None) -> float:
+    """指数退避 + 随机抖动，避免多个分片同时重试形成新的流量峰值"""
+    exponent = max(0, min(int(attempt) - 1, 4))
+    delay = (2**exponent) * random.uniform(0.5, 1.0)
+    if retry_after is not None:
+        delay = max(delay, min(float(retry_after), 30.0))
+    return max(0.2, min(delay, 30.0))
+
+
+class _AdaptiveUploadWindow:
+    """单个文件的分片并发窗口（成功后加一，限流时减半）"""
+
+    def __init__(self, max_workers: int, total_parts: int) -> None:
+        self.max_workers = max(1, min(int(max_workers), int(total_parts)))
+        self._limit = max(
+            1,
+            min(INITIAL_UPLOAD_CONCURRENCY, self.max_workers, int(total_parts)),
+        )
+        self._successes = 0
+        self._cooldown_until = 0.0
+        self._lock = threading.Lock()
+
+    def snapshot(self) -> Tuple[int, float]:
+        """返回 (当前允许并发数, 冷却剩余秒数)"""
+        with self._lock:
+            return self._limit, max(0.0, self._cooldown_until - time.time())
+
+    def success(self) -> None:
+        with self._lock:
+            if time.time() < self._cooldown_until:
+                return
+            self._successes += 1
+            if (
+                self._successes >= CONCURRENCY_INCREASE_AFTER
+                and self._limit < self.max_workers
+            ):
+                self._limit += 1
+                self._successes = 0
+
+    def throttle(self, delay: float) -> None:
+        """服务端限流或连接异常：并发减半，并暂停新分片一小段时间"""
+        with self._lock:
+            self._limit = max(1, self._limit // 2)
+            self._successes = 0
+            self._cooldown_until = max(
+                self._cooldown_until,
+                time.time() + max(0.0, min(float(delay), 30.0)),
+            )
 
 
 def _subtitle_owner(sub_stem: str, video_stems: Any) -> Optional[str]:
@@ -245,7 +330,7 @@ class RobustEmosVideoUploader:
         upload_subtitles: bool = True,
         telegram_config: Optional[Dict[str, Any]] = None,
         timeout: int = 60,
-        max_retries: int = 3,
+        max_retries: int = DEFAULT_MAX_RETRIES,
         progress_callback: Optional[ProgressCallback] = None,
         **_legacy_kwargs,
     ):
@@ -279,6 +364,7 @@ class RobustEmosVideoUploader:
         adapter = HTTPAdapter(
             pool_connections=self.upload_concurrency,
             pool_maxsize=self.upload_concurrency,
+            pool_block=True,
         )
         self.storage_session.mount("http://", adapter)
         self.storage_session.mount("https://", adapter)
@@ -724,7 +810,14 @@ class RobustEmosVideoUploader:
 
         total_parts = len(by_number)
         workers = max(1, min(self.upload_concurrency, total_parts))
-        logger.info("分片上传并发数: %d", workers)
+        window = _AdaptiveUploadWindow(workers, total_parts)
+        initial_limit, _ = window.snapshot()
+        logger.info(
+            "分片上传并发数: 起始 %d，最高 %d，全局上限 %d",
+            initial_limit,
+            workers,
+            MAX_GLOBAL_PART_CONCURRENCY,
+        )
 
         parts: List[Dict[str, Any]] = []
         uploaded_bytes = 0
@@ -733,12 +826,18 @@ class RobustEmosVideoUploader:
         self._progress_started_at = started_at
         self._progress_total_parts = total_parts
         self._progress_parts_done = 0
+        cancelled = threading.Event()
+
+        def on_throttle(delay: float) -> None:
+            window.throttle(delay)
 
         def upload_one(
             part_number: int, item: Dict[str, Any]
         ) -> Optional[Dict[str, Any]]:
-            """上传单个分片（每个分片独立打开文件，避免多线程共用句柄）"""
+            """上传单个分片（从磁盘流式发送，避免整片读进内存）"""
             nonlocal uploaded_bytes
+            if cancelled.is_set():
+                return None
             offset = (part_number - 1) * part_size
             length = min(part_size, file_size - offset)
             if length <= 0:
@@ -747,12 +846,23 @@ class RobustEmosVideoUploader:
             if not upload_url:
                 raise EmosApiError(f"分片 {part_number} 缺少上传地址")
 
-            with open(path, "rb") as handle:
-                handle.seek(offset)
-                payload = handle.read(length)
-            etag = self._put_part(
-                upload_url, payload, length, part_number, number, file_type
-            )
+            # 每次重试都重新打开文件流，避免重试时从上次中断的位置继续读，
+            # 同时避免把 200MB 分片整体读进内存（多文件并发时容易 OOM）。
+            def open_payload():
+                return _RangeReader(path, offset, length)
+
+            with _PART_UPLOAD_SLOTS:
+                if cancelled.is_set():
+                    return None
+                etag = self._put_part(
+                    upload_url,
+                    open_payload,
+                    length,
+                    part_number,
+                    number,
+                    file_type,
+                    on_throttle=on_throttle,
+                )
 
             with lock:
                 uploaded_bytes += length
@@ -785,17 +895,53 @@ class RobustEmosVideoUploader:
             with ThreadPoolExecutor(
                 max_workers=workers, thread_name_prefix="emos-part"
             ) as pool:
-                futures = [
-                    pool.submit(upload_one, part_number, by_number[part_number])
-                    for part_number in ordered
-                ]
-                try:
-                    for future in as_completed(futures):
+                pending = set()
+                next_index = 0
+
+                def collect(done) -> None:
+                    for future in done:
                         result = future.result()
                         if result:
                             parts.append(result)
+                        window.success()
+
+                try:
+                    while next_index < len(ordered) or pending:
+                        limit, cooldown = window.snapshot()
+                        if cooldown > 0:
+                            if pending:
+                                done, pending = wait(
+                                    pending,
+                                    timeout=min(cooldown, 0.25),
+                                    return_when=FIRST_COMPLETED,
+                                )
+                                collect(done)
+                            else:
+                                time.sleep(min(cooldown, 0.25))
+                            continue
+
+                        while next_index < len(ordered) and len(pending) < limit:
+                            part_number = ordered[next_index]
+                            pending.add(
+                                pool.submit(
+                                    upload_one,
+                                    part_number,
+                                    by_number[part_number],
+                                )
+                            )
+                            next_index += 1
+
+                        if not pending:
+                            continue
+                        done, pending = wait(
+                            pending,
+                            timeout=0.25,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        collect(done)
                 except Exception:
-                    for future in futures:
+                    cancelled.set()
+                    for future in pending:
                         future.cancel()
                     raise
 
@@ -808,11 +954,12 @@ class RobustEmosVideoUploader:
     def _put_part(
         self,
         upload_url: str,
-        payload: bytes,
+        payload: Any,
         length: int,
         part_number: int,
         total_parts: int,
         content_type: str,
+        on_throttle: Optional[Callable[[float], None]] = None,
     ) -> str:
         """上传单个分片，返回 ETag
 
@@ -825,19 +972,31 @@ class RobustEmosVideoUploader:
         }
         last_error: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
+            # payload 可以是 bytes（兼容旧调用），也可以是工厂函数：
+            # 工厂每次重试返回一个全新的有界文件流，失败后能从分片开头重发。
+            body = payload() if callable(payload) else payload
             try:
                 response = self.storage_session.put(
                     upload_url,
-                    data=payload,
+                    data=body,
                     headers=headers,
                     timeout=max(self.timeout, 600),
                 )
             except requests.exceptions.RequestException as exc:
                 last_error = exc
+                self._close_body(body)
                 if attempt < self.max_retries:
-                    time.sleep(min(attempt, 5))
+                    delay = _retry_delay(attempt)
+                    if on_throttle:
+                        on_throttle(delay)
+                    time.sleep(delay)
                     continue
-                raise EmosApiError(f"分片 {part_number}/{total_parts} 上传失败: {exc}") from exc
+                raise EmosApiError(
+                    f"分片 {part_number}/{total_parts} 上传失败: {exc}"
+                ) from exc
+            except Exception:
+                self._close_body(body)
+                raise
 
             try:
                 status = response.status_code
@@ -847,8 +1006,12 @@ class RobustEmosVideoUploader:
                     or response.headers.get("etag")
                     or ""
                 ).strip().strip('"')
-                body = "" if 200 <= status < 300 else self._response_snippet(response)
+                response_body = (
+                    "" if 200 <= status < 300 else self._response_snippet(response)
+                )
+                retry_after = _parse_retry_after(response.headers.get("Retry-After"))
             finally:
+                self._close_body(body)
                 try:
                     response.close()
                 except Exception:
@@ -859,16 +1022,32 @@ class RobustEmosVideoUploader:
                     raise EmosApiError(f"分片 {part_number}/{total_parts} 响应缺少 ETag")
                 return etag
 
-            detail = f" - {body}" if body else ""
+            detail = f" - {response_body}" if response_body else ""
             last_error = EmosApiError(
                 f"分片 {part_number}/{total_parts} 上传失败: HTTP {status}{detail}"
             )
-            if status in {408, 425, 429, 500, 502, 503, 504} and attempt < self.max_retries:
-                time.sleep(min(attempt, 5))
+            if (
+                status in {408, 425, 429, 500, 502, 503, 504}
+                and attempt < self.max_retries
+            ):
+                delay = _retry_delay(attempt, retry_after)
+                if on_throttle:
+                    on_throttle(delay)
+                time.sleep(delay)
                 continue
             raise last_error
 
         raise EmosApiError(f"分片 {part_number}/{total_parts} 上传失败: {last_error}")
+
+    @staticmethod
+    def _close_body(body: Any) -> None:
+        """关闭本次请求使用的文件流（bytes 没有 close，忽略即可）"""
+        close = getattr(body, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
     @staticmethod
     def _response_snippet(response: requests.Response, limit: int = 300) -> str:
@@ -1131,16 +1310,19 @@ class RobustEmosVideoUploader:
         offset = 0
         while offset < file_size:
             length = min(chunk_size, file_size - offset)
-            with open(path, "rb") as handle:
-                handle.seek(offset)
-                payload = handle.read(length)
             headers = {
                 "Tus-Resumable": "1.0.0",
                 "Upload-Offset": str(offset),
                 "Content-Type": "application/offset+octet-stream",
-                "Content-Length": str(len(payload)),
+                "Content-Length": str(length),
             }
-            status, next_offset, body = self._patch_tus(upload_url, payload, headers)
+            status, next_offset, body = self._patch_tus(
+                upload_url,
+                lambda offset=offset, length=length: _RangeReader(
+                    path, offset, length
+                ),
+                headers,
+            )
             if not (200 <= status < 300):
                 detail = f" - {body}" if body else ""
                 raise EmosApiError(f"tusd 上传失败: HTTP {status}{detail}")
@@ -1159,31 +1341,39 @@ class RobustEmosVideoUploader:
                 )
 
     def _patch_tus(
-        self, upload_url: str, payload: bytes, headers: Dict[str, str]
+        self, upload_url: str, payload: Any, headers: Dict[str, str]
     ) -> Tuple[int, Optional[int], str]:
         """发送一个 tus PATCH（带重试），返回 (status, 新 offset, 响应体片段)"""
         last_error: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
+            request_body = payload() if callable(payload) else payload
             try:
                 response = self.storage_session.patch(
                     upload_url,
-                    data=payload,
+                    data=request_body,
                     headers=headers,
                     timeout=max(self.timeout, 600),
                 )
             except requests.exceptions.RequestException as exc:
                 last_error = exc
+                self._close_body(request_body)
                 if attempt < self.max_retries:
-                    time.sleep(min(attempt, 5))
+                    time.sleep(_retry_delay(attempt))
                     continue
                 raise EmosApiError(f"tusd 上传失败: {exc}") from exc
+            except Exception:
+                self._close_body(request_body)
+                raise
             try:
                 status = response.status_code
-                body = "" if 200 <= status < 300 else self._response_snippet(response)
+                response_body = (
+                    "" if 200 <= status < 300 else self._response_snippet(response)
+                )
                 next_offset = self._parse_tus_offset(
                     response.headers.get("Upload-Offset")
                 )
             finally:
+                self._close_body(request_body)
                 try:
                     response.close()
                 except Exception:
@@ -1191,9 +1381,10 @@ class RobustEmosVideoUploader:
             if 200 <= status < 300:
                 return status, next_offset, ""
             if status in {408, 425, 429, 500, 502, 503, 504} and attempt < self.max_retries:
-                time.sleep(min(attempt, 5))
+                retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+                time.sleep(_retry_delay(attempt, retry_after))
                 continue
-            return status, next_offset, body
+            return status, next_offset, response_body
         raise EmosApiError(f"tusd 上传失败: {last_error}")
 
     # ------------------------------------------------------------------
@@ -1380,7 +1571,60 @@ class RobustEmosVideoUploader:
             pass
 
 
-class _ProgressReader:
+class _RangeReader:
+    """有界文件流：只读取 [offset, offset+length) 区间，供 requests 流式发送
+
+    requests / urllib3 会按块调用 ``read()``，不会把整个分片读进内存；
+    每次重试重新构造一个实例即可从分片开头重发。
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        offset: int,
+        length: int,
+        block_size: int = 1024 * 1024,
+    ):
+        self._handle = open(path, "rb")
+        self._handle.seek(int(offset))
+        self._remaining = max(int(length), 0)
+        self._length = self._remaining
+        self._block_size = max(int(block_size), 16 * 1024)
+        self._buffer = b""
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = self._block_size
+        if not self._buffer:
+            if self._remaining <= 0:
+                return b""
+            to_read = min(self._block_size, self._remaining)
+            self._buffer = self._handle.read(to_read)
+            if not self._buffer:
+                raise IOError("上传文件在传输过程中被截断")
+            self._remaining -= len(self._buffer)
+        size = max(int(size), 1)
+        data = self._buffer[:size]
+        self._buffer = self._buffer[size:]
+        return data
+
+    def __len__(self) -> int:
+        return self._remaining + len(self._buffer)
+
+    def close(self) -> None:
+        try:
+            self._handle.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "_RangeReader":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+
+class _ProgressReader(_RangeReader):
     """包装文件对象，按读取进度回调（用于直传上报进度）"""
 
     def __init__(self, handle, offset: int, total: int, callback):
@@ -1389,11 +1633,17 @@ class _ProgressReader:
         self._total = total
         self._callback = callback
         self._last_report = 0.0
+        self._remaining = max(total - offset, 0)
+        self._length = self._remaining
+        self._block_size = 256 * 1024
 
     def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = self._block_size
         data = self._handle.read(size)
         if data:
             self._read += len(data)
+            self._remaining = max(self._total - self._read, 0)
             now = time.time()
             if now - self._last_report >= 0.5 or self._read >= self._total:
                 self._last_report = now
@@ -1404,4 +1654,4 @@ class _ProgressReader:
         return data
 
     def __len__(self) -> int:
-        return max(self._total - (self._read - len(b"")), 0)
+        return max(self._total - self._read, 0)

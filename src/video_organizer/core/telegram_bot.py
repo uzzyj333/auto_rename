@@ -2650,7 +2650,7 @@ class TelegramBotService:
     _QUICK_INPUTS = [
         ("processing", "max_upload_workers", "上传并发数"),
         ("emos", "chunk_size_mb", "分片大小(MB)"),
-        ("emos", "upload_concurrency", "分片上传并发"),
+        ("emos", "upload_concurrency", "分片上传并发上限"),
         ("logging", "log_level", "日志等级"),
     ]
 

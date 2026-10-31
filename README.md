@@ -157,7 +157,7 @@ python -m src.video_organizer.main --process "D:\video.mkv"
 | `[llm_fallback]` | LLM 兜底解析开关和并发控制 |
 | `[llm_provider_N]` | LLM 提供商（名称/地址/密钥/模型/权重/超时），支持多个 |
 | `[processing]` | 上传目标（固定 `emos`）、上传后删除源文件、最大上传并发数 |
-| `[emos]` | Emos 认证令牌、API 地址（默认 `https://emos.best`）、存储类型、分片大小 |
+| `[emos]` | Emos 认证令牌、API 地址（默认 `https://emos.best`）、存储类型、分片大小、自适应分片并发 |
 | `[online_upload]` | 在线识别上传：视频根目录、ffprobe 开关与路径、path_type |
 | `[downloader.aria2]` | aria2 RPC 地址、密钥、监控模式（轮询/WebSocket/Webhook）|
 | `[downloader.qbittorrent]` | qBittorrent 地址、用户名、密码 |
