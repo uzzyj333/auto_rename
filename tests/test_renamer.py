@@ -10,7 +10,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.video_organizer.core.renamer import VideoRenamer
+from src.video_organizer.core.renamer import VideoRenamer, _tmdb_title_match_score
 
 
 class TestVideoRenamer(unittest.TestCase):
@@ -262,6 +262,74 @@ class TestTmdbNameCacheYearIsolation(unittest.TestCase):
         self.assertEqual(
             self.renamer._lookup_tmdb_id_by_name("笑傲江湖", "2001"), 33333
         )
+
+
+class TestTmdbCandidateTitleGate(unittest.TestCase):
+    """TMDB 模糊搜索不能把只共享一个单词的作品当成目标"""
+
+    def test_common_word_only_candidates_are_rejected(self):
+        for title in ("The Silent Noise", "The Real Silent Hill Experience", "Silent"):
+            self.assertEqual(
+                _tmdb_title_match_score("Silent Mentor", {"name": title}),
+                0,
+                title,
+            )
+
+    def test_exact_and_original_title_are_accepted(self):
+        self.assertGreater(
+            _tmdb_title_match_score("Silent Mentor", {"name": "Silent Mentor"}),
+            0,
+        )
+        self.assertGreater(
+            _tmdb_title_match_score(
+                "Silent Mentor",
+                {"name": "以身为饵", "original_name": "Silent Mentor"},
+            ),
+            0,
+        )
+
+    def test_unrelated_search_results_do_not_produce_tmdb_id(self):
+        renamer = VideoRenamer(tmdb_api_key="test_api_key_12345")
+        client = Mock()
+        client.search_multi.return_value = [
+            {
+                "id": 1,
+                "name": "The Silent Noise",
+                "media_type": "tv",
+                "first_air_date": "2026-01-01",
+                "popularity": 900,
+            },
+            {
+                "id": 2,
+                "name": "The Real Silent Hill Experience",
+                "media_type": "tv",
+                "first_air_date": "2026-01-01",
+                "popularity": 800,
+            },
+            {
+                "id": 3,
+                "name": "Silent",
+                "media_type": "tv",
+                "first_air_date": "2026-01-01",
+                "popularity": 700,
+            },
+        ]
+        renamer.tmdb_client = client
+
+        result = renamer._enrich_with_tmdb(
+            {
+                "show_name": "Silent Mentor",
+                "media_type": "tv",
+                "year": "2026",
+                "_media_type_confidence": 0.6,
+                "season": "01",
+                "episode": "02",
+                "release_group": "ADWeb",
+            }
+        )
+
+        self.assertEqual(result.get("tmdb_id"), "")
+        client.get_tv_details.assert_not_called()
 
 
 if __name__ == "__main__":

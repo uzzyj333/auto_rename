@@ -54,6 +54,107 @@ def decode_filename(filename: str) -> str:
         return filename
 
 
+_TITLE_MATCH_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "for",
+    "in",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+}
+
+
+def _normalize_title_for_match(value: object) -> str:
+    """标题匹配归一化：忽略大小写、标点、空格和繁简差异"""
+    text = str(value or "").lower().replace("&", " and ")
+    text = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", text)
+    if ZHCONV_AVAILABLE and text:
+        try:
+            text = zhconv.convert(text, "zh-cn")
+        except Exception:
+            pass
+    return text
+
+
+def _title_match_tokens(value: object) -> set:
+    """按英文单词 / 连续中文切分标题，并去掉无区分度的冠词"""
+    text = str(value or "").lower().replace("&", " and ")
+    raw_tokens = re.findall(r"[0-9a-z]+|[\u4e00-\u9fff]+", text)
+    return {token for token in raw_tokens if token not in _TITLE_MATCH_STOPWORDS}
+
+
+def _short_title_is_significant(
+    short_title: str, short_tokens: set, long_tokens: set
+) -> bool:
+    """较短标题是否足以代表较长搜索词
+
+    「Silent」只是「Silent Mentor」里的一个普通单词，不能据此认定是同一部剧；
+    但中文短剧名（如「狂王」）以及去掉冠词后 token 完全一致的标题仍然有效。
+    """
+    if short_tokens and short_tokens == long_tokens:
+        return True
+    if len(short_tokens) >= 2:
+        return True
+    return bool(re.search(r"[\u4e00-\u9fff]", short_title) and len(short_title) >= 2)
+
+
+def _tmdb_title_match_score(search_term: str, result: Dict) -> int:
+    """TMDB 候选标题与文件标题的匹配分；0 表示标题完全无关
+
+    TMDB 在找不到目标时会返回大量仅共享一个单词的作品。调用方必须先确认
+    该分数大于 0，再按 popularity 排序，否则「Silent Mentor」会被
+    「The Silent Noise」「The Real Silent Hill Experience」等高热度结果带偏。
+    """
+    search_title = _normalize_title_for_match(search_term)
+    if not search_title:
+        return 0
+    search_tokens = _title_match_tokens(search_term)
+    digit_pattern = "[0-9一二三四五六七八九十]+"
+    fuzzy_search = re.sub(digit_pattern, "", search_title)
+
+    best_score = 0
+    for value in (
+        result.get("name"),
+        result.get("title"),
+        result.get("original_name"),
+        result.get("original_title"),
+    ):
+        title = _normalize_title_for_match(value)
+        if not title:
+            continue
+        if title == search_title:
+            return 20000
+
+        fuzzy_title = re.sub(digit_pattern, "", title)
+        if fuzzy_search and fuzzy_title and fuzzy_search == fuzzy_title:
+            best_score = max(best_score, 15000)
+            continue
+
+        title_tokens = _title_match_tokens(value)
+        if len(search_title) > 1 and search_title in title:
+            best_score = max(best_score, 1000)
+            continue
+        if len(title) > 1 and title in search_title and _short_title_is_significant(
+            title, title_tokens, search_tokens
+        ):
+            best_score = max(best_score, 500)
+            continue
+        if search_tokens and title_tokens:
+            if search_tokens == title_tokens:
+                best_score = max(best_score, 1000)
+            elif search_tokens.issubset(title_tokens):
+                best_score = max(best_score, 1000)
+            elif title_tokens.issubset(search_tokens) and _short_title_is_significant(
+                title, title_tokens, search_tokens
+            ):
+                best_score = max(best_score, 500)
+    return best_score
+
+
 class VideoRenamer:
     """Extracts metadata from video files and generates organized paths."""
 
@@ -3830,75 +3931,32 @@ class VideoRenamer:
                         f"使用所有 {len(results)} 个结果"
                     )
 
-            # 计算标题相似度并按相似度和流行度排序
-            search_term_lower = search_term.lower()
+            # 先做标题相关性硬门槛，再按相似度和流行度排序。
+            # TMDB 找不到目标时会返回大量只共享一个单词的高热度作品，
+            # 不能因为 popularity 高就把它们当成目标（Silent Mentor 回归）。
+            scored_matches = []
+            for result in target_results:
+                title_score = _tmdb_title_match_score(search_term, result)
+                if title_score > 0:
+                    scored_matches.append((title_score, result))
 
-            def calculate_score(result):
-                title = result.get("name", result.get("title", "")).lower()
-                original_name = result.get("original_name", "").lower()
-
-                # 标准化搜索词和标题，移除所有非字母数字和中文的字符（包括中文点(·)）
-                normalized_search = re.sub(
-                    r"[^\w\s\u4e00-\u9fff]", "", search_term_lower
+            if not scored_matches:
+                candidate_titles = [
+                    str(result.get("name") or result.get("title") or "")
+                    for result in target_results[:5]
+                ]
+                logger.warning(
+                    f"TMDB 搜索结果均与标题 '{search_term}' 无关，拒绝按热度硬选: "
+                    f"{candidate_titles}"
                 )
-                normalized_search = re.sub(r"\s+", "", normalized_search)
+                metadata["tmdb_id"] = ""
+                metadata.setdefault("quality_tags", original_quality_tags)
+                metadata.setdefault("year", "")
+                return metadata
 
-                normalized_title = re.sub(r"[^\w\s\u4e00-\u9fff]", "", title)
-                normalized_title = re.sub(r"\s+", "", normalized_title)
-
-                normalized_original = re.sub(
-                    r"[^\w\s\u4e00-\u9fff]", "", original_name
-                )
-                normalized_original = re.sub(r"\s+", "", normalized_original)
-
-                # 繁简转换：确保繁体和简体可以正确匹配
-                normalized_search = normalize_chinese(normalized_search)
-                normalized_title = normalize_chinese(normalized_title)
-                normalized_original = normalize_chinese(normalized_original)
-
-                # 定义通用数字字符集（用于模糊匹配）
-                # 包括：阿拉伯数字(0-9)、中文数字(一二三四五六七八九十)、罗马数字(Ⅰ-Ⅹ, ⅰ-ⅹ)
-                digit_pattern = (
-                    "[0-9一二三四五六七八九十ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅰⅱⅲⅳⅵⅶⅷⅸⅹⅺⅻⅼⅽⅾⅿ]+"
-                )
-                # 进一步标准化：移除所有数字（用于模糊匹配）
-                fuzzy_search = re.sub(digit_pattern, "", normalized_search)
-                fuzzy_title = re.sub(digit_pattern, "", normalized_title)
-                fuzzy_original = re.sub(digit_pattern, "", normalized_original)
-
-                score = 0
-                # 1. 完全匹配得分最高（在标准化后的字符串上）
-                if (
-                    normalized_search == normalized_title
-                    or normalized_search == normalized_original
-                ):
-                    score = 20000
-                # 2. 模糊匹配：移除所有数字后，搜索词和标题完全匹配
-                elif fuzzy_search == fuzzy_title or fuzzy_search == fuzzy_original:
-                    score = 15000
-                # 3. 搜索词是标题的显著子集（在标准化后的字符串上）
-                elif (
-                    normalized_search in normalized_title
-                    and len(normalized_search) > 1
-                ):
-                    # # 检查标题是否明显比搜索词长（超过30%）
-                    # # 如果是，这可能是衍生作品（如"黑袍纠察队：恶魔"），应降低得分
-                    # title_len = len(normalized_title)
-                    # search_len = len(normalized_search)
-                    # if title_len > search_len * 1.3:
-                    #     # 标题明显更长，降低得分
-                    #     score = 500
-                    #     logger.debug(f"标题 '{normalized_title}' 明显长于搜索词 '{normalized_search}'，降低得分")
-                    # else:
-                        score = 1000
-                # 4. 标题是搜索词的子集（在标准化后的字符串上）
-                elif (
-                    normalized_title in normalized_search
-                    and len(normalized_title) > 1
-                ):
-                    score = 500
-
-                total_score = score + result.get("popularity", 0)
+            def calculate_total_score(scored_match):
+                title_score, result = scored_match
+                total_score = title_score + result.get("popularity", 0)
                 # 年份加权：同名不同版本（如 1996 / 2001 版《笑傲江湖》）时，
                 # 优先选择年份与文件名一致的结果，避免被高热度版本带偏
                 if search_year:
@@ -3914,11 +3972,13 @@ class VideoRenamer:
 
             # 按得分排序
             sorted_results = sorted(
-                target_results, key=calculate_score, reverse=True
+                scored_matches, key=calculate_total_score, reverse=True
             )
-            best_match = sorted_results[0]
+            best_match = sorted_results[0][1]
+            best_match_score = calculate_total_score(sorted_results[0])
             logger.info(
-                f"找到最匹配的结果: {best_match.get('name', best_match.get('title'))} (类型: {best_match.get('media_type')}, 得分: {calculate_score(best_match)})"
+                f"找到最匹配的结果: {best_match.get('name', best_match.get('title'))} "
+                f"(类型: {best_match.get('media_type')}, 得分: {best_match_score})"
             )
             # 保存 genre_ids 用于判断动画类型（搜索结果中有，详情API中文版可能丢失动画标签）
             metadata["genre_ids"] = best_match.get("genre_ids", [])

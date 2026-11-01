@@ -57,16 +57,30 @@ class TestVideoRenamer:
         # Mock TMDB client responses
         mock_client_instance = Mock()
         mock_tmdb_client.return_value = mock_client_instance
+        # fixture 在 patch 生效前已经创建，需要显式替换客户端
+        renamer.tmdb_client = mock_client_instance
 
         # 模拟实际代码中使用的方法名
-        mock_client_instance.search_tv.return_value = {"results": [{"id": 123, "name": "Game of Thrones", "media_type": "tv"}]}
+        mock_client_instance.search_multi.return_value = [
+            {
+                "id": 123,
+                "name": "Game of Thrones",
+                "original_name": "Game of Thrones",
+                "media_type": "tv",
+                "first_air_date": "2011-04-17",
+                "popularity": 100,
+            }
+        ]
         mock_client_instance.get_tv_details.return_value = {
+            "id": 123,
             "name": "Game of Thrones",
+            "original_name": "Game of Thrones",
             "first_air_date": "2011-04-17"
         }
         mock_client_instance.get_tv_episode_details.return_value = {
             "name": "Winter Is Coming"
         }
+        mock_client_instance.get_external_ids.return_value = {}
 
         # Test metadata enrichment
         metadata = {"show_name": "Game of Thrones", "season": "1", "episode": "1", "media_type": "tv"}
