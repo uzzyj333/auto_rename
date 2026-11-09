@@ -108,7 +108,15 @@ def _tmdb_title_match_score(search_term: str, result: Dict) -> int:
     TMDB 在找不到目标时会返回大量仅共享一个单词的作品。调用方必须先确认
     该分数大于 0，再按 popularity 排序，否则「Silent Mentor」会被
     「The Silent Noise」「The Real Silent Hill Experience」等高热度结果带偏。
+
+    original_name / original_title 是作品原名，优先级最高：同名作品的本地化
+    标题可能撞车（例如「Brothers」既是 2026 新剧的英文名，也可能是
+    「Ang Probinsyano」的中文译名），只按 name 比较会把高热度老剧当成新剧。
+    别名 / 译名用于匹配罗马音文件名（如 Romelia Senki -> Romelia War Chronicle）。
     """
+    if not isinstance(result, dict):
+        return 0
+
     search_title = _normalize_title_for_match(search_term)
     if not search_title:
         return 0
@@ -116,42 +124,52 @@ def _tmdb_title_match_score(search_term: str, result: Dict) -> int:
     digit_pattern = "[0-9一二三四五六七八九十]+"
     fuzzy_search = re.sub(digit_pattern, "", search_title)
 
+    primary_titles = (
+        (result.get("name"), 20000),
+        (result.get("title"), 20000),
+    )
+    original_titles = (
+        (result.get("original_name"), 24000),
+        (result.get("original_title"), 24000),
+    )
+    alias_titles = [
+        (value, 22000)
+        for value in (result.get("_tmdb_title_aliases") or [])
+        if isinstance(value, str)
+    ]
+
     best_score = 0
-    for value in (
-        result.get("name"),
-        result.get("title"),
-        result.get("original_name"),
-        result.get("original_title"),
-    ):
+    for value, exact_score in primary_titles + original_titles + tuple(alias_titles):
         title = _normalize_title_for_match(value)
         if not title:
             continue
         if title == search_title:
-            return 20000
+            best_score = max(best_score, exact_score)
+            continue
 
         fuzzy_title = re.sub(digit_pattern, "", title)
         if fuzzy_search and fuzzy_title and fuzzy_search == fuzzy_title:
-            best_score = max(best_score, 15000)
+            best_score = max(best_score, exact_score - 5000)
             continue
 
         title_tokens = _title_match_tokens(value)
         if len(search_title) > 1 and search_title in title:
-            best_score = max(best_score, 1000)
+            best_score = max(best_score, 1200 if exact_score >= 22000 else 1000)
             continue
         if len(title) > 1 and title in search_title and _short_title_is_significant(
             title, title_tokens, search_tokens
         ):
-            best_score = max(best_score, 500)
+            best_score = max(best_score, 700 if exact_score >= 22000 else 500)
             continue
         if search_tokens and title_tokens:
             if search_tokens == title_tokens:
-                best_score = max(best_score, 1000)
+                best_score = max(best_score, 1200 if exact_score >= 22000 else 1000)
             elif search_tokens.issubset(title_tokens):
-                best_score = max(best_score, 1000)
+                best_score = max(best_score, 1200 if exact_score >= 22000 else 1000)
             elif title_tokens.issubset(search_tokens) and _short_title_is_significant(
                 title, title_tokens, search_tokens
             ):
-                best_score = max(best_score, 500)
+                best_score = max(best_score, 700 if exact_score >= 22000 else 500)
     return best_score
 
 
@@ -928,6 +946,8 @@ class VideoRenamer:
         self._tmdb_name_to_id: Dict[str, Dict[str, Union[int, str]]] = {}
         # TMDB 搜索结果缓存：避免重复搜索
         self._search_cache: Dict[str, List] = {}
+        # TMDB 别名 / 译名缓存：key=(media_type, tmdb_id)
+        self._tmdb_alias_cache: Dict[tuple, List[str]] = {}
         logger.info("VideoRenamer: TMDB 缓存已初始化")
 
         # 手动规则引擎初始化
@@ -2907,6 +2927,98 @@ class VideoRenamer:
 
         return results
 
+    @staticmethod
+    def _extract_tmdb_alias_titles(payload: object) -> List[str]:
+        """从 alternative_titles / translations 响应里取出可用标题"""
+        if not isinstance(payload, dict):
+            return []
+        titles: List[str] = []
+        for key in ("results", "titles"):
+            items = payload.get(key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                value = item.get("title") or item.get("name")
+                if isinstance(value, str) and value.strip():
+                    titles.append(value.strip())
+        translations = payload.get("translations")
+        if isinstance(translations, list):
+            for item in translations:
+                if not isinstance(item, dict):
+                    continue
+                data = item.get("data")
+                if isinstance(data, dict):
+                    value = data.get("name") or data.get("title")
+                    if isinstance(value, str) and value.strip():
+                        titles.append(value.strip())
+                english_name = item.get("english_name")
+                if isinstance(english_name, str) and english_name.strip():
+                    titles.append(english_name.strip())
+        return titles
+
+    def _enrich_tmdb_candidate_titles(
+        self,
+        results: List[Dict],
+        media_type_hint: Optional[str],
+        limit: int = 6,
+    ) -> None:
+        """给标题门槛未通过的候选补查 TMDB 别名 / 译名
+
+        搜索接口可能因为罗马音、英文别名而返回正确作品，但响应里的 name /
+        original_name 是中文或日文标题；此时只比对这两个字段会误判为无关。
+        仅在标题门槛全部失败时调用，避免正常搜索也产生额外请求。
+        """
+        if not self.tmdb_client or not results:
+            return
+        for result in results[: max(0, limit)]:
+            if not isinstance(result, dict):
+                continue
+            media_type = result.get("media_type") or media_type_hint or "tv"
+            if media_type not in ("movie", "tv"):
+                continue
+            media_id = result.get("id")
+            if media_id in (None, ""):
+                continue
+            cache_key = (str(media_type), str(media_id))
+            aliases = self._tmdb_alias_cache.get(cache_key)
+            if aliases is None:
+                aliases = []
+                try:
+                    alt_payload = self.tmdb_client.get_alternative_titles(
+                        media_id, media_type
+                    )
+                    aliases.extend(self._extract_tmdb_alias_titles(alt_payload))
+                except Exception as exc:
+                    logger.debug(
+                        f"获取 TMDB 别名失败 ({media_type}/{media_id}): {exc}"
+                    )
+                try:
+                    translation_payload = self.tmdb_client.get_translations(
+                        media_id, media_type
+                    )
+                    aliases.extend(
+                        self._extract_tmdb_alias_titles(translation_payload)
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        f"获取 TMDB 译名失败 ({media_type}/{media_id}): {exc}"
+                    )
+
+                normalized: List[str] = []
+                seen = set()
+                for value in aliases:
+                    key = _normalize_title_for_match(value)
+                    if key and key not in seen:
+                        seen.add(key)
+                        normalized.append(value)
+                aliases = normalized
+                self._tmdb_alias_cache[cache_key] = aliases
+
+            if aliases:
+                result["_tmdb_title_aliases"] = aliases
+
     def _lookup_tmdb_id_by_name(
         self, show_name: str, year
     ) -> Optional[Union[int, str]]:
@@ -3581,10 +3693,12 @@ class VideoRenamer:
                         best_match = max(exact_matches, key=lambda r: r.get("popularity", 0))
 
                     logger.info(
-                        f"找到完全匹配: {best_match.get('name', best_match.get('title'))}"
+                        f"找到完全匹配候选: {best_match.get('name', best_match.get('title'))}"
                         + (f" (共{len(exact_matches)}个完全匹配，已根据字幕组类型选择)" if len(exact_matches) > 1 else "")
                     )
-                    results = [best_match]
+                    # 不在这里直接锁定一个候选：同名作品的本地化标题可能撞车，
+                    # 统一交给后面的标题门槛 + 原名/年份/别名评分重新选择。
+                    results = primary_results
                 else:
                     # 保存第一次搜索结果
                     for result in primary_results:
@@ -3679,9 +3793,13 @@ class VideoRenamer:
                                 best_match = max(exact_matches, key=lambda r: r.get("popularity", 0))
 
                             logger.info(
-                                f"在跨语言搜索中找到完全匹配: {best_match.get('name', best_match.get('title'))}"
+                                f"在跨语言搜索中找到完全匹配候选: {best_match.get('name', best_match.get('title'))}"
                             )
-                            results = [best_match]
+                            for result in secondary_results:
+                                if result.get("id") not in unique_ids:
+                                    all_results.append(result)
+                                    unique_ids.add(result.get("id"))
+                            results = all_results
                         else:
                             # 合并跨语言搜索结果
                             for result in secondary_results:
@@ -3940,6 +4058,19 @@ class VideoRenamer:
                 if title_score > 0:
                     scored_matches.append((title_score, result))
 
+            top_title_score = max(
+                (score for score, _ in scored_matches), default=0
+            )
+            if top_title_score < 24000:
+                # 没有作品原名精确命中时补查别名：正确作品可能被 TMDB 返回成本地化/
+                # 日文标题，或另一部作品的本地化标题恰好与搜索词相同。
+                self._enrich_tmdb_candidate_titles(target_results, media_type_hint)
+                scored_matches = []
+                for result in target_results:
+                    title_score = _tmdb_title_match_score(search_term, result)
+                    if title_score > 0:
+                        scored_matches.append((title_score, result))
+
             if not scored_matches:
                 candidate_titles = [
                     str(result.get("name") or result.get("title") or "")
@@ -3954,21 +4085,46 @@ class VideoRenamer:
                 metadata.setdefault("year", "")
                 return metadata
 
+            release_group = original_release_group or metadata.get("release_group", "")
+            preferred_type = None
+            if release_group:
+                if release_group in self._release_group_mapping:
+                    preferred_type = self._release_group_mapping[release_group]
+                else:
+                    for group_name, content_type in self._release_group_mapping.items():
+                        if group_name in release_group or release_group in group_name:
+                            preferred_type = content_type
+                            break
+
             def calculate_total_score(scored_match):
                 title_score, result = scored_match
-                total_score = title_score + result.get("popularity", 0)
-                # 年份加权：同名不同版本（如 1996 / 2001 版《笑傲江湖》）时，
-                # 优先选择年份与文件名一致的结果，避免被高热度版本带偏
+                content_rank = 0
+                if preferred_type:
+                    is_anime = 16 in (result.get("genre_ids") or [])
+                    if (preferred_type == "anime" and is_anime) or (
+                        preferred_type == "drama" and not is_anime
+                    ):
+                        content_rank = 1
+
+                year_rank = 0
+                result_date = str(
+                    result.get("first_air_date") or result.get("release_date") or ""
+                )
                 if search_year:
-                    result_date = str(
-                        result.get("first_air_date") or result.get("release_date") or ""
-                    )
                     result_year = result_date.split("-")[0] if result_date else ""
                     if result_year == str(search_year):
-                        total_score += 5000
+                        year_rank = 1
                     elif result_year:
-                        total_score -= 5000
-                return total_score
+                        year_rank = -1
+
+                # popularity 只做最后一级比较，不能盖过标题匹配质量。
+                return (
+                    title_score,
+                    content_rank,
+                    year_rank,
+                    result_date,
+                    result.get("popularity", 0),
+                )
 
             # 按得分排序
             sorted_results = sorted(

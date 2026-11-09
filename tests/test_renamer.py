@@ -288,6 +288,61 @@ class TestTmdbCandidateTitleGate(unittest.TestCase):
             0,
         )
 
+    def test_original_title_outranks_localized_title_collision(self):
+        """同名撞车时优先作品原名，不能按热度选到另一部老剧"""
+        correct = {
+            "name": "Brothers",
+            "original_name": "Brothers",
+            "first_air_date": "2026-09-23",
+            "popularity": 1,
+        }
+        localized_collision = {
+            "name": "Brothers",
+            "original_name": "Ang Probinsyano",
+            "first_air_date": "2015-09-28",
+            "popularity": 9999,
+        }
+        self.assertGreater(
+            _tmdb_title_match_score("Brothers", correct),
+            _tmdb_title_match_score("Brothers", localized_collision),
+        )
+
+    def test_tmdb_aliases_match_romanized_filename(self):
+        """TMDB 主标题是英文/日文时，罗马音别名仍应能匹配"""
+        self.assertGreater(
+            _tmdb_title_match_score(
+                "Romelia Senki",
+                {
+                    "name": "Romelia War Chronicle",
+                    "original_name": "ロメリア戦記",
+                    "_tmdb_title_aliases": ["Romelia Senki"],
+                },
+            ),
+            0,
+        )
+
+    def test_enrich_candidate_titles_loads_alternative_titles(self):
+        renamer = VideoRenamer(tmdb_api_key="test_api_key_12345")
+        client = Mock()
+        client.get_alternative_titles.return_value = {
+            "results": [{"title": "Romelia Senki"}]
+        }
+        client.get_translations.return_value = {"translations": []}
+        renamer.tmdb_client = client
+        candidates = [
+            {
+                "id": 1,
+                "name": "Romelia War Chronicle",
+                "original_name": "ロメリア戦記",
+                "media_type": "tv",
+            }
+        ]
+
+        renamer._enrich_tmdb_candidate_titles(candidates, "tv")
+
+        self.assertIn("Romelia Senki", candidates[0]["_tmdb_title_aliases"])
+        self.assertGreater(_tmdb_title_match_score("Romelia Senki", candidates[0]), 0)
+
     def test_unrelated_search_results_do_not_produce_tmdb_id(self):
         renamer = VideoRenamer(tmdb_api_key="test_api_key_12345")
         client = Mock()
@@ -330,6 +385,72 @@ class TestTmdbCandidateTitleGate(unittest.TestCase):
 
         self.assertEqual(result.get("tmdb_id"), "")
         client.get_tv_details.assert_not_called()
+
+    def test_alias_match_beats_wrong_localized_exact_title(self):
+        """错误作品只靠本地化同名不能赢过拥有罗马音别名的正确作品"""
+        candidates = [
+            {
+                "id": 200,
+                "name": "Star Detective Precure",
+                "original_name": "Stars in der Manege",
+                "media_type": "tv",
+                "first_air_date": "2026-01-01",
+                "popularity": 9999,
+                "genre_ids": [16],
+            },
+            {
+                "id": 100,
+                "name": "Star Detective Precure!",
+                "original_name": "スター探偵プリキュア！",
+                "media_type": "tv",
+                "first_air_date": "2026-02-01",
+                "popularity": 1,
+                "genre_ids": [16],
+            },
+        ]
+
+        class _Client:
+            def search_tv(self, *args, **kwargs):
+                return {"results": [dict(item) for item in candidates]}
+
+            def search_multi(self, *args, **kwargs):
+                return [dict(item) for item in candidates]
+
+            def search_video_show(self, *args, **kwargs):
+                return [dict(item) for item in candidates]
+
+            def get_alternative_titles(self, media_id, media_type):
+                if media_id == 100:
+                    return {"results": [{"title": "Star Detective Precure"}]}
+                return {"results": []}
+
+            def get_translations(self, media_id, media_type):
+                return {"translations": []}
+
+            def get_tv_details(self, show_id, language="zh-CN"):
+                return {
+                    "name": "Star Detective Precure!",
+                    "overview": "x",
+                    "first_air_date": "2026-02-01",
+                }
+
+            def get_external_ids(self, *args):
+                return {}
+
+            def get_tv_credits(self, *args):
+                return {"cast": [], "crew": []}
+
+            def get_tv_episode_details(self, *args, **kwargs):
+                return {}
+
+        renamer = VideoRenamer(tmdb_api_key="test_api_key_12345")
+        renamer.tmdb_client = _Client()
+
+        result = renamer.extract_metadata(
+            "Star.Detective.Precure.S01E40.2026.1080p.mkv"
+        )
+
+        self.assertEqual(result.get("tmdb_id"), 100)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,9 @@ class TMDBClient:
 
     BASE_URL = "https://api.themoviedb.org/3"
 
-    def __init__(self, api_key: str, retry_count=3, timeout=30, rate_limit=40, base_url=None):
+    def __init__(
+        self, api_key: str, retry_count=3, timeout=30, rate_limit=40, base_url=None
+    ):
         self.api_key = api_key
         self.retry_count = retry_count
         self.timeout = timeout
@@ -65,12 +67,16 @@ class TMDBClient:
         # 调试日志：打印返回数据的结构
         logger.debug(f"search_video_show 返回的数据类型: {type(data)}")
         if data:
-            logger.debug(f"search_video_show 返回的数据键: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+            logger.debug(
+                f"search_video_show 返回的数据键: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}"
+            )
             if isinstance(data, dict):
                 results = data.get("results", [])
                 logger.debug(f"search_video_show results 数量: {len(results)}")
                 if results:
-                    logger.debug(f"search_video_show 第一个结果: {results[0].get('name') or results[0].get('title') if results else 'none'}")
+                    logger.debug(
+                        f"search_video_show 第一个结果: {results[0].get('name') or results[0].get('title') if results else 'none'}"
+                    )
                 return results
             else:
                 logger.warning(f"search_video_show 返回的数据不是字典类型: {data}")
@@ -146,7 +152,9 @@ class TMDBClient:
         if len(self._request_timestamps) >= self.rate_limit:
             sleep_time = 60 - (now - self._request_timestamps[0])
             if sleep_time > 0:
-                logger.debug(f"TMDB 速率限制已达上限 ({self.rate_limit}/min)，等待 {sleep_time:.1f} 秒")
+                logger.debug(
+                    f"TMDB 速率限制已达上限 ({self.rate_limit}/min)，等待 {sleep_time:.1f} 秒"
+                )
                 time.sleep(sleep_time)
             self._request_timestamps.popleft()
         self._request_timestamps.append(time.time())
@@ -323,6 +331,25 @@ class TMDBClient:
     def get_images(self, media_id: int, media_type: str) -> Optional[Dict]:
         """获取海报和背景图片"""
         url = f"{self.BASE_URL}/{media_type}/{media_id}/images"
+        return self._request_with_retry(url)
+
+    def get_alternative_titles(self, media_id: int, media_type: str) -> Optional[Dict]:
+        """获取别名（罗马音、地区译名等）
+
+        TMDB 的搜索结果默认只返回当前语言的 name 和 original_name。动画的
+        英文/罗马音标题经常只存在于 alternative_titles 中，例如文件名里的
+        ``Romelia Senki`` 对应的 TMDB 主标题可能是 ``Romelia War Chronicle``。
+        """
+        if media_type not in ("movie", "tv"):
+            return None
+        url = f"{self.BASE_URL}/{media_type}/{media_id}/alternative_titles"
+        return self._request_with_retry(url)
+
+    def get_translations(self, media_id: int, media_type: str) -> Optional[Dict]:
+        """获取各语言译名，作为别名接口的补充"""
+        if media_type not in ("movie", "tv"):
+            return None
+        url = f"{self.BASE_URL}/{media_type}/{media_id}/translations"
         return self._request_with_retry(url)
 
     def search_tv(
