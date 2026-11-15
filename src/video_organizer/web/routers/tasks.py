@@ -7,6 +7,7 @@
 import logging
 import asyncio
 import threading
+from collections import deque
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -377,7 +378,8 @@ async def websocket_progress(websocket: WebSocket):
     await websocket.accept()
     
     state = get_state_manager()
-    progress_queue = []
+    # 浏览器标签页挂起 / 网络很慢时，进度消息不能无限堆积
+    progress_queue = deque(maxlen=200)
     queue_lock = threading.Lock()
     
     def on_progress(progress):
@@ -403,10 +405,11 @@ async def websocket_progress(websocket: WebSocket):
         while True:
             # 发送队列中的进度更新
             with queue_lock:
-                if progress_queue:
-                    for msg in progress_queue:
-                        await websocket.send_json(msg)
-                    progress_queue.clear()
+                pending = list(progress_queue)
+                progress_queue.clear()
+            # 发送时不要占着队列锁，否则进度回调会被网络阻塞
+            for msg in pending:
+                await websocket.send_json(msg)
             
             # 发送心跳（5秒间隔）
             await websocket.send_json({"type": "heartbeat"})

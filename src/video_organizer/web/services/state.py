@@ -18,6 +18,9 @@ from ...database.operations import get_failed_tasks as db_get_failed
 from ...database.operations import get_task_counts as db_get_task_counts
 
 
+MAX_UPLOAD_PROGRESS_ENTRIES = 300
+
+
 @dataclass
 class TaskInfo:
     """任务信息"""
@@ -345,6 +348,17 @@ class StateManager:
         """
         with self._state_lock:
             self._upload_progress[progress.file_path] = progress
+            # 进度表按文件路径累积，长期运行会越来越大；超出上限时优先清理终态记录
+            if len(self._upload_progress) > MAX_UPLOAD_PROGRESS_ENTRIES:
+                overflow = len(self._upload_progress) - MAX_UPLOAD_PROGRESS_ENTRIES
+                stale = [
+                    key
+                    for key, item in self._upload_progress.items()
+                    if item.status in {"completed", "failed"}
+                    and key != progress.file_path
+                ]
+                for key in stale[:overflow]:
+                    self._upload_progress.pop(key, None)
             
             # 调用所有回调
             for callback in self._progress_callbacks:
