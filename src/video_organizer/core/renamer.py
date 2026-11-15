@@ -12,10 +12,15 @@ from typing import Dict, List, Optional, Union, Set
 
 from jinja2 import Template
 from src.video_organizer.core.tmdb_client import TMDBClient
-from src.video_organizer.core.guessit_parser import GuessItParser, GUESSIT_AVAILABLE
+from src.video_organizer.core.guessit_parser import (
+    GUESSIT_AVAILABLE,
+    GuessItParser,
+    extract_leading_bracket_titles,
+)
 from src.video_organizer.utils.llm_translator import LLMTranslator
 from .manual_rule_engine import ManualRuleEngine
 from .media_type_resolver import MediaTypeResolver
+from .title_matching import title_match_score
 
 # 繁简转换支持
 try:
@@ -151,6 +156,16 @@ def _tmdb_title_match_score(search_term: str, result: Dict) -> int:
         if fuzzy_search and fuzzy_title and fuzzy_search == fuzzy_title:
             best_score = max(best_score, exact_score - 5000)
             continue
+
+        # 模糊分支必须按完整词元判断。旧的字符串子串判断会让搜索词
+        # ``Yi`` / ``Your`` / ``Star`` 命中 ``flying`` / ``Your Own Body`` /
+        # ``Starring``，直接把完全无关的作品当成 TMDB 目标。
+        related_score = title_match_score(value, search_term)
+        if related_score <= 0:
+            continue
+        # 词元 / 拼音 / 全大写缩写相关的底分：足以进入候选排序，但始终低于
+        # 标题或原名精确命中。
+        best_score = max(best_score, min(900 + related_score * 3, 1200))
 
         title_tokens = _title_match_tokens(value)
         if len(search_title) > 1 and search_title in title:
@@ -1289,6 +1304,17 @@ class VideoRenamer:
                     self._clean_filename_for_search(file_path.name) or file_path.stem
                 )
 
+            # 开头方括号里的中文译名往往比罗马音 / 英文名更准确：
+            # [痞子殿下].Your.Highness... / [一路前行 第一季].Yi.Lu.Qian.Xing...
+            # 只用 Your Highness / Yi Lu Qian Xing 去搜 TMDB 很容易撞到同名老片。
+            try:
+                bracket_titles = extract_leading_bracket_titles(file_path.name)
+            except Exception:
+                bracket_titles = []
+            if bracket_titles:
+                metadata.setdefault("title_aliases", bracket_titles)
+                metadata["_tmdb_search_seed"] = bracket_titles[0]
+
             # # 5. AI 服务辅助
             # if (self.ai_service_url and
             #     (not metadata.get('show_name') or not metadata.get('season') or not metadata.get('episode'))):
@@ -1347,6 +1373,8 @@ class VideoRenamer:
                         logger.warning("TMDB 客户端未初始化，跳过元数据丰富")
                 except Exception as e:
                     logger.error(f"TMDB元数据丰富失败: {e}")
+                finally:
+                    metadata.pop("_tmdb_search_seed", None)
 
             # 7. 最终兜底填充
             if "show_name" not in locked_fields:
@@ -2925,6 +2953,11 @@ class VideoRenamer:
         except Exception as e:
             logger.error(f"语言搜索失败: {e}")
 
+        for result in results:
+            if isinstance(result, dict):
+                # TMDB 的 /search/tv 与 /search/movie 不返回 media_type，
+                # 补上后才能在后续做严格的电影 / 电视剧类型过滤。
+                result.setdefault("media_type", media_type_hint)
         return results
 
     @staticmethod
@@ -3440,7 +3473,10 @@ class VideoRenamer:
             
             # 如果没有 tmdb_id 或获取失败，则使用搜索方式
             # 优先使用show_name搜索，否则使用title，确保搜索词存在
-            search_term = metadata.get("show_name", metadata.get("title", ""))
+            search_term = (
+                metadata.get("_tmdb_search_seed")
+                or metadata.get("show_name", metadata.get("title", ""))
+            )
             if not search_term:
                 logger.warning("搜索词为空，无法进行TMDB搜索")
                 # 确保返回的metadata包含必要字段
@@ -4034,12 +4070,16 @@ class VideoRenamer:
                         f"{len(type_matched_results)}/{len(results)} 个结果匹配 {media_type_hint}"
                     )
                 else:
-                    # 没有匹配的结果，记录警告
+                    # 文件已明确是电视剧 / 电影时，不能因为 TMDB 只返回另一类型
+                    # 的同名条目就硬选（例如 SxxExx 的剧集撞到 2011 年同名电影）。
                     logger.warning(
                         f"TMDB 搜索无 {media_type_hint} 类型结果 "
-                        f"(confidence={confidence:.2f})，使用所有结果"
+                        f"(confidence={confidence:.2f})，拒绝跨类型硬选"
                     )
-                    target_results = results
+                    metadata["tmdb_id"] = ""
+                    metadata.setdefault("quality_tags", original_quality_tags)
+                    metadata.setdefault("year", "")
+                    return metadata
             else:
                 # 低置信度或无类型提示：不过滤
                 target_results = results
@@ -4132,9 +4172,21 @@ class VideoRenamer:
             )
             best_match = sorted_results[0][1]
             best_match_score = calculate_total_score(sorted_results[0])
+            candidate_audit = [
+                {
+                    "id": result.get("id"),
+                    "title": result.get("name") or result.get("title") or "",
+                    "score": score,
+                }
+                for score, result in sorted_results[:3]
+            ]
             logger.info(
                 f"找到最匹配的结果: {best_match.get('name', best_match.get('title'))} "
-                f"(类型: {best_match.get('media_type')}, 得分: {best_match_score})"
+                f"(id: {best_match.get('id')}, 类型: {best_match.get('media_type')}, "
+                f"得分: {best_match_score})"
+            )
+            logger.info(
+                "TMDB 目标决策: 搜索词=%r 候选前三=%s", search_term, candidate_audit
             )
             # 保存 genre_ids 用于判断动画类型（搜索结果中有，详情API中文版可能丢失动画标签）
             metadata["genre_ids"] = best_match.get("genre_ids", [])

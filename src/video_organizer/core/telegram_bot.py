@@ -30,6 +30,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -49,6 +50,102 @@ _REMINDER_INTERVAL = 30       # 报错提醒检查间隔（秒）
 _MAX_BROWSE_TOKENS = 500      # 最多记住多少个「浏览/上传」路径令牌
 _BROWSE_PAGE_SIZE = 20        # 目录浏览每页显示的条目数
 _MAX_FLOW_TOKENS = 300        # 最多记住多少个「搜索 → 选季 → 选集」会话令牌
+
+_WEBDAV_SORT_FIELDS = {
+    "name": "名称",
+    "size": "大小",
+    "modified": "时间",
+    "type": "类型",
+}
+_WEBDAV_DEFAULT_SORT = {"name": "name", "size": "size_desc", "modified": "modified_desc", "type": "type"}
+
+
+def _webdav_natural_key(value: Any) -> Tuple[Any, ...]:
+    """文件名自然排序：第 2 集排在第 10 集前面"""
+    parts = re.split(r"(\d+)", str(value or "").casefold())
+    return tuple((0, int(part)) if part.isdigit() else (1, part) for part in parts if part)
+
+
+def _webdav_time_value(value: Any) -> float:
+    """解析 WebDAV 的 HTTP / ISO 时间，解析失败时排到最后"""
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return parsedate_to_datetime(text).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _webdav_sort_state(sort: Any) -> Tuple[str, bool]:
+    """返回 (排序字段, 是否降序)；字段非法时退回名称升序"""
+    text = str(sort or "name").strip().lower()
+    reverse = text.endswith("_desc")
+    field = text[:-5] if reverse else text
+    if field not in _WEBDAV_SORT_FIELDS:
+        return "name", False
+    return field, reverse
+
+
+def _webdav_sort_entries(
+    dirs: List[Dict[str, Any]], files: List[Dict[str, Any]], sort: Any
+) -> List[Dict[str, Any]]:
+    """目录始终在前；文件按名称 / 大小 / 时间 / 类型排序"""
+    field, reverse = _webdav_sort_state(sort)
+    ordered_dirs = sorted(
+        dirs, key=lambda item: _webdav_natural_key(item.get("name"))
+    )
+    if field == "name":
+        ordered_files = sorted(
+            files,
+            key=lambda item: _webdav_natural_key(item.get("name")),
+            reverse=reverse,
+        )
+    elif field == "size":
+        ordered_files = sorted(
+            files,
+            key=lambda item: (
+                int(item.get("size") or 0),
+                _webdav_natural_key(item.get("name")),
+            ),
+            reverse=reverse,
+        )
+    elif field == "modified":
+        ordered_files = sorted(
+            files,
+            key=lambda item: (
+                _webdav_time_value(item.get("modified")),
+                _webdav_natural_key(item.get("name")),
+            ),
+            reverse=reverse,
+        )
+    else:
+        ordered_files = sorted(
+            files,
+            key=lambda item: (
+                Path(str(item.get("path") or "")).suffix.lower(),
+                _webdav_natural_key(item.get("name")),
+            ),
+            reverse=reverse,
+        )
+    return ordered_dirs + ordered_files
+
+
+def _webdav_sort_arrow(sort: Any) -> str:
+    _field, reverse = _webdav_sort_state(sort)
+    return " ↓" if reverse else " ↑"
+
+
+def _webdav_next_sort(current: Any, field: str) -> str:
+    """点击当前排序字段时切换升降序，点其他字段时使用习惯默认方向"""
+    active_field, reverse = _webdav_sort_state(current)
+    if active_field == field:
+        return field if reverse else f"{field}_desc"
+    return _WEBDAV_DEFAULT_SORT[field]
 
 # 旧版底部快捷键盘按钮文字 → 指令的映射：仅用于兼容客户端上残留的旧键盘
 _QUICK_REPLY_MAP = {
@@ -1736,6 +1833,8 @@ class TelegramBotService:
         path: str = "",
         edit_message_id: Optional[int] = None,
         page: int = 0,
+        show_all: Optional[bool] = None,
+        sort: str = "name",
     ) -> None:
         """展示 WebDAV 目录键盘：点目录进去，点文件直接推送给 aria2 下载"""
         from .webdav_client import WebDAVError, client_from_config, normalize_path
@@ -1765,15 +1864,17 @@ class TelegramBotService:
             self.send_text(f"读取 WebDAV 目录失败：{exc}", chat_id=chat_id)
             return
 
-        show_all = bool(section.get("show_all_files"))
-        dirs = sorted(
-            [item for item in entries if item.get("is_dir")],
-            key=lambda item: str(item.get("name") or "").lower(),
-        )
+        # 浏览页默认显示全部文件；需要只看视频 / 字幕时可点按钮切换。
+        if show_all is None:
+            show_all = True
+        dirs = [item for item in entries if item.get("is_dir")]
         files = self._webdav_files(entries, show_all)
 
-        all_entries: List[Dict[str, Any]] = [dict(item, kind="dir") for item in dirs]
-        all_entries += [dict(item, kind="file") for item in files]
+        ordered = _webdav_sort_entries(dirs, files, sort)
+        all_entries: List[Dict[str, Any]] = [
+            dict(item, kind="dir" if item.get("is_dir") else "file")
+            for item in ordered
+        ]
         total = len(all_entries)
         total_pages = max(1, (total + _BROWSE_PAGE_SIZE - 1) // _BROWSE_PAGE_SIZE)
         try:
@@ -1784,6 +1885,10 @@ class TelegramBotService:
         page_entries = all_entries[
             page * _BROWSE_PAGE_SIZE : (page + 1) * _BROWSE_PAGE_SIZE
         ]
+        sort_field, sort_reverse = _webdav_sort_state(sort)
+        sort = f"{sort_field}_desc" if sort_reverse else sort_field
+        mode = "all" if show_all else "video"
+        state_suffix = f":{sort}:{mode}"
 
         rows: List[List[Dict[str, str]]] = []
         nav_row: List[Dict[str, str]] = []
@@ -1792,42 +1897,76 @@ class TelegramBotService:
             nav_row.append(
                 {
                     "text": "⬆️ 上一级",
-                    "callback_data": f"wd:ls:{self._token_for_path(parent)}:0",
+                    "callback_data": (
+                        f"wd:ls:{self._token_for_path(parent)}:0{state_suffix}"
+                    ),
                 }
             )
         nav_row.append(
             {
                 "text": self._WEBDAV_ROOT_LABEL,
-                "callback_data": f"wd:ls:{self._token_for_path(root)}:0",
+                "callback_data": f"wd:ls:{self._token_for_path(root)}:0{state_suffix}",
             }
         )
         nav_row.append(
             {
                 "text": "🔄 刷新",
-                "callback_data": f"wd:ls:{self._token_for_path(target)}:{page}",
+                "callback_data": (
+                    f"wd:ls:{self._token_for_path(target)}:{page}{state_suffix}"
+                ),
             }
         )
         rows.append(nav_row)
+
+        target_token = self._token_for_path(target)
+        mode_row = [
+            {
+                "text": "🎬 仅视频 / 字幕" if show_all else "📄 显示全部文件",
+                "callback_data": (
+                    f"wd:ls:{target_token}:0:{sort}:"
+                    f"{'video' if show_all else 'all'}"
+                ),
+            }
+        ]
+        rows.append(mode_row)
+
+        sort_row: List[Dict[str, str]] = []
+        for field, label in _WEBDAV_SORT_FIELDS.items():
+            active = field == sort_field
+            sort_row.append(
+                {
+                    "text": ("✅ " if active else "") + label + (
+                        _webdav_sort_arrow(sort) if active else ""
+                    ),
+                    "callback_data": (
+                        f"wd:ls:{target_token}:0:"
+                        f"{_webdav_next_sort(sort, field)}:{mode}"
+                    ),
+                }
+            )
+        rows.append(sort_row)
 
         action_row: List[Dict[str, str]] = []
         if files:
             action_row.append(
                 {
                     "text": f"📥 下载本目录（{len(files)}）",
-                    "callback_data": f"wd:push:{self._token_for_path(target)}:dir",
+                    "callback_data": f"wd:push:{target_token}:dir:{mode}",
                 }
             )
         if dirs:
             action_row.append(
                 {
                     "text": "📥 含子目录",
-                    "callback_data": f"wd:push:{self._token_for_path(target)}:tree",
+                    "callback_data": f"wd:push:{target_token}:tree:{mode}",
                 }
             )
         if action_row:
             rows.append(action_row)
 
         listing: List[str] = []
+        listing_len = 0
+        omitted = 0
         for number, entry in enumerate(page_entries, start=1):
             token = self._token_for_path(str(entry.get("path")))
             name = str(entry.get("name") or "")
@@ -1836,11 +1975,16 @@ class TelegramBotService:
                     [
                         {
                             "text": f"📂 {_shorten_text(name, 40)}",
-                            "callback_data": f"wd:ls:{token}:0",
+                            "callback_data": f"wd:ls:{token}:0:{sort}:{mode}",
                         }
                     ]
                 )
-                listing.append(f"{number}. 📁 {name}/")
+                line = f"{number}. 📁 {name}/"
+                if listing_len + len(line) > 2800:
+                    omitted += 1
+                    continue
+                listing.append(line)
+                listing_len += len(line) + 1
                 continue
             size_text = _format_size(entry.get("size"))
             suffix = f"（{size_text}）" if size_text else ""
@@ -1852,7 +1996,12 @@ class TelegramBotService:
                     }
                 ]
             )
-            listing.append(f"{number}. 🎬 {name}{suffix}")
+            line = f"{number}. 📄 {name}{suffix}"
+            if listing_len + len(line) > 2800:
+                omitted += 1
+                continue
+            listing.append(line)
+            listing_len += len(line) + 1
 
         if total_pages > 1:
             nav: List[Dict[str, str]] = []
@@ -1861,7 +2010,7 @@ class TelegramBotService:
                     {
                         "text": "⬅️ 上一页",
                         "callback_data": (
-                            f"wd:ls:{self._token_for_path(target)}:{page - 1}"
+                            f"wd:ls:{target_token}:{page - 1}{state_suffix}"
                         ),
                     }
                 )
@@ -1873,7 +2022,7 @@ class TelegramBotService:
                     {
                         "text": "下一页 ➡️",
                         "callback_data": (
-                            f"wd:ls:{self._token_for_path(target)}:{page + 1}"
+                            f"wd:ls:{target_token}:{page + 1}{state_suffix}"
                         ),
                     }
                 )
@@ -1895,15 +2044,15 @@ class TelegramBotService:
             f"WebDAV：{client.base_url}{'' if target == '/' else target}",
             f"子目录 {len(dirs)} 个 · 文件 {len(files)} 个"
             f"（点文件即交给 {downloader} 下载）",
+            f"显示：{'全部文件' if show_all else '仅视频 / 字幕'} · "
+            f"排序：{_WEBDAV_SORT_FIELDS[sort_field]}{_webdav_sort_arrow(sort)}",
         ]
-        if not show_all:
-            lines.append(
-                "默认只列视频 / 字幕；要显示全部文件可改 webdav.show_all_files。"
-            )
         if listing:
             lines.append("")
             lines.append("本页完整名称：")
             lines.extend(listing)
+            if omitted:
+                lines.append(f"…… 其余 {omitted} 个名称过长，已省略按钮外的正文说明")
         self._send_keyboard(chat_id, "\n".join(lines), rows, edit_message_id)
 
     def _webdav_download(self, path: str, chat_id: str) -> None:
@@ -1948,7 +2097,7 @@ class TelegramBotService:
     def _webdav_files(
         entries: List[Dict[str, Any]], show_all: bool
     ) -> List[Dict[str, Any]]:
-        """从目录条目里挑出可下载的文件（默认只保留视频 / 字幕）"""
+        """从目录条目里挑出可下载的文件（show_all 时保留全部普通文件）"""
         files: List[Dict[str, Any]] = []
         for item in entries:
             if item.get("is_dir"):
@@ -2021,6 +2170,7 @@ class TelegramBotService:
         path: str,
         scope: str,
         edit_message_id: Optional[int] = None,
+        show_all: bool = True,
     ) -> None:
         """批量下载前先统计数量并让用户确认，避免误点把整个网盘拉下来"""
         from .downloader_monitor import find_downloader_instance
@@ -2030,9 +2180,7 @@ class TelegramBotService:
         try:
             client = client_from_config({"webdav": section})
             target = normalize_path(path)
-            files = self._webdav_collect(
-                client, target, scope, bool(section.get("show_all_files"))
-            )
+            files = self._webdav_collect(client, target, scope, show_all)
         except WebDAVError as exc:
             self.send_text(f"读取 WebDAV 目录失败：{exc}", chat_id=chat_id)
             return
@@ -2059,7 +2207,8 @@ class TelegramBotService:
                 {
                     "text": f"✅ 确认推送 {len(files)} 个",
                     "callback_data": (
-                        f"wd:pushok:{self._token_for_path(target)}:{scope}"
+                        f"wd:pushok:{self._token_for_path(target)}:{scope}:"
+                        f"{'all' if show_all else 'video'}"
                     ),
                 },
                 {"text": "↩️ 取消", "callback_data": "wd:pushcancel"},
@@ -2072,7 +2221,9 @@ class TelegramBotService:
             edit_message_id,
         )
 
-    def _webdav_push_batch(self, path: str, scope: str, chat_id: str) -> None:
+    def _webdav_push_batch(
+        self, path: str, scope: str, chat_id: str, show_all: bool = True
+    ) -> None:
         """批量把目录里的文件推给 aria2 下载（tree 会递归子目录）"""
         from .downloader_monitor import find_downloader_instance, push_uri_to_aria2
         from .webdav_client import WebDAVError, client_from_config, normalize_path
@@ -2081,9 +2232,7 @@ class TelegramBotService:
         try:
             client = client_from_config({"webdav": section})
             target = normalize_path(path)
-            files = self._webdav_collect(
-                client, target, scope, bool(section.get("show_all_files"))
-            )
+            files = self._webdav_collect(client, target, scope, show_all)
         except WebDAVError as exc:
             self.send_text(f"读取 WebDAV 目录失败：{exc}", chat_id=chat_id)
             return
@@ -2291,7 +2440,9 @@ class TelegramBotService:
                 return
             if data.startswith("wd:ls:"):
                 payload = data[len("wd:ls:") :]
-                token, _, page_text = payload.partition(":")
+                token, _, rest = payload.partition(":")
+                page_text, _, rest = rest.partition(":")
+                sort, _, mode = rest.partition(":")
                 path = self._path_for_token(token)
                 self._answer_callback(query_id, "")
                 if path is None:
@@ -2304,7 +2455,7 @@ class TelegramBotService:
                 # 列远端目录要走网络，放到后台线程，避免阻塞长轮询
                 threading.Thread(
                     target=self._send_webdav_browse,
-                    args=(chat_id, path, message_id, page),
+                    args=(chat_id, path, message_id, page, mode != "video", sort),
                     name="telegram-webdav-browse",
                     daemon=True,
                 ).start()
@@ -2324,7 +2475,8 @@ class TelegramBotService:
                 return
             if data.startswith("wd:push:"):
                 payload = data[len("wd:push:") :]
-                token, _, scope = payload.partition(":")
+                token, _, rest = payload.partition(":")
+                scope, _, mode = rest.partition(":")
                 path = self._path_for_token(token)
                 self._answer_callback(query_id, "")
                 if path is None:
@@ -2333,14 +2485,21 @@ class TelegramBotService:
                 # 递归统计可能要多次 PROPFIND，放到后台线程
                 threading.Thread(
                     target=self._webdav_confirm_push,
-                    args=(chat_id, path, scope or "dir", message_id),
+                    args=(
+                        chat_id,
+                        path,
+                        scope or "dir",
+                        message_id,
+                        mode != "video",
+                    ),
                     name="telegram-webdav-batch",
                     daemon=True,
                 ).start()
                 return
             if data.startswith("wd:pushok:"):
                 payload = data[len("wd:pushok:") :]
-                token, _, scope = payload.partition(":")
+                token, _, rest = payload.partition(":")
+                scope, _, mode = rest.partition(":")
                 path = self._path_for_token(token)
                 self._answer_callback(query_id, "开始推送…")
                 if path is None:
@@ -2348,7 +2507,7 @@ class TelegramBotService:
                     return
                 threading.Thread(
                     target=self._webdav_push_batch,
-                    args=(path, scope or "dir", chat_id),
+                    args=(path, scope or "dir", chat_id, mode != "video"),
                     name="telegram-webdav-batch",
                     daemon=True,
                 ).start()
@@ -3437,11 +3596,28 @@ class TelegramBotService:
         例如「狂王.Asura.S02E04」解析出的标题是「狂王.Asura」，
         而「狂王.2024.1080p.S01E01」会剩下「狂王 1080p」；
         Emos 里通常只叫「狂王」，所以按「原样 → 点换空格 → 去掉压制标签
-        → 去掉年份 → 第一段 → 去掉空格」依次搜。
+        → 去掉年份 → 去掉季集号」依次搜。
+
+        不能把「Your.Highness...」「Yi.Lu.Qian.Xing...」的第一段直接拿去
+        搜索：``Your`` / ``Yi`` / ``Star`` 会命中 JBYB、The Flying Nun、
+        Tonight Starring Jack Paar 等完全无关的条目。只有第一段是中文或
+        全大写缩写时才单独作为变体。
         """
-        base = str(title or "").strip()
+        base = _RE_MEDIA_EXT.sub("", str(title or "").strip())
         variants: List[str] = []
         spaced = base.replace(".", " ")
+        # 年份 / 季集号 / 压制标签可能同时出现，单项清理后仍需再走一遍
+        # 其他清理，否则「Lost.S01E01.1080p.mkv」只会得到带标签的中间结果。
+        cleaned_base = TelegramBotService._strip_release_tags(
+            TelegramBotService._strip_episode_tags(
+                TelegramBotService._strip_years(base)
+            )
+        )
+        cleaned_spaced = TelegramBotService._strip_release_tags(
+            TelegramBotService._strip_episode_tags(
+                TelegramBotService._strip_years(spaced)
+            )
+        )
         for candidate in (
             base,
             spaced,
@@ -3449,13 +3625,98 @@ class TelegramBotService:
             TelegramBotService._strip_release_tags(spaced),
             TelegramBotService._strip_years(base),
             TelegramBotService._strip_years(spaced),
-            base.split(".")[0],
+            TelegramBotService._strip_episode_tags(base),
+            TelegramBotService._strip_episode_tags(spaced),
+            cleaned_base,
+            cleaned_spaced,
             "".join(base.split()),
         ):
             candidate = " ".join(str(candidate).split()).strip()
-            if candidate and candidate not in variants:
-                variants.append(candidate)
+            if not candidate or candidate in variants:
+                continue
+            if not TelegramBotService._is_specific_title_variant(candidate):
+                continue
+            variants.append(candidate)
+
+        first_segment = base.split(".")[0].strip()
+        is_upper_acronym = (
+            first_segment.isascii()
+            and first_segment.isalpha()
+            and first_segment.isupper()
+            and len(first_segment) >= 3
+        )
+        if (
+            first_segment
+            and (re.search(r"[\u3400-\u9fff]", first_segment) or is_upper_acronym)
+            and TelegramBotService._is_specific_title_variant(first_segment)
+        ):
+            first_segment = " ".join(first_segment.split())
+            if first_segment not in variants:
+                variants.append(first_segment)
         return variants
+
+    @staticmethod
+    def _is_specific_title_variant(value: str) -> bool:
+        """过滤「Yi」「Your」这类片段，但保留 Lost / Dark / 24 等完整短片名"""
+        text = str(value or "").strip()
+        if not text:
+            return False
+        if re.search(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]", text):
+            return (
+                len(
+                    re.sub(
+                        r"[^0-9A-Za-z\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]",
+                        "",
+                        text,
+                    )
+                )
+                >= 2
+            )
+        tokens = re.findall(r"[0-9A-Za-z]+", text)
+        if not tokens:
+            return False
+        if len(tokens) == 1:
+            token = tokens[0]
+            if token.lower() in {
+                "about",
+                "after",
+                "again",
+                "before",
+                "every",
+                "first",
+                "other",
+                "their",
+                "there",
+                "these",
+                "those",
+                "under",
+                "where",
+                "which",
+                "while",
+                "would",
+                "your",
+            }:
+                return False
+            # NCIS / FBI / CSI 这类全大写缩写本身就是完整剧名，不能因为
+            # 长度不足 5 个字母就被过滤掉。
+            if token.isupper() and token.isalpha() and len(token) >= 3:
+                return True
+            if token.isdigit():
+                return True
+            # 一两个字母的英文片段（Yi）不足以作为片名；Lost / Dark / Star
+            # 这类完整短标题仍然保留，最终能否上传由候选标题校验决定。
+            return len(token) >= 3
+        return True
+
+    @staticmethod
+    def _strip_episode_tags(title: str) -> str:
+        """去掉搜索词里混入的 SxxExx / 第 x 季第 x 集"""
+        text = re.sub(
+            r"[Ss]\d{1,2}[Ee]\d{1,4}|第\s*\d+\s*季|第\s*\d+\s*集",
+            " ",
+            str(title or ""),
+        )
+        return " ".join(text.split()).strip()
 
     @staticmethod
     def _strip_years(title: str) -> str:

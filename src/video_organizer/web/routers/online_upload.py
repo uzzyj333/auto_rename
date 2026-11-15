@@ -8,7 +8,7 @@
 import logging
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from ..services.state import get_state_manager
@@ -67,6 +67,11 @@ class SaveInternalRequest(BaseModel):
     upload_username: Optional[str] = None
 
 
+class ImportUrlRequest(BaseModel):
+    url: str
+    filename: Optional[str] = ""
+
+
 def _service() -> OnlineUploadService:
     """获取在线上传服务（首次访问时按当前配置初始化）"""
     service = OnlineUploadService.instance()
@@ -110,6 +115,60 @@ async def browse(request: PathRequest):
     """浏览服务器目录"""
     try:
         return _service().list_directory(request.path)
+    except Exception as exc:
+        raise _fail(exc)
+
+
+@router.post("/upload-local")
+async def upload_local(files: List[UploadFile] = File(...)):
+    """浏览器本地上传：先保存到视频根目录，再交给前端识别并选择目标"""
+    service = _service()
+    max_bytes = service.max_upload_bytes()
+    imported = []
+    errors = []
+    for upload in files:
+        target = None
+        temp = None
+        name = upload.filename or "upload"
+        try:
+            target = service.alloc_upload_path(name)
+            temp = target.with_suffix(target.suffix + ".part")
+            written = 0
+            with temp.open("wb") as handle:
+                while True:
+                    chunk = await upload.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if max_bytes and written > max_bytes:
+                        raise ValueError(
+                            f"上传文件超过 max_upload_mb="
+                            f"{max_bytes / 1024 / 1024:g} MB 限制"
+                        )
+                    handle.write(chunk)
+            temp.replace(target)
+            imported.append(service.file_info(target))
+        except Exception as exc:
+            for path in (temp, target):
+                if path is not None:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+            errors.append(f"{name}: {exc}")
+        finally:
+            await upload.close()
+    if not imported and errors:
+        raise HTTPException(status_code=400, detail="；".join(errors))
+    return {"success": True, "files": imported, "errors": errors}
+
+
+@router.post("/import-url")
+def import_url(request: ImportUrlRequest):
+    """在线直链导入：下载到视频根目录后交给前端识别并选择目标"""
+    try:
+        info = _service().import_url(request.url, request.filename or "")
+        return {"success": True, "file": info}
     except Exception as exc:
         raise _fail(exc)
 

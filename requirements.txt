@@ -12,11 +12,15 @@ guessit>=3.8.0
 # 繁简中文转换
 zhconv>=1.4.0
 
+# 中文片名转拼音（用于罗马音文件名匹配）
+pypinyin>=0.50.0
+
 # HTTP客户端 - Python 3.9兼容版本
 httpx>=0.24.0
 
 # Web 服务依赖 - 管理后台
 fastapi>=0.100.0
+python-multipart>=0.0.9
 uvicorn[standard]>=0.23.0
 # WebSocket依赖 - uvicorn[standard]已包含，此处显式声明确保可用
 websockets>=14.0

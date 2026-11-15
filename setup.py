@@ -26,6 +26,8 @@ setup(
     install_requires=[
         "requests>=2.28.0",
         "watchdog>=3.0.0",
+        "pypinyin>=0.50.0",
+        "python-multipart>=0.0.9",
     ],
     entry_points={
         "console_scripts": [

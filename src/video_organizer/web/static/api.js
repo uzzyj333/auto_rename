@@ -9,7 +9,8 @@ function isAuthenticated() { return !!getAuthToken(); }
 
 async function apiRequest(endpoint, options = {}) {
     const token = getAuthToken();
-    const headers = { 'Content-Type': 'application/json', ...options.headers };
+    const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
+    const headers = { ...(isFormData ? {} : { 'Content-Type': 'application/json' }), ...options.headers };
     if (token) {
         headers['Authorization'] = `Bearer ${token}`;
     }
@@ -280,6 +281,17 @@ async function browseOnlineApi(path) {
 }
 async function scanOnlineApi(path, recursive) {
     return await apiRequest('/online-upload/scan', { method: 'POST', body: JSON.stringify({ path: path || '', recursive: recursive !== false }) });
+}
+async function uploadLocalOnlineFilesApi(files) {
+    const form = new FormData();
+    (files || []).forEach(file => form.append('files', file));
+    return await apiRequest('/online-upload/upload-local', { method: 'POST', body: form });
+}
+async function importOnlineUrlApi(url, filename) {
+    return await apiRequest('/online-upload/import-url', {
+        method: 'POST',
+        body: JSON.stringify({ url, filename: filename || '' })
+    });
 }
 async function probeOnlineApi(path) {
     return await apiRequest('/online-upload/probe', { method: 'POST', body: JSON.stringify({ path }) });

@@ -606,6 +606,7 @@ const FIELD_LABELS = {
     },
     online_upload: {
         video_root: '视频根目录', probe_enabled: '上传前用 ffprobe 校验',
+        upload_dir: '本地上传落盘目录', max_upload_mb: '单文件大小上限（MB）',
         ffprobe_path: 'ffprobe 路径', path_type: '内部入库 path_type',
     },
     naming: {
@@ -641,7 +642,7 @@ const FIELD_LABELS = {
     webdav: {
         enabled: '启用 TG WebDAV 入口', base_url: 'WebDAV 服务地址',
         root_path: '浏览根目录', username: '用户名', password: '密码',
-        verify_ssl: '校验 SSL 证书', show_all_files: '显示全部文件（不限视频/字幕）',
+        verify_ssl: '校验 SSL 证书',
         downloader: '交给哪个 aria2 实例（标识）', save_dir: 'aria2 保存目录',
         timeout: '请求超时（秒）',
     },
@@ -2006,6 +2007,8 @@ function bindOnlineEvents() {
     bind('onlineTgTestBtn', () => sendTelegramTest());
     bind('onlineBrowseBtn', () => browseOnline(onlineState.path));
     bind('onlineScanBtn', () => scanOnline());
+    bind('onlineLocalUploadBtn', () => uploadLocalOnlineFiles());
+    bind('onlineUrlImportBtn', () => importOnlineUrl());
     bind('onlineRecognizeBtn', () => recognizeSelected());
     bind('onlineAddAllBtn', () => addAllOnlineTasks());
     bind('onlineRefreshTasksBtn', () => loadOnlineTasks());
@@ -2131,6 +2134,90 @@ async function scanOnline() {
         if (!onlineState.videos.length) alert('该目录下没有扫描到视频文件');
     } catch (e) {
         alert('扫描失败: ' + e.message);
+    }
+}
+
+function setOnlineImportStatus(text, isError) {
+    const node = document.getElementById('onlineImportStatus');
+    if (!node) return;
+    node.textContent = text;
+    node.style.color = isError ? '#e5534b' : 'var(--text-muted)';
+}
+
+function addRecognizedOnlineResults(results) {
+    const incoming = (results || []).map(buildRecognizedItem).filter(it => it && it.file_path);
+    if (!incoming.length) return;
+    const merged = new Map(onlineState.recognized.map(it => [it.file_path, it]));
+    incoming.forEach(it => merged.set(it.file_path, it));
+    onlineState.recognized = Array.from(merged.values());
+    onlineState.groupResults = {};
+    onlineState.groupKeywords = {};
+    renderOnlineRecognize();
+}
+
+async function recognizeUploadedPaths(paths) {
+    if (!paths || !paths.length) return;
+    let results = [];
+    try {
+        const data = await recognizeOnlineBatchApi(paths, 4);
+        results = data.results || [];
+    } catch (e) {
+        for (const path of paths) {
+            results.push(await recognizeOnlineApi(path));
+        }
+    }
+    addRecognizedOnlineResults(results);
+}
+
+async function uploadLocalOnlineFiles() {
+    const input = document.getElementById('onlineLocalFiles');
+    const files = input && input.files ? Array.from(input.files) : [];
+    if (!files.length) { showToast('请先选择本机视频文件', 'warning'); return; }
+    const btn = document.getElementById('onlineLocalUploadBtn');
+    if (btn) { btn.disabled = true; btn.textContent = '上传中…'; }
+    try {
+        setOnlineImportStatus('正在上传 ' + files.length + ' 个文件…');
+        const data = await uploadLocalOnlineFilesApi(files);
+        const imported = data.files || [];
+        if (data.errors && data.errors.length) {
+            setOnlineImportStatus('部分文件上传失败：' + data.errors.join('；'), true);
+        }
+        if (imported.length) {
+            setOnlineImportStatus('上传完成，正在识别 ' + imported.length + ' 个文件…');
+            await recognizeUploadedPaths(imported.map(it => it.path));
+            setOnlineImportStatus('已上传并识别 ' + imported.length + ' 个文件，请在下方选择或搜索指定剧集。');
+            input.value = '';
+        }
+    } catch (e) {
+        setOnlineImportStatus('上传失败：' + e.message, true);
+        alert('上传失败: ' + e.message);
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '上传并识别'; }
+    }
+}
+
+async function importOnlineUrl() {
+    const urlInput = document.getElementById('onlineUrlInput');
+    const nameInput = document.getElementById('onlineUrlFilename');
+    const url = urlInput ? urlInput.value.trim() : '';
+    if (!url) { showToast('请填写在线视频直链', 'warning'); return; }
+    const btn = document.getElementById('onlineUrlImportBtn');
+    if (btn) { btn.disabled = true; btn.textContent = '导入中…'; }
+    try {
+        setOnlineImportStatus('正在下载在线文件…');
+        const data = await importOnlineUrlApi(url, nameInput ? nameInput.value.trim() : '');
+        const file = data.file;
+        if (!file || !file.path) throw new Error('后端没有返回文件路径');
+        setOnlineImportStatus('下载完成，正在识别…');
+        await recognizeUploadedPaths([file.path]);
+        setOnlineImportStatus('已导入并识别：' + file.name + '，请在下方选择或搜索指定剧集。');
+        if (urlInput) urlInput.value = '';
+        if (nameInput) nameInput.value = '';
+    } catch (e) {
+        setOnlineImportStatus('导入失败：' + e.message, true);
+        alert('导入失败: ' + e.message);
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '导入并识别'; }
     }
 }
 

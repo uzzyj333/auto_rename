@@ -287,9 +287,10 @@ class TestTelegramWebDAVFlow(unittest.TestCase):
         callbacks = [cell["callback_data"] for row in captured["rows"] for cell in row]
         self.assertTrue(any(cb.startswith("wd:ls:") for cb in callbacks))
         self.assertTrue(any(cb.startswith("wd:get:") for cb in callbacks))
-        # 默认只列视频/字幕：txt 不出现
+        # 浏览页默认列出全部文件（要过滤时点「仅视频 / 字幕」）
         self.assertIn("时光代理人.S01E01.mkv", captured["text"])
-        self.assertNotIn("readme.txt", captured["text"])
+        self.assertIn("readme.txt", captured["text"])
+        self.assertIn("显示：全部文件", captured["text"])
 
     def test_browse_keeps_path_inside_configured_root(self):
         self.service._config = self._config()
@@ -305,6 +306,69 @@ class TestTelegramWebDAVFlow(unittest.TestCase):
             self.service._send_webdav_browse("1", "/other/secret")
 
         self.assertEqual(listed, ["/tv"])
+
+    def _capture_browse(self, entries, **kwargs):
+        captured = {}
+        with patch.object(
+            WebDAVClient, "list_dir", lambda self, path="/": entries
+        ), patch.object(
+            TelegramBotService,
+            "_send_keyboard",
+            lambda self, chat_id, text, rows, edit=None: captured.update(
+                text=text, rows=rows
+            ),
+        ), patch.object(TelegramBotService, "send_text", lambda *a, **k: None):
+            self.service._send_webdav_browse("1", "/tv", **kwargs)
+        return captured
+
+    def test_browse_supports_size_time_type_sorting(self):
+        self.service._config = self._config()
+        entries = [
+            {
+                "name": "small.txt",
+                "path": "/tv/small.txt",
+                "is_dir": False,
+                "size": 50,
+                "modified": "Wed, 21 Oct 2026 10:00:00 GMT",
+            },
+            {
+                "name": "medium.mkv",
+                "path": "/tv/medium.mkv",
+                "is_dir": False,
+                "size": 100,
+                "modified": "Thu, 22 Oct 2026 10:00:00 GMT",
+            },
+            {
+                "name": "large.srt",
+                "path": "/tv/large.srt",
+                "is_dir": False,
+                "size": 300,
+                "modified": "Fri, 23 Oct 2026 10:00:00 GMT",
+            },
+        ]
+
+        by_size = self._capture_browse(entries, sort="size_desc")["text"]
+        self.assertLess(by_size.index("large.srt"), by_size.index("medium.mkv"))
+        self.assertLess(by_size.index("medium.mkv"), by_size.index("small.txt"))
+
+        by_time = self._capture_browse(entries, sort="modified_desc")["text"]
+        self.assertLess(by_time.index("large.srt"), by_time.index("medium.mkv"))
+        self.assertLess(by_time.index("medium.mkv"), by_time.index("small.txt"))
+
+        by_type = self._capture_browse(entries, sort="type")["text"]
+        self.assertLess(by_type.index("medium.mkv"), by_type.index("large.srt"))
+        self.assertLess(by_type.index("large.srt"), by_type.index("small.txt"))
+
+    def test_browse_can_switch_to_video_only_mode(self):
+        self.service._config = self._config()
+        entries = [
+            _file_entry("/tv/a.mkv"),
+            _file_entry("/tv/readme.txt"),
+        ]
+        captured = self._capture_browse(entries, show_all=False)
+        self.assertIn("a.mkv", captured["text"])
+        self.assertNotIn("readme.txt", captured["text"])
+        self.assertIn("显示：仅视频 / 字幕", captured["text"])
 
     def test_download_pushes_uri_with_auth_header_and_dir(self):
         self.service._config = self._config(
@@ -463,10 +527,10 @@ class TestWebDAVBatchPush(unittest.TestCase):
             self.service._send_webdav_browse("1", "/tv")
         callbacks = [cell["callback_data"] for row in captured["rows"] for cell in row]
         self.assertTrue(
-            any(cb.startswith("wd:push:") and cb.endswith(":dir") for cb in callbacks)
+            any(cb.startswith("wd:push:") and cb.endswith(":dir:all") for cb in callbacks)
         )
         self.assertTrue(
-            any(cb.startswith("wd:push:") and cb.endswith(":tree") for cb in callbacks)
+            any(cb.startswith("wd:push:") and cb.endswith(":tree:all") for cb in callbacks)
         )
 
     def test_confirm_push_shows_count_and_confirm_button(self):
@@ -488,7 +552,7 @@ class TestWebDAVBatchPush(unittest.TestCase):
         self.assertIn("2 个文件", captured["text"])
         callbacks = [cell["callback_data"] for row in captured["rows"] for cell in row]
         self.assertTrue(
-            any(cb.startswith("wd:pushok:") and cb.endswith(":dir") for cb in callbacks)
+            any(cb.startswith("wd:pushok:") and cb.endswith(":dir:all") for cb in callbacks)
         )
         self.assertIn("wd:pushcancel", callbacks)
 

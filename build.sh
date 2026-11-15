@@ -63,6 +63,7 @@ datas = [('config.ini', '.')]
 datas += [('src/video_organizer/web/static', 'video_organizer/web/static')]
 datas += collect_data_files('babelfish')
 datas += collect_data_files('guessit')
+datas += collect_data_files('pypinyin')
 
 hiddenimports = [
     'src',
@@ -73,10 +74,13 @@ hiddenimports = [
     'rebulk.rules',
     'rebulk.patterns',
     'rebulk.match',
+    'python_multipart',
+    'multipart',
 ]
 hiddenimports += collect_submodules('babelfish')
 hiddenimports += collect_submodules('guessit')
 hiddenimports += collect_submodules('rebulk')
+hiddenimports += collect_submodules('pypinyin')
 
 a = Analysis(
     ['run_organizer.py'],

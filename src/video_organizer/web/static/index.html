@@ -534,6 +534,20 @@
                     </div>
                 </div>
 
+                <div class="card" style="margin-top:1.5rem">
+                    <div class="card-header"><h3 class="card-title">直接上传文件（本机 / 在线直链）</h3></div>
+                    <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+                        <input type="file" class="form-input" id="onlineLocalFiles" multiple accept="video/*,.mkv,.mp4,.avi,.mov,.ts,.m2ts,.srt,.ass,.ssa,.vtt" style="flex:1;min-width:280px">
+                        <button class="btn btn-primary" id="onlineLocalUploadBtn">上传并识别</button>
+                    </div>
+                    <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:12px">
+                        <input type="text" class="form-input" id="onlineUrlInput" placeholder="在线视频直链（http/https，例如 https://example.com/show.S01E01.mkv）" style="flex:1;min-width:320px">
+                        <input type="text" class="form-input" id="onlineUrlFilename" placeholder="可选：保存文件名" style="width:220px">
+                        <button class="btn btn-secondary" id="onlineUrlImportBtn">导入并识别</button>
+                    </div>
+                    <div id="onlineImportStatus" style="margin-top:8px;font-size:13px;color:var(--text-muted)">上传 / 导入完成后会进入下方识别结果，可手动指定剧、季、集后再上传。</div>
+                </div>
+
                 <div class="card" id="onlineProbeCard" style="display:none;margin-top:1.5rem">
                     <div class="card-header"><h3 class="card-title">ffprobe 校验结果</h3></div>
                     <div id="onlineProbeContent"></div>

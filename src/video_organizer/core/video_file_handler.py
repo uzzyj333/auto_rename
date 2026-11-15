@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import threading
 import logging
@@ -23,7 +24,8 @@ from .tmdb_client import TMDBClient
 from .subtitle_handler import SubtitleHandler
 from .downloader_monitor import decode_file_path
 from .config_loader import normalize_extensions, normalize_path_mappings
-from .guessit_parser import strip_leading_bracket_prefix
+from .guessit_parser import extract_leading_bracket_titles, strip_leading_bracket_prefix
+from .title_matching import title_matches
 from ..utils.logging_utils import get_logger, log_success, log_failure, log_exception
 from ..database.operations import record_task
 from ..database.session import init_db as init_task_db
@@ -324,6 +326,7 @@ class VideoFileHandler:
         media_type: str,
         season: Optional[int] = None,
         episode: Optional[int] = None,
+        expected_titles: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """从 Emos getVideoId 返回结果中挑选最合适的上传目标
 
@@ -331,6 +334,19 @@ class VideoFileHandler:
         绝不退回整部剧（vl）/整季（vs），否则上传接口会返回 404。
         """
         if not isinstance(payload, dict):
+            return None
+
+        payload_title = str(
+            payload.get("title") or payload.get("video_title") or payload.get("video_list_name") or ""
+        ).strip()
+        expected = [
+            str(item).strip()
+            for item in (expected_titles or [])
+            if str(item or "").strip()
+        ]
+        if payload_title and expected and not any(
+            title_matches(payload_title, item) for item in expected
+        ):
             return None
 
         # 只要不是电影且能确定集号，就按电视剧处理，必须定位到具体某一集
@@ -362,6 +378,7 @@ class VideoFileHandler:
                 "kind": "episode",
                 "season_number": episode_info.get("season_number"),
                 "episode_number": episode_info.get("episode_number"),
+                "video_title": payload_title,
             }
 
         if media_type == "movie" or payload.get("video_type") == "movie":
@@ -371,6 +388,7 @@ class VideoFileHandler:
                     "item_id": str(payload.get("item_id")),
                     "label": payload.get("title") or payload.get("video_list_name") or "",
                     "kind": "movie",
+                    "video_title": payload_title,
                 }
 
         # 电视剧找不到具体某一集时不再退回整季/整剧，避免上传到错误目标
@@ -385,6 +403,7 @@ class VideoFileHandler:
                 "label": season_info.get("season_title") or payload.get("title") or "",
                 "kind": "season",
                 "season_number": season_info.get("season_number"),
+                "video_title": payload_title,
             }
 
         if payload.get("item_id"):
@@ -393,6 +412,7 @@ class VideoFileHandler:
                 "item_id": str(payload.get("item_id")),
                 "label": payload.get("title") or "",
                 "kind": "video",
+                "video_title": payload_title,
             }
         return None
 
@@ -413,6 +433,49 @@ class VideoFileHandler:
             return strip_leading_bracket_prefix(Path(file_path).stem).strip()
         except Exception:
             return Path(file_path).stem
+
+    @classmethod
+    def _filename_titles(cls, file_path: str) -> List[str]:
+        """文件名里可用于搜索的片名（中文方括号译名优先）"""
+        titles: List[str] = []
+        try:
+            titles.extend(extract_leading_bracket_titles(Path(file_path).name))
+        except Exception:
+            pass
+        fallback = cls._filename_title(file_path)
+        if fallback and fallback not in titles:
+            titles.append(fallback)
+        return titles
+
+    def _target_title_mismatch_reason(
+        self, match: Optional[Dict[str, Any]], file_path: str
+    ) -> str:
+        """通用防误传校验：最终目标标题是否和文件名里的标题一致。
+
+        只要文件名带方括号标题（译名 / 原名），自动匹配出的 Emos 目标标题就
+        必须命中方括号标题或去掉前缀后的文件名标题。这样即使上游 TMDB /
+        Emos 返回了别的作品，也不会把文件传到完全无关的条目。
+        """
+        target_title = str((match or {}).get("video_title") or "").strip()
+        if not target_title:
+            return ""
+        filename_titles = self._filename_titles(file_path)
+        bracket_titles = extract_leading_bracket_titles(Path(file_path).name)
+        self.logger.info(
+            "自动上传目标决策: 文件=%s 目标=%r 标题=%r 文件名标题=%s",
+            Path(file_path).name,
+            (match or {}).get("item_id"),
+            target_title,
+            filename_titles,
+        )
+        if not bracket_titles or not filename_titles:
+            return ""
+        if any(title_matches(target_title, item) for item in filename_titles):
+            return ""
+        return (
+            f"自动匹配目标「{target_title}」与文件名标题 {filename_titles} "
+            "不一致，已阻止上传，请手动选择目标"
+        )
 
     def _search_emos_by_title(
         self,
@@ -435,6 +498,8 @@ class VideoFileHandler:
             text = " ".join(str(value or "").split()).strip()
             if text and text not in texts:
                 texts.append(text)
+        # Emos 以中文目录为主：文件名方括号里的中文译名优先，英文名随后兜底。
+        texts.sort(key=lambda text: 0 if re.search(r"[\u3400-\u9fff]", text) else 1)
         if not texts:
             return None
         try:
@@ -994,6 +1059,7 @@ class VideoFileHandler:
                 console_log(f"\n❌ [线程#{worker_id}] 未找到 TMDB 匹配结果")
                 # TMDB 没结果时先按文件名识别出的标题直接在 Emos 里搜一遍，
                 # 能命中就直接上传，避免明明 Emos 里有条目却直接判失败。
+                fallback_blocked_reason = ""
                 fallback_match = self._search_emos_by_title(
                     metadata.get("show_name") or metadata.get("title") or "",
                     metadata.get("media_type") or "",
@@ -1002,11 +1068,21 @@ class VideoFileHandler:
                     self._safe_int(metadata.get("year")),
                     worker_id,
                     alt_titles=[
+                        *self._filename_titles(file_path),
                         metadata.get("original_show_name"),
                         metadata.get("title"),
-                        self._filename_title(file_path),
+                        metadata.get("show_name"),
                     ],
                 )
+                if fallback_match and fallback_match.get("item_id"):
+                    fallback_blocked_reason = self._target_title_mismatch_reason(
+                        fallback_match, file_path
+                    )
+                    if fallback_blocked_reason:
+                        console_log(
+                            f"⚠ [线程#{worker_id}] {fallback_blocked_reason}"
+                        )
+                        fallback_match = None
                 if fallback_match and fallback_match.get("item_id"):
                     fallback_season = self._safe_int(metadata.get("season"))
                     fallback_episode = self._safe_int(metadata.get("episode"))
@@ -1036,7 +1112,28 @@ class VideoFileHandler:
                     self.renamer.tmdb_client
                     and getattr(self.renamer.tmdb_client, "last_request_failed", False)
                 )
-                if tmdb_request_failed:
+                if fallback_blocked_reason:
+                    reason = fallback_blocked_reason
+                    self._failed_files[file_path] = reason
+                    record_task(
+                        file_path,
+                        "failed",
+                        error_message=reason,
+                        end_time=datetime.now(),
+                    )
+                    if self._parent_monitor:
+                        self._parent_monitor._retry_files.add(file_path)
+                    self._notify_match_error(
+                        file_path,
+                        metadata.get("show_name") or metadata.get("title") or "",
+                        metadata.get("media_type") or "",
+                        metadata.get("season"),
+                        metadata.get("episode"),
+                        reason,
+                        header="自动匹配被拦截",
+                        auto_retry=True,
+                    )
+                elif tmdb_request_failed:
                     error_msg = getattr(self.renamer.tmdb_client, "last_request_error", None)
                     reason = f"TMDB请求失败: {error_msg}" if error_msg else "TMDB请求失败"
                     console_log(f"⚠️  TMDB 请求异常，文件将加入自动重试: {reason}")
@@ -1169,6 +1266,7 @@ class VideoFileHandler:
             matched_item_id = None
             matched_item_type = None
             match_error = ""
+            auto_blocked_reason = ""
 
             # 目标映射表优先：手动指定过的目标直接命中，跳过 TMDB/Emos 搜索
             mapped = mapped_target or self._resolve_target_mapping(
@@ -1232,7 +1330,42 @@ class VideoFileHandler:
                             episode_number=episode_num if media_type == "tv" else None,
                         )
                         print(f"[线程#{worker_id}] Emos 识别返回: {result2}")
-                        match = self._pick_emos_match(result2, media_type, season_num, episode_num)
+                        expected_titles = [
+                            metadata.get("title"),
+                            metadata.get("show_name"),
+                            metadata.get("original_show_name"),
+                            *self._filename_titles(file_path),
+                        ]
+                        match = self._pick_emos_match(
+                            result2,
+                            media_type,
+                            season_num,
+                            episode_num,
+                            expected_titles=expected_titles,
+                        )
+                        if match and not match.get("video_title"):
+                            # getVideoId 有时不返回标题：再用目标基本信息核对一次，
+                            # 避免 Emos 的 TMDB 映射把文件传到完全无关的剧。
+                            try:
+                                base_info = emos_client.get_video_base(
+                                    match.get("item_type"), match.get("item_id")
+                                )
+                            except Exception as exc:
+                                self.logger.debug("查询上传目标标题失败: %s", exc)
+                            else:
+                                actual_title = str((base_info or {}).get("title") or "").strip()
+                                if actual_title and not any(
+                                    title_matches(actual_title, item)
+                                    for item in expected_titles
+                                    if str(item or "").strip()
+                                ):
+                                    console_log(
+                                        f"⚠ [线程#{worker_id}] 跳过标题不匹配的 Emos 目标："
+                                        f"{actual_title}"
+                                    )
+                                    match = None
+                                elif actual_title:
+                                    match["video_title"] = actual_title
                         if (
                             not match
                             and media_type == "tv"
@@ -1242,7 +1375,17 @@ class VideoFileHandler:
                             from .online_upload import OnlineUploadService
 
                             match = OnlineUploadService.resolve_episode_from_tree(
-                                emos_client, result2.get("item_id"), season_num, episode_num
+                                emos_client,
+                                result2.get("item_id"),
+                                season_num,
+                                episode_num,
+                                expected_titles=expected_titles,
+                                video_title=str(
+                                    result2.get("title")
+                                    or result2.get("video_title")
+                                    or result2.get("video_list_name")
+                                    or ""
+                                ),
                             )
                     except Exception as e:
                         console_log(
@@ -1260,11 +1403,20 @@ class VideoFileHandler:
                         year_num,
                         worker_id,
                         alt_titles=[
+                            *self._filename_titles(file_path),
                             metadata.get("original_show_name"),
+                            metadata.get("title"),
                             metadata.get("show_name"),
-                            self._filename_title(file_path),
                         ],
                     )
+
+                if match and match.get("item_id"):
+                    auto_blocked_reason = self._target_title_mismatch_reason(
+                        match, file_path
+                    )
+                    if auto_blocked_reason:
+                        console_log(f"⚠ [线程#{worker_id}] {auto_blocked_reason}")
+                        match = None
 
                 if match and match.get("item_id"):
                     matched_item_id = match["item_id"]
@@ -1275,6 +1427,18 @@ class VideoFileHandler:
                     console_log(
                         f"✓ [线程#{worker_id}] 在线识别成功: "
                         f"{matched_item_type}/{matched_item_id} {match.get('label') or ''}"
+                    )
+                elif auto_blocked_reason:
+                    match_error = auto_blocked_reason
+                    console_log(f"✗ [线程#{worker_id}] {match_error}")
+                    self._notify_match_error(
+                        file_path,
+                        title,
+                        media_type,
+                        season_num,
+                        episode_num,
+                        match_error,
+                        auto_retry=True,
                     )
                 elif media_type == "tv":
                     if episode_num is None:

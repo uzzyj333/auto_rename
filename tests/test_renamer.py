@@ -275,6 +275,37 @@ class TestTmdbCandidateTitleGate(unittest.TestCase):
                 title,
             )
 
+    def test_short_english_fragments_are_rejected(self):
+        """搜索词退化成一两个字母时不能按字符串子串命中无关作品"""
+        for query, title in (
+            ("Yi", "The Flying Nun"),
+            ("Your", "JBYB (Just Bring Your Own Body)"),
+            ("Star", "Tonight Starring Jack Paar"),
+        ):
+            self.assertEqual(
+                _tmdb_title_match_score(query, {"name": title}),
+                0,
+                f"{query} -> {title}",
+            )
+
+    def test_cjk_and_romanized_titles_match_each_other(self):
+        """一路前行 <-> Yi Lu Qian Xing（双向），避免罗马音被当成无关标题"""
+        self.assertGreater(
+            _tmdb_title_match_score("一路前行", {"name": "Yi Lu Qian Xing"}), 0
+        )
+        self.assertGreater(
+            _tmdb_title_match_score("Yi Lu Qian Xing", {"name": "一路前行"}), 0
+        )
+
+    def test_uppercase_acronym_matches_longer_title(self):
+        """VIVANT 这类全大写短标题仍能命中较长的完整标题"""
+        self.assertGreater(
+            _tmdb_title_match_score(
+                "VIVANT", {"name": "成吉思-VIVANT THE ORIGIN STORY-"}
+            ),
+            0,
+        )
+
     def test_exact_and_original_title_are_accepted(self):
         self.assertGreater(
             _tmdb_title_match_score("Silent Mentor", {"name": "Silent Mentor"}),
@@ -451,6 +482,53 @@ class TestTmdbCandidateTitleGate(unittest.TestCase):
         )
 
         self.assertEqual(result.get("tmdb_id"), 100)
+
+    def test_bracket_chinese_title_is_used_as_tmdb_search_seed(self):
+        """方括号里的中文译名不能被罗马音 / 英文名挤掉"""
+        renamer = VideoRenamer(tmdb_api_key="test_api_key_12345")
+        captured = {}
+
+        def fake_enrich(metadata):
+            captured.update(metadata)
+            return {}
+
+        with patch.object(renamer, "_enrich_with_tmdb", side_effect=fake_enrich):
+            result = renamer.extract_metadata(
+                "[痞子殿下].Your.Highness.2022.S01E01.1080p.WEB-DL.mkv"
+            )
+
+        self.assertEqual(captured.get("_tmdb_search_seed"), "痞子殿下")
+        self.assertIn("痞子殿下", result.get("title_aliases") or [])
+
+    def test_tv_file_does_not_fall_back_to_same_name_movie(self):
+        """SxxExx 文件没有电视剧候选时，不能硬选同名电影"""
+        renamer = VideoRenamer(tmdb_api_key="test_api_key_12345")
+        client = Mock()
+        client.search_multi.return_value = [
+            {
+                "id": 1,
+                "title": "Your Highness",
+                "original_title": "Your Highness",
+                "media_type": "movie",
+                "release_date": "2011-04-08",
+                "popularity": 100,
+            }
+        ]
+        renamer.tmdb_client = client
+
+        result = renamer._enrich_with_tmdb(
+            {
+                "show_name": "Your Highness",
+                "media_type": "tv",
+                "year": "2022",
+                "_media_type_confidence": 0.6,
+                "season": "01",
+                "episode": "01",
+            }
+        )
+
+        self.assertEqual(result.get("tmdb_id"), "")
+        client.get_movie_details.assert_not_called()
 
 
 if __name__ == "__main__":

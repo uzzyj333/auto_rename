@@ -199,6 +199,8 @@ DEFAULT_CONFIG = {
     },
     "online_upload": {
         "video_root": "",  # 允许浏览/上传的视频根目录，多个用逗号分隔（留空则使用监控目录）
+        "upload_dir": "",  # 浏览器上传 / URL 导入落盘目录（相对第一个根目录，留空用 .web_uploads）
+        "max_upload_mb": 0,  # 浏览器上传 / URL 导入单文件大小上限（MB，0 表示不限制）
         "probe_enabled": True,  # 上传前用 ffprobe 校验并提取视频信息
         "ffprobe_path": "",  # ffprobe 可执行文件路径，留空则使用 PATH
         "path_type": "local_emos_1",  # saveInternal 使用的 path_type
@@ -210,7 +212,6 @@ DEFAULT_CONFIG = {
         "username": "",
         "password": "",
         "verify_ssl": True,  # 自签证书的 WebDAV 可关掉校验
-        "show_all_files": False,  # 默认只列视频/字幕，开启后列出全部文件
         "downloader": "",  # 交给哪个 aria2 实例下载（填下载器标识，如 aria2 / aria2_2），留空用第一个
         "save_dir": "",  # aria2 下载保存目录，留空使用 aria2 默认目录
         "timeout": 30,  # WebDAV 请求超时（秒）

@@ -181,17 +181,17 @@ class TestPickTargetTitlePreference(unittest.TestCase):
         match = self.service.pick_target([wrong, right], 1, 19, "tv", title="死有对证")
         self.assertEqual(match["item_id"], "ve-right")
 
-    def test_falls_back_when_no_title_matches(self):
+    def test_returns_none_when_no_title_matches(self):
         first = _tv("111", "另一部剧", "ve-first")
         second = _tv("202974", "死有对证", "ve-second")
         match = self.service.pick_target([first, second], 1, 19, "tv", title="完全不相干的标题")
-        self.assertEqual(match["item_id"], "ve-first")
+        self.assertIsNone(match)
 
-    def test_unmatched_english_query_keeps_original_order(self):
+    def test_unmatched_english_query_returns_none(self):
         first = _tv("111", "死有对证", "ve-first")
         second = _tv("202974", "Another Show", "ve-second")
         match = self.service.pick_target([first, second], 1, 19, "tv", title="Jade Cause Of Death")
-        self.assertEqual(match["item_id"], "ve-first")
+        self.assertIsNone(match)
 
     def test_does_not_pick_unrelated_show_when_matched_show_lacks_episode(self):
         """标题已匹配到「Brothers」，它没有 E07 时不能改选 Ang Probinsyano 的 E07"""
@@ -202,13 +202,11 @@ class TestPickTargetTitlePreference(unittest.TestCase):
         )
         self.assertIsNone(match)
 
-    def test_fallback_match_is_marked_as_title_mismatch(self):
-        """没有任何标题相关候选时保留别名兜底，但标记出来供自动上传拒绝"""
+    def test_unrelated_candidate_is_not_auto_selected(self):
+        """没有任何标题相关候选时必须返回 None，不能按同号集硬传"""
         unrelated = _tv("222", "Ang Probinsyano", "ve-ang-7", season=1, episode=7)
         match = self.service.pick_target([unrelated], 1, 7, "tv", title="Brothers")
-        self.assertEqual(match["item_id"], "ve-ang-7")
-        self.assertFalse(match["title_matched"])
-        self.assertEqual(match["video_title"], "Ang Probinsyano")
+        self.assertIsNone(match)
 
 
 class _FlatThenFullTreeClient:

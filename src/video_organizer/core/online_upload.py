@@ -25,11 +25,18 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import unquote, urlparse
+
+import requests
 
 from .emos_client import EmosApiError, EmosClient
-from .guessit_parser import strip_leading_bracket_prefix
+from .guessit_parser import (
+    extract_leading_bracket_titles,
+    strip_leading_bracket_prefix,
+)
 from .incomplete_downloads import collect_incomplete_paths, is_incomplete
 from .probe import probe_summary_for_upload, probe_video
+from .title_matching import normalize_title, title_matches
 from ..upload.upload_emos import (
     DEFAULT_CHUNK_MB,
     DEFAULT_UPLOAD_CONCURRENCY,
@@ -48,6 +55,7 @@ VIDEO_EXTENSIONS = {
 
 MAX_SCAN_FILES = 2000
 MAX_TASKS = 200
+UPLOAD_SUBDIR = ".web_uploads"
 
 
 def _now() -> str:
@@ -65,16 +73,17 @@ def _to_int(value: Any) -> Optional[int]:
 
 def _normalize_title(value: Any) -> str:
     """标题归一化：去掉空格/标点并转小写，便于比较中英文标题"""
-    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(value or "").lower())
+    return normalize_title(value)
 
 
 def _title_matches(candidate: Any, query: Any) -> bool:
-    """候选标题与搜索标题是否相关（互为子串即视为相关）"""
-    left = _normalize_title(candidate)
-    right = _normalize_title(query)
-    if not left or not right:
-        return False
-    return left == right or left in right or right in left
+    """候选标题与搜索标题是否相关。
+
+    不能用字符串子串判断：搜索词退回 ``Yi`` / ``Your`` / ``Star`` 时，
+    ``flying`` / ``Just Bring Your Own Body`` / ``Starring`` 都会被误判成
+    同一部剧。这里按完整词元（以及中文拼音）比较。
+    """
+    return title_matches(candidate, query)
 
 
 def _search_title_candidates(metadata: Dict[str, Any], file_name: str) -> List[str]:
@@ -84,11 +93,16 @@ def _search_title_candidates(metadata: Dict[str, Any], file_name: str) -> List[s
     「成吉思-VIVANT THE ORIGIN STORY-」），只用 TMDB 标题会搜不到。
     这里同时保留 show_name / original_show_name / 文件名标题作为兜底。
     """
+    bracket_titles = extract_leading_bracket_titles(file_name or "")
     values = [
+        # 方括号里的中文译名通常比 TMDB 的英文名 / 罗马音更接近 Emos 条目。
+        *bracket_titles,
         metadata.get("title"),
         metadata.get("show_name"),
         metadata.get("original_show_name"),
+        *(metadata.get("title_aliases") or []),
     ]
+    values.extend(bracket_titles)
     stem = Path(file_name or "").stem
     if stem:
         values.append(strip_leading_bracket_prefix(stem))
@@ -102,7 +116,33 @@ def _search_title_candidates(metadata: Dict[str, Any], file_name: str) -> List[s
             continue
         seen.add(key)
         titles.append(text)
+    # Emos 以中文标题为主；中文译名优先尝试，英文原名 / 罗马音作为兜底。
+    titles.sort(key=lambda text: 0 if re.search(r"[\u3400-\u9fff]", text) else 1)
     return titles
+
+
+def _filename_title_guard_reason(match: Any, file_name: str) -> str:
+    """自动匹配目标的标题是否和文件名里的方括号标题一致。
+
+    该守卫只针对带方括号标题的文件生效：文件名里的译名 / 原名是比 TMDB
+    搜索词更可靠的最后一道校验，能阻止上游返回完全无关的作品。
+    """
+    target_title = str((match or {}).get("video_title") or "").strip()
+    if not target_title:
+        return ""
+    bracket_titles = extract_leading_bracket_titles(file_name or "")
+    if not bracket_titles:
+        return ""
+    titles = list(bracket_titles)
+    fallback = strip_leading_bracket_prefix(Path(file_name or "").stem)
+    if fallback and fallback not in titles:
+        titles.append(fallback)
+    if any(title_matches(target_title, item) for item in titles):
+        return ""
+    return (
+        f"自动匹配目标「{target_title}」与文件名标题 {titles} 不一致，"
+        "请手动选择目标"
+    )
 
 
 # 播出 / 上映年份可能出现的字段名（Emos 各条目字段不统一）
@@ -505,6 +545,166 @@ class OnlineUploadService:
 
         return {"success": True, "path": str(directory), "parent": parent, "entries": entries}
 
+    # ------------------------------------------------------------------
+    # 浏览器本地上传 / 在线 URL 导入
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def safe_upload_name(filename: Any) -> str:
+        """清洗浏览器文件名，只保留安全的视频 / 字幕文件名"""
+        raw = unquote(str(filename or "").replace("\\", "/")).strip()
+        name = Path(raw).name.strip()
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+        if not name:
+            name = f"upload-{uuid.uuid4().hex[:8]}.mp4"
+        suffix = Path(name).suffix.lower()
+        if suffix not in VIDEO_EXTENSIONS and suffix not in SUBTITLE_EXTENSIONS:
+            raise ValueError("仅支持视频 / 字幕文件（mkv、mp4、avi、srt、ass 等）")
+        return name
+
+    def uploads_dir(self) -> Path:
+        """浏览器上传文件的落盘目录（必须位于允许的视频根目录内）"""
+        roots = self.roots()
+        if not roots:
+            raise PermissionError("未配置视频根目录，无法保存上传文件")
+        online = self._online_config()
+        configured = str(online.get("upload_dir") or "").strip()
+        if configured:
+            candidate = Path(os.path.expanduser(configured))
+            if not candidate.is_absolute():
+                candidate = Path(roots[0]) / candidate
+        else:
+            candidate = Path(roots[0]) / UPLOAD_SUBDIR
+        real = os.path.realpath(os.path.abspath(str(candidate)))
+        if not any(real == root or real.startswith(root + os.sep) for root in roots):
+            raise PermissionError("upload_dir 必须位于 online_upload.video_root 内")
+        directory = Path(real)
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def max_upload_bytes(self) -> int:
+        """浏览器上传 / URL 导入的单文件大小上限（字节，0 表示不限制）"""
+        try:
+            max_mb = float(self._online_config().get("max_upload_mb") or 0)
+        except (TypeError, ValueError):
+            return 0
+        if max_mb <= 0:
+            return 0
+        return int(max_mb * 1024 * 1024)
+
+    def alloc_upload_path(self, filename: Any) -> Path:
+        """为一次上传分配独立子目录，保留原文件名供识别使用"""
+        safe_name = self.safe_upload_name(filename)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        folder = self.uploads_dir() / f"{stamp}-{uuid.uuid4().hex[:8]}"
+        folder.mkdir(parents=True, exist_ok=False)
+        return folder / safe_name
+
+    @staticmethod
+    def file_info(path: Path) -> Dict[str, Any]:
+        stat = path.stat()
+        suffix = path.suffix.lower()
+        return {
+            "id": f"{path}:{stat.st_size}:{int(stat.st_mtime)}",
+            "name": path.name,
+            "path": str(path),
+            "kind": "subtitle" if suffix in SUBTITLE_EXTENSIONS else "video",
+            "size": stat.st_size,
+            "size_text": format_size(stat.st_size),
+            "modified_at": datetime.fromtimestamp(stat.st_mtime).strftime(
+                "%Y-%m-%d %H:%M"
+            ),
+        }
+
+    @staticmethod
+    def _response_filename(url: str, response: Any, filename: Any = "") -> str:
+        """从用户输入 / Content-Disposition / URL 中确定保存文件名"""
+        candidate = str(filename or "").strip()
+        if not candidate:
+            disposition = str(response.headers.get("Content-Disposition") or "")
+            match = re.search(
+                r"filename\*?=(?:UTF-8''|[\"'])?([^\"';]+)", disposition, re.I
+            )
+            if match:
+                candidate = unquote(match.group(1).strip())
+        if not candidate:
+            candidate = unquote(Path(urlparse(url).path).name)
+        if not candidate:
+            candidate = f"online-{uuid.uuid4().hex[:8]}"
+        if not Path(candidate).suffix:
+            content_type = str(response.headers.get("Content-Type") or "").lower()
+            for prefix, suffix in (
+                ("video/mp4", ".mp4"),
+                ("video/x-matroska", ".mkv"),
+                ("video/webm", ".webm"),
+                ("application/x-subrip", ".srt"),
+            ):
+                if prefix in content_type:
+                    candidate += suffix
+                    break
+        return candidate
+
+    def import_url(self, url: str, filename: Any = "") -> Dict[str, Any]:
+        """把 http/https 直链流式下载到上传目录，随后交给识别流程"""
+        text = str(url or "").strip()
+        parsed = urlparse(text)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("请填写 http/https 视频直链")
+        online = self._online_config()
+        try:
+            timeout = max(10, int(online.get("timeout") or 60))
+        except (TypeError, ValueError):
+            timeout = 60
+        max_bytes = self.max_upload_bytes()
+        try:
+            response = requests.get(
+                text,
+                stream=True,
+                timeout=timeout,
+                headers={"User-Agent": "VideoOrganizer/1.0"},
+            )
+        except requests.RequestException as exc:
+            raise ValueError(f"下载在线文件失败：{exc}") from exc
+
+        target: Optional[Path] = None
+        temp: Optional[Path] = None
+        try:
+            if response.status_code >= 400:
+                raise ValueError(f"下载在线文件失败：HTTP {response.status_code}")
+            declared = _to_int(response.headers.get("Content-Length"))
+            if max_bytes and declared and declared > max_bytes:
+                raise ValueError(
+                    f"在线文件超过 max_upload_mb={max_bytes / 1024 / 1024:g} MB 限制"
+                )
+            target = self.alloc_upload_path(
+                self._response_filename(text, response, filename)
+            )
+            temp = target.with_suffix(target.suffix + ".part")
+            written = 0
+            with temp.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if max_bytes and written > max_bytes:
+                        raise ValueError(
+                            f"在线文件超过 max_upload_mb={max_bytes / 1024 / 1024:g} MB 限制"
+                        )
+                    handle.write(chunk)
+            temp.replace(target)
+            temp = None
+            return self.file_info(target)
+        except Exception:
+            for path in (temp, target):
+                if path is not None:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+            raise
+        finally:
+            response.close()
+
     def scan_videos(self, raw_path: Optional[str] = None, recursive: bool = True) -> Dict[str, Any]:
         """扫描目录中的视频文件"""
         directory = self.resolve(raw_path)
@@ -640,8 +840,15 @@ class OnlineUploadService:
             match = mapped
             mapping_matched = True
         else:
+            title_guard_error = ""
             try:
                 client = self.get_client()
+                expected_titles = [
+                    title,
+                    metadata.get("show_name"),
+                    metadata.get("original_show_name"),
+                    *search_titles,
+                ]
                 if tmdb_id:
                     tmdb_type = "movie" if media_type == "movie" else "tv"
                     payload = client.get_video_id(
@@ -651,12 +858,62 @@ class OnlineUploadService:
                         season_number=season if tmdb_type == "tv" else None,
                         episode_number=episode if tmdb_type == "tv" else None,
                     )
-                    match = self._pick_match(payload, media_type, season, episode)
+                    match = self._pick_match(
+                        payload,
+                        media_type,
+                        season,
+                        episode,
+                        expected_titles=expected_titles,
+                    )
+                    if match and not match.get("video_title"):
+                        try:
+                            base_info = client.get_video_base(
+                                match.get("item_type"), match.get("item_id")
+                            )
+                        except Exception as exc:
+                            logger.debug("查询上传目标标题失败: %s", exc)
+                        else:
+                            actual_title = str(
+                                (base_info or {}).get("title") or ""
+                            ).strip()
+                            if actual_title and not any(
+                                title_matches(actual_title, item)
+                                for item in expected_titles
+                                if str(item or "").strip()
+                            ):
+                                logger.info(
+                                    "跳过标题不匹配的 Emos 目标: %s", actual_title
+                                )
+                                match = None
+                            elif actual_title:
+                                match["video_title"] = actual_title
                     if not match and tmdb_type == "tv":
                         # getVideoId 没给到具体集时，用该剧的目录树兜底定位
                         match = self.resolve_episode_from_tree(
-                            client, payload.get("item_id"), season, episode
+                            client,
+                            payload.get("item_id"),
+                            season,
+                            episode,
+                            expected_titles=expected_titles,
+                            video_title=str(
+                                payload.get("title")
+                                or payload.get("video_title")
+                                or payload.get("video_list_name")
+                                or ""
+                            ),
                         )
+                    if match and not mapping_matched:
+                        # TMDB 映射也可能指向无关作品；先按文件名标题拦下，
+                        # 再继续尝试下面的标题搜索，而不是直接返回错误目标。
+                        reason = _filename_title_guard_reason(match, path.name)
+                        if reason:
+                            title_guard_error = reason
+                            logger.warning(
+                                "跳过标题不一致的 TMDB 映射目标: 文件=%s 目标=%r",
+                                path.name,
+                                match.get("video_title") or match.get("label"),
+                            )
+                            match = None
                 if not match and search_titles:
                     video_type = (
                         "movie" if media_type == "movie" else ("tv" if media_type else None)
@@ -688,9 +945,21 @@ class OnlineUploadService:
                             )
                             match = None
                         if match:
+                            reason = _filename_title_guard_reason(match, path.name)
+                            if reason:
+                                title_guard_error = reason
+                                logger.info(
+                                    "跳过标题不一致的 Emos 搜索候选: %s（搜索词: %s）",
+                                    match.get("video_title") or match.get("label") or "",
+                                    search_title,
+                                )
+                                match = None
+                        if match:
                             break
                 if not match and (media_type == "tv" or (media_type != "movie" and episode is not None)):
-                    if episode is None:
+                    if title_guard_error:
+                        errors.append(title_guard_error)
+                    elif episode is None:
                         errors.append("未能从文件名解析出季/集号，无法定位到具体某一集")
                     else:
                         errors.append(
@@ -701,6 +970,18 @@ class OnlineUploadService:
                 errors.append(str(exc))
             except Exception as exc:
                 errors.append(f"查询 Emos 失败: {exc}")
+
+        if match and not mapping_matched:
+            guard_reason = _filename_title_guard_reason(match, path.name)
+            if guard_reason:
+                logger.warning(
+                    "在线识别拦截错误目标: 文件=%s 目标=%r 标题=%r",
+                    path.name,
+                    match.get("item_id"),
+                    match.get("video_title"),
+                )
+                errors.append(guard_reason)
+                match = None
 
         return {
             "success": True,
@@ -772,6 +1053,7 @@ class OnlineUploadService:
         media_type: str,
         season: Optional[int] = None,
         episode: Optional[int] = None,
+        expected_titles: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """从 getVideoId 返回结果中挑选最合适的上传目标
 
@@ -780,6 +1062,24 @@ class OnlineUploadService:
         否则上传接口 /api/upload/video/base 会返回 404。
         """
         if not isinstance(payload, dict):
+            return None
+
+        payload_title = str(
+            payload.get("title") or payload.get("video_title") or payload.get("video_list_name") or ""
+        ).strip()
+        expected = [
+            str(item).strip()
+            for item in (expected_titles or [])
+            if str(item or "").strip()
+        ]
+        if payload_title and expected and not any(
+            title_matches(payload_title, item) for item in expected
+        ):
+            logger.info(
+                "拒绝 Emos 目标: 标题=%r 与期望标题=%s 不匹配",
+                payload_title,
+                expected,
+            )
             return None
 
         # 只要不是电影且能确定集号，就按电视剧处理，必须定位到具体某一集
@@ -805,6 +1105,7 @@ class OnlineUploadService:
                 "kind": "episode",
                 "season_number": _to_int(episode_info.get("season_number")),
                 "episode_number": _to_int(episode_info.get("episode_number")),
+                "video_title": payload_title,
             }
 
         if media_type == "movie" or payload.get("video_type") == "movie":
@@ -814,6 +1115,7 @@ class OnlineUploadService:
                     "item_id": str(payload.get("item_id")),
                     "label": payload.get("title") or payload.get("video_list_name") or "",
                     "kind": "movie",
+                    "video_title": payload_title,
                 }
 
         # 电视剧找不到具体某一集时不再退回整季/整剧，避免上传到错误目标
@@ -828,6 +1130,7 @@ class OnlineUploadService:
                 "label": season_info.get("season_title") or payload.get("title") or "",
                 "kind": "season",
                 "season_number": _to_int(season_info.get("season_number")),
+                "video_title": payload_title,
             }
 
         if payload.get("item_id"):
@@ -836,6 +1139,7 @@ class OnlineUploadService:
                 "item_id": str(payload.get("item_id")),
                 "label": payload.get("title") or "",
                 "kind": "video",
+                "video_title": payload_title,
             }
         return None
 
@@ -845,9 +1149,31 @@ class OnlineUploadService:
         vl_id: Any,
         season: Optional[int],
         episode: Optional[int],
+        expected_titles: Optional[List[str]] = None,
+        video_title: str = "",
     ) -> Optional[Dict[str, Any]]:
-        """getVideoId 未返回 episode_info 时，用视频目录树兜底定位具体某一集（ve）"""
+        """getVideoId 未返回 episode_info 时，用视频目录树兜底定位具体某一集（ve）
+
+        ``video_title`` 是 getVideoId 返回的作品标题。目录树兜底只能在这个标题
+        与文件名识别结果一致时使用；否则错误 TMDB ID 指向别的作品后，按同季
+        同集也能凑出一个 ve，最终把文件传到完全无关的剧。
+        """
         if not vl_id or episode is None:
+            return None
+        payload_title = str(video_title or "").strip()
+        expected = [
+            str(item).strip()
+            for item in (expected_titles or [])
+            if str(item or "").strip()
+        ]
+        if payload_title and expected and not any(
+            title_matches(payload_title, item) for item in expected
+        ):
+            logger.info(
+                "拒绝目录树兜底: 目标标题=%r 与期望标题=%s 不匹配",
+                payload_title,
+                expected,
+            )
             return None
         tree: List[Dict[str, Any]] = []
         try:
@@ -859,16 +1185,36 @@ class OnlineUploadService:
             for item in (tree or [])
             if isinstance(item, dict) and str(item.get("item_id")) == str(vl_id)
         ]
+        if not payload_title:
+            for item in narrowed or tree:
+                if isinstance(item, dict) and str(item.get("item_id")) == str(vl_id):
+                    payload_title = str(item.get("title") or "").strip()
+                    if payload_title:
+                        break
+        if payload_title and expected and not any(
+            title_matches(payload_title, item) for item in expected
+        ):
+            logger.info(
+                "拒绝目录树兜底: 目录树标题=%r 与期望标题=%s 不匹配",
+                payload_title,
+                expected,
+            )
+            return None
         match = OnlineUploadService._pick_from_candidates(
             narrowed or tree, season, episode, "tv"
         )
         if match:
+            if payload_title:
+                match["video_title"] = payload_title
             return match
         # Emos 里手动新增的集有时不会出现在目录树的嵌套结构里，
         # 再用 Emos 自己的季 / 集接口兜底查一次，避免「明明有集却匹配不到」。
-        return OnlineUploadService._resolve_episode_via_endpoints(
+        resolved = OnlineUploadService._resolve_episode_via_endpoints(
             client, vl_id, season, episode
         )
+        if resolved and payload_title:
+            resolved["video_title"] = payload_title
+        return resolved
 
     @staticmethod
     def _resolve_episode_via_endpoints(
@@ -968,11 +1314,21 @@ class OnlineUploadService:
                 for video in ordered
                 if isinstance(video, dict) and _title_matches(video.get("title"), title)
             ]
-            # 只要存在标题相关的候选，就只在它们里面找；否则「Brothers」搜不到
-            # 本剧时，会顺着候选列表把另一部剧的同号集（如 Ang Probinsyano）
-            # 当成目标上传。确实一部都对不上时才保留原顺序（兼容中英文别名）。
-            if matched:
-                ordered = matched
+            # 标题完全对不上时宁可返回 None，让用户手动选，也不能顺着候选
+            # 列表拿另一部剧的同号集上传。中英文别名请通过 title_aliases /
+            # 方括号译名提前加入搜索词，而不是在这里兜底。
+            if not matched:
+                logger.info(
+                    "Emos 候选标题均不匹配 %r: %s",
+                    title,
+                    [
+                        video.get("title")
+                        for video in ordered[:8]
+                        if isinstance(video, dict)
+                    ],
+                )
+                return None
+            ordered = matched
         for video in ordered:
             if not isinstance(video, dict):
                 continue
@@ -1077,13 +1433,9 @@ class OnlineUploadService:
                 for video in ordered
                 if isinstance(video, dict) and _title_matches(video.get("title"), title)
             ]
-            if matched:
-                rest = [
-                    video
-                    for video in ordered
-                    if not (isinstance(video, dict) and _title_matches(video.get("title"), title))
-                ]
-                ordered = matched + rest
+            if not matched:
+                return None
+            ordered = matched
         client = self.get_client()
         attempts = 0
         for video in ordered:

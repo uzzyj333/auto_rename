@@ -41,6 +41,35 @@ def strip_leading_bracket_prefix(filename: str) -> str:
     return str(path.with_name(remainder))
 
 
+def extract_leading_bracket_titles(filename: str) -> List[str]:
+    """提取文件名开头方括号里的片名候选。
+
+    ``[痞子殿下].Your.Highness...`` 里的中文名是可靠的搜索词，不能在剥离
+    前缀时一起丢掉；同时去掉 ``[一路前行 第一季]`` 末尾的季数。
+    """
+    name = Path(filename).name
+    match = _RE_LEADING_BRACKET_PREFIX.match(name)
+    if not match:
+        return []
+
+    titles: List[str] = []
+    seen = set()
+    for raw in re.findall(r"\[([^\]]*)\]|【([^】]*)】", match.group(0)):
+        text = next((part for part in raw if part), "").strip()
+        text = re.sub(
+            r"\s*(?:第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾廿]+\s*季|"
+            r"Season\s*\d+|S\d{1,2})\s*$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip(" .-_·|,，。、:：;；")
+        key = text.lower()
+        if text and key not in seen:
+            seen.add(key)
+            titles.append(text)
+    return titles
+
+
 # 尝试导入 guessit，如果不可用则使用 None
 try:
     from guessit import guessit

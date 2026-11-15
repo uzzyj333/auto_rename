@@ -656,6 +656,8 @@ async def get_config_schema():
             "description": "在线识别上传配置",
             "fields": {
                 "video_root": "允许浏览/上传的视频根目录（多个用逗号分隔）",
+                "upload_dir": "浏览器上传 / URL 导入落盘目录（相对第一个根目录，留空用 .web_uploads）",
+                "max_upload_mb": "单个上传文件大小上限（MB，0 表示不限制）",
                 "probe_enabled": "上传前是否用 ffprobe 校验视频",
                 "ffprobe_path": "ffprobe 可执行文件路径",
                 "path_type": "saveInternal 使用的 path_type",

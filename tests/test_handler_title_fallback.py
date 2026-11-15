@@ -104,6 +104,32 @@ class _WrongMatchService:
         return None
 
 
+class _WrongButClaimedMatchService:
+    """返回标题完全不相关、却标记 title_matched=True 的候选"""
+
+    def search_targets(self, video_type=None, title=None, todb_id=None):
+        return [
+            {
+                "title": "Completely Different Show",
+                "item_id": "1",
+                "item_type": "vl",
+                "seasons": [],
+            }
+        ]
+
+    def pick_target(self, candidates, season, episode, media_type, year=None, title=None):
+        return {
+            "item_type": "ve",
+            "item_id": "ve-wrong",
+            "label": "第 1 集",
+            "title_matched": True,
+            "video_title": "Completely Different Show",
+        }
+
+    def resolve_episode_from_candidates(self, *args, **kwargs):
+        return None
+
+
 class _FakeRenamer:
     def __init__(self, metadata, tmdb_client=None):
         self._metadata = metadata
@@ -228,6 +254,49 @@ class TestTitleSearchFallback(_TempDbMixin, unittest.TestCase):
             match = self.handler._search_emos_by_title("Brothers", "tv", 1, 7, None, 0)
 
         self.assertIsNone(match)
+
+    def test_filename_title_guard_blocks_wrong_target(self):
+        """即使上游声称 title_matched，最终目标标题与文件名对不上也不能上传"""
+        self.handler.renamer = _FakeRenamer(
+            {
+                "show_name": "Romaji Title",
+                "title_aliases": ["中文标题"],
+                "media_type": "tv",
+                "season": 1,
+                "episode": 1,
+                "year": 2024,
+            }
+        )
+        self.handler.emos_client = _RaisingEmosClient()
+        uploaded = []
+        notified = []
+
+        def fake_search(self, *args, **kwargs):
+            return {
+                "item_type": "ve",
+                "item_id": "ve-wrong",
+                "label": "第 1 集",
+                "title_matched": True,
+                "video_title": "Completely Different Show",
+            }
+
+        with patch.object(
+            VideoFileHandler, "_search_emos_by_title", fake_search
+        ), patch.object(
+            VideoFileHandler,
+            "_execute_upload",
+            lambda self, *a, **k: uploaded.append(a),
+        ), patch.object(
+            VideoFileHandler,
+            "_notify_match_error",
+            lambda self, *a, **k: notified.append(a),
+        ):
+            self.handler._process_file_internal(
+                "/media/[中文标题].Romaji.Title.2024.S01E01.1080p.mkv", 0
+            )
+
+        self.assertEqual(uploaded, [])
+        self.assertTrue(notified)
 
     def test_missing_tmdb_uses_title_fallback(self):
         self.handler.renamer = _FakeRenamer(
