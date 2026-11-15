@@ -819,8 +819,8 @@ class TestBrowseGrid(_BotHarness):
                 self.service._send_browse("1", tmp)
 
         text, rows = self.keyboards[-1]
-        # 导航行与每个条目行都是 3 个键（一行放完）
-        self.assertEqual(len(rows[0]), 3)
+        # 导航行 4 个键（含「指定剧上传」开关），条目行仍是 3 个键
+        self.assertEqual(len(rows[0]), 4)
         self.assertEqual([len(row) for row in rows[1:]], [3, 3])
         dir_row, file_row = rows[1], rows[2]
         self.assertEqual(dir_row[0]["text"], "📂 sub")

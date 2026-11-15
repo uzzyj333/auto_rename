@@ -50,6 +50,7 @@ _REMINDER_INTERVAL = 30       # 报错提醒检查间隔（秒）
 _MAX_BROWSE_TOKENS = 500      # 最多记住多少个「浏览/上传」路径令牌
 _BROWSE_PAGE_SIZE = 20        # 目录浏览每页显示的条目数
 _MAX_FLOW_TOKENS = 300        # 最多记住多少个「搜索 → 选季 → 选集」会话令牌
+_LOCAL_TARGET_TTL = 1800      # 本地文件「指定剧上传」等待输入剧名的时长（秒）
 
 _WEBDAV_SORT_FIELDS = {
     "name": "名称",
@@ -179,6 +180,9 @@ _UPLOAD_FILE_EXTENSIONS = {
     ".srt", ".ass", ".ssa", ".vtt", ".sub",
 }
 
+# 外挂字幕：指定剧上传只针对视频文件，字幕跟随视频自动上传
+_SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt", ".sub"}
+
 _CN_DIGITS = {
     "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
     "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
@@ -211,7 +215,7 @@ def _extract_urls(text: Any, limit: int = _MAX_URLS_PER_MESSAGE) -> List[str]:
 _HELP_TEXT = (
     "可用指令：\n"
     "/bind  绑定当前会话（把 chat_id 写回配置）\n"
-    "/upload  浏览本地文件：上传 / 删除文件或文件夹\n"
+    "/upload  浏览本地文件：自动识别上传 / 指定剧上传 / 删除\n"
     "/webdav  浏览 WebDAV 网盘：选中文件即推送给 aria2 下载\n"
     "/dl  把下载链接（http/https/磁力）直接推给 aria2 下载\n"
     "/config  快捷配置（开关）+「处理配置」/「Emos API」/「WebDAV 网盘」\n"
@@ -515,6 +519,9 @@ class TelegramBotService:
         self._browse_token_seq = 0
         self._flow_tokens: Dict[str, Dict[str, Any]] = {}
         self._flow_seq = 0
+        # /upload 的「指定剧上传」：等待用户输入剧名的本地文件 + 每会话模式开关
+        self._pending_local_targets: Dict[str, Dict[str, Any]] = {}
+        self._manual_pick_chats: set = set()
         self._sent_count = 0
         self._last_error = ""
         self._last_update_at = ""
@@ -1381,11 +1388,15 @@ class TelegramBotService:
             self.send_text("你没有权限操作此机器人。", chat_id=chat_id)
             return
         if command:
+            self._clear_pending_local_target(chat_id)
             self._handle_command(command, chat_id, user_id, allowed, text)
             return
 
         reply_to = (message.get("reply_to_message") or {}).get("message_id")
         reply_text = str((message.get("reply_to_message") or {}).get("text") or "")
+        if reply_to is not None:
+            # 用户改用「回复消息」修正时，放弃上一条待输入的本地文件目标
+            self._clear_pending_local_target(chat_id)
         context: Optional[Dict[str, Any]] = None
         if reply_to is not None:
             context = self._resolve_reply_context(reply_to, reply_text)
@@ -1393,7 +1404,26 @@ class TelegramBotService:
             # 没有回复上下文：消息里若是下载链接，直接推给 aria2
             urls = _extract_urls(text)
             if urls and self._url_download_enabled():
+                self._clear_pending_local_target(chat_id)
                 self._start_url_download(urls, chat_id)
+                return
+            # /upload 里选了「指定剧上传」后，下一条文本就是目标片名
+            pending = self._pop_pending_local_target(chat_id)
+            if pending is not None:
+                if self._is_delete_intent(text):
+                    self.send_text("已取消指定剧上传。", chat_id=chat_id)
+                    return
+                self._handle_correction(
+                    {
+                        "file_path": str(pending.get("file_path") or ""),
+                        "storage": None,
+                        "media_type": "",
+                        "title": "",
+                    },
+                    text,
+                    chat_id,
+                    None,
+                )
                 return
             self.send_text(
                 "请直接「回复」某条报错信息来修正上传目标，或发送 /help 查看用法。",
@@ -1630,14 +1660,79 @@ class TelegramBotService:
             return message_id
         return None
 
+    # ------------------------------------------------------------------
+    # /upload：本地文件「指定剧上传」
+    # ------------------------------------------------------------------
+
+    def _manual_pick_enabled(self, chat_id: str) -> bool:
+        with self._lock:
+            return str(chat_id) in self._manual_pick_chats
+
+    def _set_manual_pick(self, chat_id: str, enabled: bool) -> None:
+        with self._lock:
+            if enabled:
+                self._manual_pick_chats.add(str(chat_id))
+            else:
+                self._manual_pick_chats.discard(str(chat_id))
+
+    def _set_pending_local_target(self, chat_id: str, file_path: str) -> None:
+        with self._lock:
+            self._pending_local_targets[str(chat_id)] = {
+                "file_path": str(file_path),
+                "ts": time.time(),
+            }
+            while len(self._pending_local_targets) > 50:
+                self._pending_local_targets.pop(
+                    next(iter(self._pending_local_targets)), None
+                )
+
+    def _pop_pending_local_target(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            item = self._pending_local_targets.pop(str(chat_id), None)
+        if not item:
+            return None
+        if time.time() - float(item.get("ts") or 0.0) > _LOCAL_TARGET_TTL:
+            return None
+        return item
+
+    def _clear_pending_local_target(self, chat_id: str) -> None:
+        with self._lock:
+            self._pending_local_targets.pop(str(chat_id), None)
+
+    def _prompt_local_target(self, chat_id: str, file_path: Any) -> None:
+        """本地文件 → 指定剧上传：提示用户直接发送片名关键词"""
+        path = str(file_path)
+        self._set_pending_local_target(chat_id, path)
+        context = {
+            "file_path": path,
+            "storage": None,
+            "media_type": "",
+            "title": "",
+        }
+        text = (
+            "🎯 指定剧上传\n"
+            f"文件：{Path(path).name}\n\n"
+            "请直接发送片名关键词（可带季集号），例如：\n"
+            "　时光代理人S04E09\n"
+            "　时光代理人 第4季第9集\n"
+            "　壮志凌云 (1986)　（电影）\n\n"
+            "之后按提示选择电影/电视剧，再点选作品、季、集即可上传。"
+        )
+        rows = [[{"text": "✖️ 取消", "callback_data": "up:pickcancel"}]]
+        self._send_keyboard(chat_id, text, rows, context=context)
+
     def _send_browse(
         self,
         chat_id: str,
         path: str,
         edit_message_id: Optional[int] = None,
         page: int = 0,
+        manual_pick: Optional[bool] = None,
     ) -> None:
-        """展示目录浏览键盘：目录 / 视频字幕文件，支持翻页与整目录上传"""
+        """展示目录浏览键盘：目录 / 视频字幕文件，支持翻页、整目录上传与指定剧上传"""
+        if manual_pick is not None:
+            self._set_manual_pick(chat_id, bool(manual_pick))
+        manual = self._manual_pick_enabled(chat_id)
         from .online_upload import OnlineUploadService
 
         service = OnlineUploadService.instance()
@@ -1727,6 +1822,14 @@ class TelegramBotService:
             nav_row.append({"text": "📤 上传全部", "callback_data": f"up:dir:{base_token}"})
         else:
             nav_row.append({"text": "🚫 无可上传", "callback_data": "up:noop"})
+        nav_row.append(
+            {
+                "text": "📤 自动识别" if manual else "🎯 指定剧上传",
+                "callback_data": (
+                    f"up:mode:{'auto' if manual else 'pick'}:{base_token}:{page}"
+                ),
+            }
+        )
         rows.append(nav_row)
         for number, entry in enumerate(page_entries, start=1):
             target = entry["path"]
@@ -1748,15 +1851,31 @@ class TelegramBotService:
                 suffix = f"（{size_text}）" if size_text else ""
                 # 名称按钮只放短名，完整名称在正文里按序号列出
                 name = _shorten_text(target.name, max(8, 26 - len(suffix)))
+                use_manual = (
+                    manual
+                    and target.suffix.lower() not in _SUBTITLE_EXTENSIONS
+                )
                 rows.append(
                     [
                         {
                             "text": f"🎬 {name}{suffix}",
-                            "callback_data": f"up:file:{token}",
+                            "callback_data": (
+                                f"up:pick:{token}"
+                                if use_manual
+                                else f"up:file:{token}"
+                            ),
                         },
                         {
-                            "text": f"📤 {number} 上传",
-                            "callback_data": f"up:file:{token}",
+                            "text": (
+                                f"🎯 {number} 指定剧"
+                                if use_manual
+                                else f"📤 {number} 上传"
+                            ),
+                            "callback_data": (
+                                f"up:pick:{token}"
+                                if use_manual
+                                else f"up:file:{token}"
+                            ),
                         },
                         {"text": "🗑️ 删除", "callback_data": f"up:del:{token}"},
                     ]
@@ -1782,6 +1901,11 @@ class TelegramBotService:
         if not page_entries:
             rows.append([{"text": "（此目录没有可上传文件）", "callback_data": "up:noop"}])
         lines = [f"目录：{base}", f"子目录 {len(dirs)} 个 · 视频/字幕 {len(files)} 个"]
+        if manual:
+            lines.insert(
+                0,
+                "🎯 指定剧上传模式：先点文件，再发送剧名关键词（可带 SxxExx）",
+            )
         size_text = _format_size(total_size)
         tail = ""
         if size_text:
@@ -2372,6 +2496,43 @@ class TelegramBotService:
             if data == "up:roots":
                 self._answer_callback(query_id, "")
                 self._send_browse(chat_id, "", message_id)
+                return
+            if data.startswith("up:mode:"):
+                payload = data[len("up:mode:") :]
+                mode, _, rest = payload.partition(":")
+                token, _, page_text = rest.partition(":")
+                path = self._path_for_token(token)
+                self._answer_callback(query_id, "")
+                if path is None:
+                    self.send_text("目录已过期，请重新发送 /upload", chat_id=chat_id)
+                    return
+                try:
+                    page = int(page_text) if page_text else 0
+                except ValueError:
+                    page = 0
+                self._send_browse(
+                    chat_id,
+                    path,
+                    message_id,
+                    page,
+                    manual_pick=(mode == "pick"),
+                )
+                return
+            if data.startswith("up:pick:"):
+                path = self._path_for_token(data[len("up:pick:") :])
+                self._answer_callback(query_id, "请输入剧名")
+                if path is None:
+                    self.send_text("文件已过期，请重新发送 /upload", chat_id=chat_id)
+                    return
+                if not Path(path).is_file():
+                    self.send_text(f"文件不存在：{path}", chat_id=chat_id)
+                    return
+                self._prompt_local_target(chat_id, path)
+                return
+            if data == "up:pickcancel":
+                self._clear_pending_local_target(chat_id)
+                self._answer_callback(query_id, "已取消")
+                self._send_keyboard(chat_id, "已取消指定剧上传。", [], message_id)
                 return
             if data.startswith("up:ls:"):
                 payload = data[len("up:ls:"):]
